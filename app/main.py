@@ -161,13 +161,26 @@ def _render_datetime_block(operation: str | None, values: dict[str, str]) -> str
             입찰마감제외 <code>bidClseExcpYn</code>
           </label>"""
 
+    # inqryDiv 의 의미는 서비스마다 다르다(라벨만 op별로 교체, 동작은 동일).
+    #  - 입찰(검색/목록): 1=게시일자, 2=개찰일시
+    #  - 사전규격(op15):  1=접수일시, 2=사전규격등록번호, 3=참조번호
+    if spec is not None and spec.kind == "prespec":
+        inqry_label = "조회구분"
+        inqry_options = (("1", "접수일시"), ("2", "사전규격등록번호"), ("3", "참조번호"))
+    else:
+        inqry_label = "공고/개찰일자"
+        inqry_options = (("1", "게시일자"), ("2", "개찰일시"))
+    inqry_opt_html = "".join(
+        f'<option value="{_e(v)}"{" selected" if inqry_div == v else ""}>{_e(t)}</option>'
+        for v, t in inqry_options
+    )
+
     return f"""
       <div class="row daterow">
         <label class="field">
-          <span class="flabel">공고/개찰일자 <code>inqryDiv</code></span>
+          <span class="flabel">{_e(inqry_label)} <code>inqryDiv</code></span>
           <select name="inqryDiv">
-            <option value="1"{' selected' if inqry_div == '1' else ''}>게시일자</option>
-            <option value="2"{' selected' if inqry_div == '2' else ''}>개찰일시</option>
+            {inqry_opt_html}
           </select>
         </label>
         <label class="field">

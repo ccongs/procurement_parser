@@ -30,6 +30,13 @@ BASE_URL = os.getenv(
     "PROCUREMENT_BASE_URL",
     "http://apis.data.go.kr/1230000/ad/BidPublicInfoService",
 ).strip().rstrip("/")
+# 사전규격정보서비스(HrcspSsstndrdInfoService)는 입찰공고서비스와 베이스 URL 경로가 다르다
+# (/ao/… vs /ad/…). 별도 .env 키로 두되 미설정 시 표준 값으로 폴백한다.
+# 서비스키는 입찰과 동일한 PROCUREMENT_SERVICE_KEY 를 재사용한다(별도 키 없음).
+PRESPEC_BASE_URL = os.getenv(
+    "PROCUREMENT_PRESPEC_BASE_URL",
+    "http://apis.data.go.kr/1230000/ao/HrcspSsstndrdInfoService",
+).strip().rstrip("/")
 DEFAULT_RESPONSE_TYPE = os.getenv("PROCUREMENT_RESPONSE_TYPE", "json").strip() or "json"
 
 
@@ -90,17 +97,36 @@ SEARCH_PARAMS: list[ParamSpec] = [
     ParamSpec("bidClseExcpYn", "입찰마감제외", "", "Y=입찰마감 건 제외"),
 ]
 
+# 사전규격(op 15 getPublicPrcureThngInfoServcPPSSrch)의 추가 검색 파라미터(명세 endpoints/15).
+# ⚠️ 입찰의 indstrytyCd/prtcptLmtRgnCd/presmptPrce* 는 이 op 에 없음 → 포함하지 않는다.
+# 공통(inqryDiv/inqryBgnDt/inqryEndDt/pageNo/numOfRows) 외에 아래만 전송 허용.
+PRESPEC_SEARCH_PARAMS: list[ParamSpec] = [
+    ParamSpec("bfSpecRgstNo", "사전규격등록번호", "", "inqryDiv=2 일 때 사용 (예: 347539)"),
+    ParamSpec("refNo", "참조번호", "", "inqryDiv=3 일 때 사용 (부분검색)"),
+    ParamSpec("ntceInsttCd", "공고기관코드", "", "예: 3180000"),
+    ParamSpec("ntceInsttNm", "공고기관명", "", "부분검색 가능"),
+    ParamSpec("dminsttCd", "수요기관코드", "", "행자부코드 우선 (예: 3180000)"),
+    ParamSpec("dminsttNm", "수요기관명", "", "부분검색 가능"),
+    ParamSpec("prdctClsfcNoNm", "품명(사업명)", "", "물품분류명 부분검색 가능"),
+    ParamSpec("swBizObjYn", "SW사업대상여부", "", "Y/N (SW 용역 식별)"),
+    ParamSpec("dtilPrdctClsfcNo", "세부품명번호", "", "예: 4110350201"),
+]
+
 
 @dataclass(frozen=True)
 class EndpointSpec:
     no: int
     operation: str
     label: str            # 화면 표시용
-    kind: str             # "search" (검색조건) | "list" (기본 목록)
+    kind: str             # "search" (검색조건) | "list" (기본 목록) | "prespec" (사전규격 검색조건)
     extra_params: list[ParamSpec] = field(default_factory=list)
+    base_url: str | None = None     # None 이면 입찰 BASE_URL 사용(기존 동작 불변)
+    # 공통 파라미터(COMMON_PARAMS) 중 이 op 에서 전송하지 않을 항목(허용목록에서 제외).
+    omit_common: frozenset[str] = field(default_factory=frozenset)
 
 
 # 화면에 등록할 엔드포인트: 검색조건 조회 11~14 (핵심) + 기본 목록조회 1~4 (보조)
+# + 사전규격 검색조건 15 (별도 서비스 베이스 URL).
 ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(11, "getBidPblancListInfoCnstwkPPSSrch", "11 · 공사 (검색조건)", "search", SEARCH_PARAMS),
     EndpointSpec(12, "getBidPblancListInfoServcPPSSrch", "12 · 용역 (검색조건)", "search", SEARCH_PARAMS),
@@ -110,9 +136,27 @@ ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(2, "getBidPblancListInfoServc", "2 · 용역 (기본 목록)", "list"),
     EndpointSpec(3, "getBidPblancListInfoFrgcpt", "3 · 외자 (기본 목록)", "list"),
     EndpointSpec(4, "getBidPblancListInfoThng", "4 · 물품 (기본 목록)", "list"),
+    # 사전규격 용역 검색조건(별도 서비스). bidNtceNo 는 입찰 전용이라 이 op 허용목록에서 제외.
+    EndpointSpec(
+        15,
+        "getPublicPrcureThngInfoServcPPSSrch",
+        "15 · 사전규격 용역 (검색조건)",
+        "prespec",
+        PRESPEC_SEARCH_PARAMS,
+        base_url=PRESPEC_BASE_URL,
+        omit_common=frozenset({"bidNtceNo"}),
+    ),
 ]
 
 ENDPOINTS_BY_OP: dict[str, EndpointSpec] = {e.operation: e for e in ENDPOINTS}
+
+
+def base_url_for(operation: str) -> str:
+    """op 의 베이스 URL 반환. 엔드포인트 메타에 base_url 이 없으면 입찰 BASE_URL(기존 동작)."""
+    spec = ENDPOINTS_BY_OP.get(operation)
+    if spec is not None and spec.base_url:
+        return spec.base_url
+    return BASE_URL
 
 
 # --- 검증 ----------------------------------------------------------------
@@ -205,8 +249,11 @@ def build_params(operation: str, raw: dict[str, str], response_type: str) -> dic
     if spec is None:
         raise ApiClientError(f"알 수 없는 엔드포인트: {operation}")
 
-    # 이 엔드포인트에서 허용되는 파라미터만 통과 (예: 검색 파라미터를 목록조회로 보내지 않음)
-    allowed = {p.name for p in COMMON_PARAMS} | {p.name for p in spec.extra_params}
+    # 이 엔드포인트에서 허용되는 파라미터만 통과 (예: 검색 파라미터를 목록조회로 보내지 않음).
+    # omit_common 에 든 공통 파라미터는 이 op 에 없으므로 허용목록에서 제외(예: 사전규격 op15 의 bidNtceNo).
+    allowed = (
+        {p.name for p in COMMON_PARAMS} - set(spec.omit_common)
+    ) | {p.name for p in spec.extra_params}
 
     params: dict[str, str] = {}
     for key, value in raw.items():
@@ -255,7 +302,7 @@ def call_endpoint(
         rtype = "json"
 
     sent_params = build_params(operation, raw_params, rtype)
-    url = f"{BASE_URL}/{operation}"
+    url = f"{base_url_for(operation)}/{operation}"
 
     # serviceKey 는 표시/로그에 포함하지 않기 위해 별도로 합친다.
     request_params = {"serviceKey": SERVICE_KEY, **sent_params}
