@@ -186,8 +186,24 @@ _CONFIG_UPDATABLE: frozenset[str] = frozenset(
         "inqry_div",
         "intrntnl_div_cd",
         "indstryty_cds",
+        # Phase 4.2: 추정가격 기본 하한/상한(/list 가격 입력의 기본값으로 사용).
+        "presmpt_prce_bgn",
+        "presmpt_prce_end",
     }
 )
+
+# /list 헤더 정렬 허용값 → (정렬 컬럼, 내림차순 여부). NULL 은 항상 뒤로.
+_SORT_COLUMNS: dict[str, tuple[str, bool]] = {
+    "bid_ntce_dt_desc": ("bid_ntce_dt", True),
+    "bid_ntce_dt_asc": ("bid_ntce_dt", False),
+    "openg_dt_desc": ("openg_dt", True),
+    "openg_dt_asc": ("openg_dt", False),
+    "presmpt_prce_desc": ("presmpt_prce", True),
+    "presmpt_prce_asc": ("presmpt_prce", False),
+}
+
+# 날짜 범위를 적용할 컬럼 허용값(공고일/개찰일).
+_DATE_FIELDS: frozenset[str] = frozenset({"bid_ntce_dt", "openg_dt"})
 
 
 def search_bid_notices(
@@ -196,6 +212,9 @@ def search_bid_notices(
     q: str | None = None,
     dt_from: datetime | None = None,
     dt_to: datetime | None = None,
+    date_field: str = "bid_ntce_dt",
+    price_min: int | None = None,
+    price_max: int | None = None,
     openg_only_future: bool = False,
     include_past_openg: bool = True,
     sort: str = "bid_ntce_dt_desc",
@@ -206,23 +225,38 @@ def search_bid_notices(
     """저장된 공고를 필터·정렬·페이지네이션해서 (행 목록, 전체건수)로 반환.
 
     - q: bid_ntce_nm 부분검색(LIKE %q%, 대소문자 무시).
-    - dt_from/dt_to: bid_ntce_dt 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
+    - dt_from/dt_to: 날짜 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
       그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
+    - date_field(Phase 4.2): 날짜 범위를 적용할 컬럼. "bid_ntce_dt"(공고일, 기본) 또는
+      "openg_dt"(개찰일). 허용값 외는 기본(bid_ntce_dt)으로 폴백.
+    - price_min/price_max(Phase 4.2): 추정가격(presmpt_prce) 범위. 있는 쪽만 적용
+      (>= min / <= max). presmpt_prce 는 Numeric — 정수로 비교.
     - openg_only_future=True: openg_dt >= now(개찰 임박/미래만, NULL 제외). now 는 테스트
       결정성을 위해 주입 가능(기본 None → datetime.now()).
     - include_past_openg(기본 True=하위호환): False 면 개찰 지난 공고를 숨긴다 —
       `(openg_dt >= now) OR (openg_dt IS NULL)`. **개찰일 미정(NULL)은 아직 유효하므로 표시.**
       openg_only_future 보다 완화된 조건(NULL 포함)이며 /list 기본 동작이 이것이다.
-    - sort: "bid_ntce_dt_desc"(기본=최신 공고순) 또는 "openg_dt_asc"(개찰 임박순; NULL 뒤로).
+    - sort(Phase 4.2 확장): _SORT_COLUMNS 의 6종 허용
+      (bid_ntce_dt/openg_dt/presmpt_prce × asc/desc). NULL 은 항상 뒤로.
+      기본·미허용값은 "bid_ntce_dt_desc"(최신 공고순).
     - page/page_size: LIMIT/OFFSET 페이지네이션. 전체건수는 동일 필터로 count.
     """
+    # 날짜 범위를 적용할 컬럼(허용값 외는 기본 공고일).
+    if date_field not in _DATE_FIELDS:
+        date_field = "bid_ntce_dt"
+    date_col = getattr(BidNotice, date_field)
+
     conditions = []
     if q:
         conditions.append(BidNotice.bid_ntce_nm.ilike(f"%{q}%"))
     if dt_from is not None:
-        conditions.append(BidNotice.bid_ntce_dt >= dt_from)
+        conditions.append(date_col >= dt_from)
     if dt_to is not None:
-        conditions.append(BidNotice.bid_ntce_dt <= dt_to)
+        conditions.append(date_col <= dt_to)
+    if price_min is not None:
+        conditions.append(BidNotice.presmpt_prce >= price_min)
+    if price_max is not None:
+        conditions.append(BidNotice.presmpt_prce <= price_max)
     if openg_only_future:
         if now is None:
             now = datetime.now()
@@ -244,17 +278,16 @@ def search_bid_notices(
     for cond in conditions:
         stmt = stmt.where(cond)
 
-    if sort == "openg_dt_asc":
-        # NULL(개찰일 미정)은 뒤로: is-null 플래그(0/1)를 1차 정렬키로(이식성↑).
-        stmt = stmt.order_by(
-            case((BidNotice.openg_dt.is_(None), 1), else_=0),
-            BidNotice.openg_dt.asc(),
-        )
-    else:  # 기본: 최신 공고순
-        stmt = stmt.order_by(
-            case((BidNotice.bid_ntce_dt.is_(None), 1), else_=0),
-            BidNotice.bid_ntce_dt.desc(),
-        )
+    # 정렬: 허용 6종 → (컬럼, 내림차순). NULL 은 항상 뒤로(is-null 플래그를 1차 키로, 이식성↑).
+    sort_col_name, descending = _SORT_COLUMNS.get(
+        sort, _SORT_COLUMNS["bid_ntce_dt_desc"]
+    )
+    sort_col = getattr(BidNotice, sort_col_name)
+    direction = sort_col.desc() if descending else sort_col.asc()
+    stmt = stmt.order_by(
+        case((sort_col.is_(None), 1), else_=0),
+        direction,
+    )
 
     page = max(1, int(page))
     page_size = max(1, int(page_size))

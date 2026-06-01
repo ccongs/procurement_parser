@@ -28,7 +28,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from app import api_client, repository, scheduler
+from app import api_client, industry_codes, repository, scheduler
 from app.db import SessionLocal
 from app.models import BidNotice
 from app.field_labels import label as field_label
@@ -79,9 +79,34 @@ def _months_ago(d: date, n: int) -> date:
     return date(year, month, min(d.day, last_day))
 
 
+def _months_after(d: date, n: int) -> date:
+    """d 에서 n개월 후 날짜 (말일 보정)."""
+    month = d.month + n
+    year = d.year
+    while month > 12:
+        month -= 12
+        year += 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+
 def _default_date_range() -> tuple[str, str]:
     """기본 조회 기간: 최근 한 달 (시작=한 달 전, 종료=오늘) ISO(yyyy-mm-dd)."""
     today = date.today()
+    return _months_ago(today, 1).isoformat(), today.isoformat()
+
+
+def _list_default_date_range(date_field: str, today: date | None = None) -> tuple[str, str]:
+    """/list 날짜필드별 기본 기간(쿼리에 날짜가 없을 때 서버가 채움). ISO(yyyy-mm-dd).
+
+    - 공고일(bid_ntce_dt): 오늘 − 1개월 ~ 오늘.
+    - 개찰일(openg_dt):   오늘 ~ 오늘 + 1개월.
+    today 는 테스트 결정성을 위해 주입 가능(기본 None → date.today()).
+    """
+    if today is None:
+        today = date.today()
+    if date_field == "openg_dt":
+        return today.isoformat(), _months_after(today, 1).isoformat()
     return _months_ago(today, 1).isoformat(), today.isoformat()
 
 
@@ -483,7 +508,7 @@ BASE_CSS = """
                padding: 7px 14px; border-radius: 7px; }
   .navbtns a:hover { background: #3a6199; }
   .navbtns a.active { background: #fff; color: #1f3a5f; font-weight: 600; }
-  main { max-width: 1180px; margin: 0 auto; padding: 20px; }
+  main { max-width: 1920px; margin: 0 auto; padding: 20px; }
   .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px;
           box-shadow: 0 1px 3px rgba(0,0,0,.08); }
   .card h2 { margin: 0 0 14px; font-size: 16px; }
@@ -525,7 +550,16 @@ BASE_CSS = """
            max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
   th { background: #f4f5f7; }
   th .col-en { font-weight: 400; font-size: 10px; color: #97a0b0; }
+  tbody tr:hover { background: #f5f8ff; }
   tr.bad { background: #fdf1f0; }
+  /* 정렬 가능한 컬럼 헤더(Phase 4.2): 클릭 가능 표시 + 방향 화살표 */
+  th a.sortcol { text-decoration: none; color: inherit; display: inline-block; cursor: pointer; }
+  th a.sortcol:hover { color: #1f3a5f; }
+  th a.sortcol .arrow { color: #1f3a5f; font-size: 11px; }
+  /* 매칭업종 컬럼: 한글(코드) 세로 목록 + 너비 제한 + ellipsis(tooltip 으로 전체 확인) */
+  td.matchind { max-width: 240px; }
+  td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
+                        white-space: nowrap; }
   .pager { display: flex; gap: 10px; align-items: center; margin-top: 14px; font-size: 13px; }
   .pager a { text-decoration: none; color: #1f3a5f; border: 1px solid #cbd2dc; padding: 6px 12px;
              border-radius: 6px; background: #fff; }
@@ -538,9 +572,10 @@ BASE_CSS = """
   button.filebtn:hover { background: #dfe9f7; }
   .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; z-index: 40; }
   .drawer-backdrop.open { display: block; }
-  .drawer { position: fixed; top: 0; right: 0; height: 100%; width: 380px; max-width: 90vw; background: #fff;
+  .drawer { position: fixed; top: 0; right: 0; height: 100%; width: 500px; max-width: 100vw; background: #fff;
             box-shadow: -2px 0 10px rgba(0,0,0,.2); transform: translateX(100%); transition: transform .2s ease;
             z-index: 50; display: flex; flex-direction: column; }
+  @media (max-width: 600px) { .drawer { width: 100%; } }
   .drawer.open { transform: translateX(0); }
   .drawer .dz-head { background: #1f3a5f; color: #fff; padding: 14px 16px; position: relative; }
   .drawer .dz-title { font-size: 14px; padding-right: 28px; word-break: break-all; }
@@ -550,13 +585,16 @@ BASE_CSS = """
   .zipall { display: block; text-align: center; background: #1d7a43; color: #fff; text-decoration: none;
             padding: 9px; border-radius: 7px; margin-bottom: 14px; font-size: 13px; }
   .zipall:hover { background: #166035; }
-  .filelist { list-style: none; margin: 0; padding: 0; }
-  .filelist li { display: flex; justify-content: space-between; gap: 10px; align-items: center;
-                 padding: 8px 0; border-bottom: 1px solid #eef1f6; font-size: 13px; }
-  .filelist span.fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .filelist a.dl { background: #1f3a5f; color: #fff; text-decoration: none; padding: 5px 10px;
-                   border-radius: 6px; font-size: 12px; white-space: nowrap; }
-  .filelist a.dl:hover { background: #16294a; }
+  /* 파일 목록 테이블(Phase 4.2): 파일명 ellipsis + title(tooltip)으로 전체명 확인 */
+  table.filetable { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+  table.filetable th, table.filetable td { border: 1px solid #eef1f6; padding: 7px 8px; text-align: left;
+                                           vertical-align: middle; }
+  table.filetable th { background: #f4f5f7; font-size: 12px; color: #4a5568; }
+  table.filetable th.c-dl, table.filetable td.c-dl { width: 88px; text-align: center; }
+  table.filetable td.c-fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 0; }
+  table.filetable a.dl { background: #1f3a5f; color: #fff; text-decoration: none; padding: 5px 10px;
+                         border-radius: 6px; font-size: 12px; white-space: nowrap; }
+  table.filetable a.dl:hover { background: #16294a; }
 """
 
 
@@ -627,8 +665,28 @@ _LIST_COLUMNS: list[tuple[str, str, str]] = [
     ("presmpt_prce", "amt", "추정가격"),
     ("bid_ntce_dt", "dt", "공고일시"),
     ("openg_dt", "dt", "개찰일시"),
-    ("matched_indstryty_cds", "text", "매칭업종"),
+    ("matched_indstryty_cds", "matchind", "매칭업종"),
 ]
+
+# 컬럼 헤더 클릭 정렬이 가능한 컬럼 → 정렬 sort 키 접두(asc/desc 토글에 사용).
+_SORTABLE_COLUMNS: dict[str, str] = {
+    "bid_ntce_dt": "bid_ntce_dt",
+    "openg_dt": "openg_dt",
+    "presmpt_prce": "presmpt_prce",
+}
+
+# /list 정렬 허용값(repository._SORT_COLUMNS 와 동일). 미허용·빈값은 기본으로 폴백.
+_LIST_SORTS: frozenset[str] = frozenset(
+    {
+        "bid_ntce_dt_desc",
+        "bid_ntce_dt_asc",
+        "openg_dt_desc",
+        "openg_dt_asc",
+        "presmpt_prce_desc",
+        "presmpt_prce_asc",
+    }
+)
+_DEFAULT_SORT = "bid_ntce_dt_desc"
 
 # 첨부 URL 컬럼명(파일 개수 계산·파일 목록 추출에 재사용).
 _SPEC_URL_COLUMNS: list[str] = [f"ntce_spec_doc_url{i}" for i in range(1, 11)]
@@ -650,10 +708,49 @@ def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
     return d
 
 
-def _render_list_rows(rows: list[dict]) -> str:
+def _render_matched_inds(csv: Any) -> str:
+    """매칭업종 CSV → '한글명(코드)' 세로 목록 셀. 셀은 너비 제한+ellipsis, title 로 전체 표시."""
+    labels = industry_codes.matched_labels(str(csv) if csv is not None else None)
+    if not labels:
+        return "<td></td>"
+    rows = "".join(
+        f'<span class="indrow" title="{_e(lbl)}">{_e(lbl)}</span>' for lbl in labels
+    )
+    return f'<td class="matchind">{rows}</td>'
+
+
+def _sort_header(col: str, header: str, sort: str, qs: dict[str, str]) -> str:
+    """정렬 가능한 컬럼 헤더 — 클릭 시 asc↔desc 토글, 현재 정렬 방향을 화살표로 표시.
+
+    링크는 현재 필터(qs)를 보존하고 sort 만 교체한다. page 는 정렬 변경 시 1 로 초기화.
+    """
+    base = _SORTABLE_COLUMNS[col]
+    cur_desc = sort == f"{base}_desc"
+    cur_asc = sort == f"{base}_asc"
+    # 현재 이 컬럼으로 정렬 중이면 반대 방향, 아니면 처음엔 desc(추정가격·일시 모두 큰 값/최신 먼저).
+    next_sort = f"{base}_asc" if cur_desc else f"{base}_desc"
+    arrow = ""
+    if cur_desc:
+        arrow = ' <span class="arrow">▼</span>'
+    elif cur_asc:
+        arrow = ' <span class="arrow">▲</span>'
+    params = {**qs, "sort": next_sort, "page": "1"}
+    query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+    return (
+        f'<th><a class="sortcol" href="/list?{query}">{_e(header)}{arrow}</a></th>'
+    )
+
+
+def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
-    head = "".join(f"<th>{_e(header)}</th>" for _, _, header in _LIST_COLUMNS)
+    head_cells = []
+    for col, _kind, header in _LIST_COLUMNS:
+        if col in _SORTABLE_COLUMNS:
+            head_cells.append(_sort_header(col, header, sort, qs))
+        else:
+            head_cells.append(f"<th>{_e(header)}</th>")
+    head = "".join(head_cells)
     head += "<th>파일</th>"
     body_rows = []
     for i, r in enumerate(rows, start=1):
@@ -664,6 +761,8 @@ def _render_list_rows(rows: list[dict]) -> str:
                 cells.append(f"<td>{_e(_fmt_amt(val))}</td>")
             elif kind == "dt":
                 cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
+            elif kind == "matchind":
+                cells.append(_render_matched_inds(val))
             elif kind == "link":
                 url = r.get("bid_ntce_dtl_url")
                 text = _e(val)
@@ -729,6 +828,27 @@ _LIST_SCRIPT = """
     if (t) t.value = fmtDate(today);
   }
 
+  // 날짜 기준(공고일/개찰일) 변경 시 날짜 입력 기본값을 해당 필드 기본 기간으로 갱신.
+  // 공고일: 오늘-1개월 ~ 오늘 / 개찰일: 오늘 ~ 오늘+1개월. (서버도 동일 기본 적용)
+  (function () {
+    var sel = document.getElementById('date_field');
+    if (!sel) return;
+    sel.addEventListener('change', function () {
+      var today = new Date();
+      var f = document.getElementById('dt_from');
+      var t = document.getElementById('dt_to');
+      if (sel.value === 'openg_dt') {
+        var after = new Date(today.getFullYear(), today.getMonth() + 1, today.getDate());
+        if (f) f.value = fmtDate(today);
+        if (t) t.value = fmtDate(after);
+      } else {
+        var before = new Date(today.getFullYear(), today.getMonth() - 1, today.getDate());
+        if (f) f.value = fmtDate(before);
+        if (t) t.value = fmtDate(today);
+      }
+    });
+  })();
+
   (function () {
     var backdrop = document.getElementById('drawerBackdrop');
     var drawer = document.getElementById('drawer');
@@ -766,25 +886,33 @@ _LIST_SCRIPT = """
             titleEl.textContent = d.bid_ntce_nm || no;
             var files = d.files || [];
             if (!files.length) {
-              var empty = document.createElement('li');
-              empty.textContent = '첨부가 없습니다.';
-              listEl.appendChild(empty);
+              var emptyTr = document.createElement('tr');
+              var emptyTd = document.createElement('td');
+              emptyTd.colSpan = 2;
+              emptyTd.textContent = '첨부가 없습니다.';
+              emptyTr.appendChild(emptyTd);
+              listEl.appendChild(emptyTr);
               return;
             }
             files.forEach(function (f) {
-              var li = document.createElement('li');
-              var span = document.createElement('span');
-              span.className = 'fn';
-              span.textContent = f.name;
+              var tr = document.createElement('tr');
+              var tdName = document.createElement('td');
+              tdName.className = 'c-fn';
+              // 표시 텍스트는 ellipsis 로 줄이고, title 에 전체 파일명(hover tooltip). XSS 방지 위해 textContent.
+              tdName.textContent = f.name;
+              tdName.title = f.name;
+              var tdDl = document.createElement('td');
+              tdDl.className = 'c-dl';
               var a = document.createElement('a');
               a.className = 'dl';
               a.href = f.url;
               a.target = '_blank';
               a.rel = 'noopener';
               a.textContent = '다운로드';
-              li.appendChild(span);
-              li.appendChild(a);
-              listEl.appendChild(li);
+              tdDl.appendChild(a);
+              tr.appendChild(tdName);
+              tr.appendChild(tdDl);
+              listEl.appendChild(tr);
             });
           })
           .catch(function () { titleEl.textContent = '불러오기 실패'; });
@@ -799,11 +927,31 @@ def root() -> RedirectResponse:
     return RedirectResponse(url="/list", status_code=307)
 
 
+def _parse_price(s: str | None) -> int | None:
+    """가격 입력(문자열, 콤마 허용) → int. 빈값/형식오류는 None."""
+    if not s:
+        return None
+    s = str(s).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            # "1234.0" 같은 소수 표기 방어(설정값이 그렇게 저장될 수 있음).
+            return int(float(s))
+        except ValueError:
+            return None
+
+
 @app.get("/list", response_class=HTMLResponse)
 def list_page(
     q: str | None = None,
     dt_from: str | None = None,
     dt_to: str | None = None,
+    date_field: str = "bid_ntce_dt",
+    price_min: str | None = None,
+    price_max: str | None = None,
     include_past: str | None = None,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
@@ -811,21 +959,43 @@ def list_page(
     page_size = 50
     # 기본 동작 = 개찰 지난 공고 숨김. "지난 개찰 포함" 체크 시에만 전체 노출.
     include_past_flag = include_past in ("1", "on", "true", "Y", "y")
-    sort = sort if sort in ("bid_ntce_dt_desc", "openg_dt_asc") else "bid_ntce_dt_desc"
+    # 정렬: 헤더 클릭 6종. 미허용·빈값은 기본(최신 공고일).
+    sort = sort if sort in _LIST_SORTS else _DEFAULT_SORT
+    # 날짜 적용 컬럼: 공고일/개찰일.
+    date_field = date_field if date_field in ("bid_ntce_dt", "openg_dt") else "bid_ntce_dt"
     try:
         page = max(1, int(page))
     except (TypeError, ValueError):
         page = 1
 
-    df = _parse_date(dt_from)
-    dtto = _parse_date(dt_to, end_of_day=True)
+    # 날짜 기본값: 쿼리에 값이 없을 때만 필드별 기본 기간을 채운다(사용자 입력 우선).
+    def_from, def_to = _list_default_date_range(date_field)
+    dt_from_eff = dt_from if (dt_from and dt_from.strip()) else def_from
+    dt_to_eff = dt_to if (dt_to and dt_to.strip()) else def_to
 
+    df = _parse_date(dt_from_eff)
+    dtto = _parse_date(dt_to_eff, end_of_day=True)
+
+    # 가격: 화면 입력값 우선, 비었으면 설정 기본값(presmpt_prce_bgn/end).
     with SessionLocal() as session:
+        cfg = repository.get_config(session)
+        cfg_price_bgn = cfg.presmpt_prce_bgn
+        cfg_price_end = cfg.presmpt_prce_end
+
+        price_min_in = price_min if (price_min is not None and str(price_min).strip()) else None
+        price_max_in = price_max if (price_max is not None and str(price_max).strip()) else None
+        # 입력칸에 표시할 값(숫자 정규화). 입력이 없으면 설정 기본값.
+        price_min_disp = _parse_price(price_min_in) if price_min_in is not None else _parse_price(cfg_price_bgn)
+        price_max_disp = _parse_price(price_max_in) if price_max_in is not None else _parse_price(cfg_price_end)
+
         objs, total = repository.search_bid_notices(
             session,
             q=q,
             dt_from=df,
             dt_to=dtto,
+            date_field=date_field,
+            price_min=price_min_disp,
+            price_max=price_max_disp,
             include_past_openg=include_past_flag,
             sort=sort,
             page=page,
@@ -841,13 +1011,24 @@ def list_page(
             d["_file_count"] = sum(1 for c in _SPEC_URL_COLUMNS if d.get(c))
             rows.append(d)
 
+    # 입력칸 표시값(문자열). 정규화된 정수를 그대로 보여준다(없으면 빈칸).
+    price_min_field = "" if price_min_disp is None else str(price_min_disp)
+    price_max_field = "" if price_max_disp is None else str(price_max_disp)
+
+    # 쿼리스트링 보존(페이지 이동·헤더 정렬 시 다른 필터 유지). 유효 날짜(서버 기본 포함)를 싣는다.
     qs = {
         "q": q or "",
-        "dt_from": dt_from or "",
-        "dt_to": dt_to or "",
+        "dt_from": dt_from_eff or "",
+        "dt_to": dt_to_eff or "",
+        "date_field": date_field,
+        "price_min": price_min_field,
+        "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
         "sort": sort,
     }
+
+    nf_sel = " selected" if date_field == "bid_ntce_dt" else ""
+    og_sel = " selected" if date_field == "openg_dt" else ""
 
     body = f"""
     <div class="card">
@@ -859,13 +1040,20 @@ def list_page(
             <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
           </label>
           <label class="field">
-            <span class="flabel">공고일 시작 <code>dt_from</code></span>
-            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from or '')}">
+            <span class="flabel">날짜 기준 <code>date_field</code></span>
+            <select name="date_field" id="date_field">
+              <option value="bid_ntce_dt"{nf_sel}>공고일</option>
+              <option value="openg_dt"{og_sel}>개찰일</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="flabel">시작 <code>dt_from</code></span>
+            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
           </label>
           <span class="tilde">~</span>
           <label class="field">
-            <span class="flabel">공고일 종료 <code>dt_to</code></span>
-            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to or '')}">
+            <span class="flabel">종료 <code>dt_to</code></span>
+            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
           </label>
           <div class="quick">
             <button type="button" onclick="setRecent(1)">최근1개월</button>
@@ -874,17 +1062,22 @@ def list_page(
           </div>
         </div>
         <div class="row" style="margin-top:12px;">
+          <label class="field">
+            <span class="flabel">추정가격 최소 <code>price_min</code></span>
+            <input type="number" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
+          </label>
+          <span class="tilde">~</span>
+          <label class="field">
+            <span class="flabel">추정가격 최대 <code>price_max</code></span>
+            <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px;">
           <label class="chk">
             <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
             지난 개찰 포함 (기본은 개찰 지난 공고 숨김 · 개찰일 미정은 항상 표시)
           </label>
-          <label class="field">
-            <span class="flabel">정렬 <code>sort</code></span>
-            <select name="sort">
-              <option value="bid_ntce_dt_desc"{' selected' if sort == 'bid_ntce_dt_desc' else ''}>최신 공고순</option>
-              <option value="openg_dt_asc"{' selected' if sort == 'openg_dt_asc' else ''}>개찰 임박순</option>
-            </select>
-          </label>
+          <input type="hidden" name="sort" value="{_e(sort)}">
           <button type="submit" class="submit">검색</button>
         </div>
       </form>
@@ -892,7 +1085,7 @@ def list_page(
 
     <div class="card">
       <h2>수집된 공고</h2>
-      {_render_list_rows(rows)}
+      {_render_list_rows(rows, sort, qs)}
       {_render_pager(total, page, page_size, qs)}
     </div>
 
@@ -904,7 +1097,10 @@ def list_page(
       </div>
       <div class="dz-body">
         <a id="zipAll" class="zipall" href="#">전체 다운로드 (.zip)</a>
-        <ul class="filelist" id="fileList"></ul>
+        <table class="filetable">
+          <thead><tr><th class="c-fn">파일명</th><th class="c-dl">다운로드</th></tr></thead>
+          <tbody id="fileList"></tbody>
+        </table>
       </div>
     </aside>
 
@@ -1166,7 +1362,16 @@ def _render_config_page(
               <span class="flabel">업종코드 CSV <code>indstryty_cds</code></span>
               <input type="text" name="indstryty_cds" value="{_e(cfg.get('indstryty_cds'))}" placeholder="예: 1426,1468,1469,1470">
             </label>
+            <label class="field">
+              <span class="flabel">추정가격 기본 하한 <code>presmpt_prce_bgn</code></span>
+              <input type="number" name="presmpt_prce_bgn" value="{_e(cfg.get('presmpt_prce_bgn'))}" placeholder="비우면 미적용" min="0">
+            </label>
+            <label class="field">
+              <span class="flabel">추정가격 기본 상한 <code>presmpt_prce_end</code></span>
+              <input type="number" name="presmpt_prce_end" value="{_e(cfg.get('presmpt_prce_end'))}" placeholder="비우면 미적용" min="0">
+            </label>
           </div>
+          <div class="note">목록(/list) 추정가격 검색의 기본값으로 쓰입니다(비우면 기본 미적용).</div>
         </fieldset>
         <label class="chk" style="margin-bottom:14px;">
           <input type="checkbox" name="enabled" value="1"{enabled_checked}>
@@ -1193,6 +1398,7 @@ def _load_config_view() -> tuple[dict, list[dict]]:
         "interval_minutes", "window_overlap_minutes", "backfill_days",
         "num_of_rows", "max_retries", "inqry_div", "intrntnl_div_cd",
         "indstryty_cds", "last_success_dt",
+        "presmpt_prce_bgn", "presmpt_prce_end",
     ]
     run_fields = [
         "id", "trigger", "status", "window_bgn_dt", "window_end_dt",
@@ -1263,6 +1469,25 @@ async def config_save(request: Request):
         errors.append("업종코드(indstryty_cds)는 숫자 코드의 콤마 구분이어야 합니다.")
     else:
         updates["indstryty_cds"] = ",".join(codes)
+
+    # 추정가격 기본 하한/상한 — 숫자(콤마 허용) 또는 빈값. 빈값은 None(미적용)으로 저장.
+    for name, lbl in (
+        ("presmpt_prce_bgn", "추정가격 기본 하한"),
+        ("presmpt_prce_end", "추정가격 기본 상한"),
+    ):
+        raw = data.get(name, "").strip().replace(",", "")
+        if raw == "":
+            updates[name] = None
+            continue
+        try:
+            num = int(raw)
+        except ValueError:
+            errors.append(f"{lbl}({name}): 숫자 또는 빈값이어야 합니다('{data.get(name)}').")
+            continue
+        if num < 0:
+            errors.append(f"{lbl}({name}): 0 이상이어야 합니다({num}).")
+            continue
+        updates[name] = str(num)
 
     # enabled 체크박스(없으면 False)
     updates["enabled"] = data.get("enabled") in ("1", "on", "true")

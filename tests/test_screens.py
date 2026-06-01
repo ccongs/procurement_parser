@@ -274,15 +274,22 @@ def test_root_redirects_to_list(client):
     assert resp.headers["location"] == "/list"
 
 
+# 공고일 기본 기간(오늘-1개월~오늘)에 의존하지 않도록, 시드(2026-05-xx)를 덮는 넓은 범위를 명시.
+# (서버는 쿼리에 날짜가 없을 때만 기본 기간을 적용하므로, 명시하면 실행 시점과 무관하게 결정적.)
+_WIDE = {"dt_from": "2000-01-01", "dt_to": "2099-12-31"}
+
+
 def test_list_page_ok(client):
-    resp = client.get("/list")
+    resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     assert "스모크 테스트 공고" in resp.text
     assert "공고 검색" in resp.text
 
 
 def test_list_page_filter_querystring(client):
-    resp = client.get("/list", params={"q": "없는공고", "sort": "openg_dt_asc", "page": "1"})
+    resp = client.get(
+        "/list", params={**_WIDE, "q": "없는공고", "sort": "openg_dt_asc", "page": "1"}
+    )
     assert resp.status_code == 200
     assert "조건에 맞는 공고가 없습니다" in resp.text
 
@@ -396,7 +403,7 @@ def test_get_notice_files_missing_notice(session):
 
 # --- 라우트: 기본 숨김 / 토글 -----------------------------------------
 def test_list_default_hides_past_openg(client):
-    resp = client.get("/list")
+    resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     # 개찰일 NULL(S-1)·미래 없음 → 표시, 과거(S-PAST)는 기본 숨김.
     assert "스모크 테스트 공고" in resp.text
@@ -404,7 +411,7 @@ def test_list_default_hides_past_openg(client):
 
 
 def test_list_include_past_shows_past(client):
-    resp = client.get("/list", params={"include_past": "1"})
+    resp = client.get("/list", params={**_WIDE, "include_past": "1"})
     assert resp.status_code == 200
     assert "지난 개찰 공고" in resp.text
     # 페이지네이션·쿼리스트링에 include_past 보존
@@ -412,7 +419,7 @@ def test_list_include_past_shows_past(client):
 
 
 def test_list_korean_only_headers(client):
-    resp = client.get("/list")
+    resp = client.get("/list", params=_WIDE)
     # 한글 헤더 노출, 영문 컬럼명/병기 code 미노출.
     assert "<th>공고번호</th>" in resp.text
     assert "<th>공고명</th>" in resp.text
@@ -508,3 +515,350 @@ def test_list_files_zip_all_fail_returns_502(client, monkeypatch):
     monkeypatch.setattr(main.httpx, "AsyncClient", _FailingClient)
     resp = client.get("/list/S-FILE/files.zip")
     assert resp.status_code == 502
+
+
+# =====================================================================
+#  Phase 4.2 — 매칭업종·정렬·날짜필드·가격필터·설정 기본값
+# =====================================================================
+
+from datetime import date as _date  # noqa: E402
+
+from decimal import Decimal  # noqa: E402
+
+from app import industry_codes, main  # noqa: E402
+
+
+def _bnp(no, nm, ntce_dt, openg_dt, price):
+    """가격(presmpt_prce) 포함 BidNotice. price=None 이면 NULL."""
+    base = datetime(2026, 6, 1, 12, 0, 0)
+    return BidNotice(
+        bid_ntce_no=no,
+        bid_ntce_nm=nm,
+        ntce_instt_nm="테스트기관",
+        bid_ntce_dt=ntce_dt,
+        openg_dt=openg_dt,
+        presmpt_prce=(None if price is None else Decimal(price)),
+        collected_at=base,
+        updated_at=base,
+    )
+
+
+def _seed_priced(session):
+    session.add_all(
+        [
+            _bnp("P-1", "공고1", datetime(2026, 5, 1, 9, 0), datetime(2026, 7, 1, 10, 0), 10_000_000),
+            _bnp("P-2", "공고2", datetime(2026, 5, 10, 9, 0), datetime(2026, 6, 20, 10, 0), 50_000_000),
+            _bnp("P-3", "공고3", datetime(2026, 5, 20, 9, 0), datetime(2026, 5, 25, 10, 0), 100_000_000),
+            _bnp("P-4", "공고4(가격없음)", datetime(2026, 4, 1, 9, 0), None, None),
+        ]
+    )
+    session.commit()
+
+
+# --- date_field 범위 필터 ---------------------------------------------
+def test_search_date_field_openg(session):
+    _seed_priced(session)
+    # 개찰일 2026-06-01 ~ 2026-07-31 → P-1(7/1), P-2(6/20). P-3(5/25)·P-4(NULL) 제외.
+    rows, total = repository.search_bid_notices(
+        session,
+        date_field="openg_dt",
+        dt_from=datetime(2026, 6, 1, 0, 0, 0),
+        dt_to=datetime(2026, 7, 31, 23, 59, 59),
+    )
+    assert total == 2
+    assert {r.bid_ntce_no for r in rows} == {"P-1", "P-2"}
+
+
+def test_search_date_field_default_is_bid_ntce_dt(session):
+    _seed_priced(session)
+    # 기본(date_field 미지정)은 공고일 기준 — 5/5~5/31 → P-2(5/10), P-3(5/20).
+    rows, total = repository.search_bid_notices(
+        session,
+        dt_from=datetime(2026, 5, 5, 0, 0, 0),
+        dt_to=datetime(2026, 5, 31, 23, 59, 59),
+    )
+    assert total == 2
+    assert {r.bid_ntce_no for r in rows} == {"P-2", "P-3"}
+
+
+def test_search_date_field_invalid_falls_back(session):
+    _seed_priced(session)
+    # 허용 외 값 → 공고일(bid_ntce_dt)로 폴백.
+    rows, _ = repository.search_bid_notices(
+        session,
+        date_field="HACK",
+        dt_from=datetime(2026, 5, 5, 0, 0, 0),
+        dt_to=datetime(2026, 5, 31, 23, 59, 59),
+    )
+    assert {r.bid_ntce_no for r in rows} == {"P-2", "P-3"}
+
+
+# --- price_min / price_max 경계 ---------------------------------------
+def test_search_price_min(session):
+    _seed_priced(session)
+    # >= 50,000,000 → P-2, P-3 (P-1 1천만 제외, P-4 NULL 제외).
+    rows, total = repository.search_bid_notices(session, price_min=50_000_000)
+    assert total == 2
+    assert {r.bid_ntce_no for r in rows} == {"P-2", "P-3"}
+
+
+def test_search_price_max(session):
+    _seed_priced(session)
+    # <= 50,000,000 → P-1, P-2 (경계 포함, P-3 1억 제외, P-4 NULL 제외).
+    rows, total = repository.search_bid_notices(session, price_max=50_000_000)
+    assert total == 2
+    assert {r.bid_ntce_no for r in rows} == {"P-1", "P-2"}
+
+
+def test_search_price_min_and_max(session):
+    _seed_priced(session)
+    # 10,000,000 ~ 50,000,000 (경계 포함) → P-1, P-2.
+    rows, total = repository.search_bid_notices(
+        session, price_min=10_000_000, price_max=50_000_000
+    )
+    assert total == 2
+    assert {r.bid_ntce_no for r in rows} == {"P-1", "P-2"}
+
+
+def test_search_price_none_keeps_null_rows(session):
+    _seed_priced(session)
+    # 가격 필터 없으면 NULL 가격(P-4)도 포함.
+    rows, total = repository.search_bid_notices(session)
+    assert total == 4
+    assert "P-4" in {r.bid_ntce_no for r in rows}
+
+
+# --- 신규 sort 6종 (NULL 뒤로) ----------------------------------------
+def test_sort_bid_ntce_dt_asc(session):
+    _seed_priced(session)
+    rows, _ = repository.search_bid_notices(session, sort="bid_ntce_dt_asc")
+    # 오름차순: 4/1(P-4) < 5/1(P-1) < 5/10(P-2) < 5/20(P-3)
+    assert [r.bid_ntce_no for r in rows] == ["P-4", "P-1", "P-2", "P-3"]
+
+
+def test_sort_openg_dt_desc_nulls_last(session):
+    _seed_priced(session)
+    rows, _ = repository.search_bid_notices(session, sort="openg_dt_desc")
+    # 내림차순: 7/1(P-1) > 6/20(P-2) > 5/25(P-3) > NULL(P-4) 뒤로
+    assert [r.bid_ntce_no for r in rows] == ["P-1", "P-2", "P-3", "P-4"]
+
+
+def test_sort_presmpt_prce_desc_nulls_last(session):
+    _seed_priced(session)
+    rows, _ = repository.search_bid_notices(session, sort="presmpt_prce_desc")
+    # 1억(P-3) > 5천만(P-2) > 1천만(P-1) > NULL(P-4) 뒤로
+    assert [r.bid_ntce_no for r in rows] == ["P-3", "P-2", "P-1", "P-4"]
+
+
+def test_sort_presmpt_prce_asc_nulls_last(session):
+    _seed_priced(session)
+    rows, _ = repository.search_bid_notices(session, sort="presmpt_prce_asc")
+    # 1천만(P-1) < 5천만(P-2) < 1억(P-3) < NULL(P-4) 뒤로
+    assert [r.bid_ntce_no for r in rows] == ["P-1", "P-2", "P-3", "P-4"]
+
+
+def test_sort_unknown_falls_back_to_default(session):
+    _seed_priced(session)
+    rows, _ = repository.search_bid_notices(session, sort="bogus")
+    # 기본 = 최신 공고일순(desc): 5/20 > 5/10 > 5/1 > 4/1
+    assert [r.bid_ntce_no for r in rows] == ["P-3", "P-2", "P-1", "P-4"]
+
+
+# --- update_config: 가격 기본값 화이트리스트 --------------------------
+def test_update_config_price_defaults_whitelist(session):
+    cfg = repository.update_config(
+        session, presmpt_prce_bgn="1000", presmpt_prce_end="9000"
+    )
+    assert cfg.presmpt_prce_bgn == "1000"
+    assert cfg.presmpt_prce_end == "9000"
+    # 비허용 키는 여전히 무시.
+    cfg2 = repository.update_config(session, presmpt_prce_bgn="2000", bid_ntce_no="X")
+    assert cfg2.presmpt_prce_bgn == "2000"
+
+
+def test_update_config_price_defaults_none(session):
+    repository.update_config(session, presmpt_prce_bgn="500")
+    cfg = repository.update_config(session, presmpt_prce_bgn=None)
+    assert cfg.presmpt_prce_bgn is None
+
+
+# --- main 헬퍼: 날짜 기본 기간(결정적: today 주입) --------------------
+def test_months_after_basic():
+    assert main._months_after(_date(2026, 6, 1), 1) == _date(2026, 7, 1)
+    # 말일 보정: 1/31 + 1개월 → 2/28(2026 평년)
+    assert main._months_after(_date(2026, 1, 31), 1) == _date(2026, 2, 28)
+    # 연도 넘김
+    assert main._months_after(_date(2026, 12, 15), 1) == _date(2027, 1, 15)
+
+
+def test_list_default_date_range_bid_ntce_dt():
+    today = _date(2026, 6, 1)
+    f, t = main._list_default_date_range("bid_ntce_dt", today=today)
+    assert f == "2026-05-01"
+    assert t == "2026-06-01"
+
+
+def test_list_default_date_range_openg_dt():
+    today = _date(2026, 6, 1)
+    f, t = main._list_default_date_range("openg_dt", today=today)
+    assert f == "2026-06-01"
+    assert t == "2026-07-01"
+
+
+# --- industry_codes 매핑 ----------------------------------------------
+def test_industry_matched_labels():
+    labels = industry_codes.matched_labels("1426,1468")
+    assert labels == [
+        "소프트웨어사업자(패키지소프트웨어개발·공급사업)(1426)",
+        "소프트웨어사업자(컴퓨터관련서비스사업)(1468)",
+    ]
+
+
+def test_industry_unknown_code_passthrough():
+    assert industry_codes.matched_labels("9999") == ["9999"]
+    assert industry_codes.matched_labels("") == []
+    assert industry_codes.matched_labels(None) == []
+
+
+# --- main 헬퍼: 가격 파싱 ---------------------------------------------
+def test_parse_price():
+    assert main._parse_price("1,000,000") == 1_000_000
+    assert main._parse_price("500") == 500
+    assert main._parse_price("") is None
+    assert main._parse_price(None) is None
+    assert main._parse_price("abc") is None
+    assert main._parse_price("1234.0") == 1234
+
+
+# --- 라우트 스모크: Phase 4.2 -----------------------------------------
+def test_list_header_sort_links_present(client):
+    """컬럼 헤더 정렬 링크가 존재(공고일/개찰일/추정가격)."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'class="sortcol"' in resp.text
+    assert "sort=bid_ntce_dt_asc" in resp.text  # 기본이 desc 이므로 헤더는 다음 클릭=asc
+    assert "sort=openg_dt_desc" in resp.text
+    assert "sort=presmpt_prce_desc" in resp.text
+    # 정렬 select 는 검색폼에서 제거됨(헤더 클릭으로 대체).
+    assert '<select name="sort"' not in resp.text
+
+
+def test_list_default_sort_is_latest(client):
+    """기본 정렬 = 최신 공고일(bid_ntce_dt_desc) — 현재 컬럼 헤더에 ▼ 표시."""
+    resp = client.get("/list", params=_WIDE)
+    # 현재 정렬이 desc 이므로 공고일 헤더에 ▼ 화살표.
+    assert "▼" in resp.text
+
+
+def test_list_price_filter_query(client):
+    """가격 필터 쿼리 — price_max 로 좁히면 결과·입력값 반영."""
+    resp = client.get("/list", params={**_WIDE, "price_min": "1", "price_max": "999999999999"})
+    assert resp.status_code == 200
+    # 입력칸에 값 반영
+    assert 'name="price_min"' in resp.text
+    assert 'name="price_max"' in resp.text
+
+
+def test_list_date_field_switch_openg(client):
+    """date_field=openg_dt 전환 — select 에 개찰일 선택, 라우트 200."""
+    resp = client.get("/list", params={**_WIDE, "date_field": "openg_dt"})
+    assert resp.status_code == 200
+    assert 'name="date_field"' in resp.text
+    assert '<option value="openg_dt" selected>개찰일</option>' in resp.text
+
+
+def test_list_matched_industry_korean_vertical(client):
+    """매칭업종 한글(코드) 세로 표기 — 시드에 매칭코드 부여 후 한글명 노출 확인."""
+    from app import main as _main
+
+    # 매칭코드가 있는 공고를 임시로 추가(client 픽스처 DB 에).
+    with _main.SessionLocal() as s:
+        s.add(
+            BidNotice(
+                bid_ntce_no="S-IND",
+                bid_ntce_nm="매칭업종 표기 공고",
+                ntce_instt_nm="테스트기관",
+                bid_ntce_dt=datetime(2026, 5, 4, 9, 0),
+                openg_dt=None,
+                matched_indstryty_cds="1426,1468",
+                collected_at=datetime(2026, 6, 1, 12, 0),
+                updated_at=datetime(2026, 6, 1, 12, 0),
+            )
+        )
+        s.commit()
+
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 한글명(코드) 세로(span.indrow) 표기.
+    assert 'class="indrow"' in resp.text
+    assert "소프트웨어사업자(컴퓨터관련서비스사업)(1468)" in resp.text
+
+
+def test_config_page_has_price_defaults(client):
+    """/config 에 추정가격 기본 하한/상한 입력 노출."""
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    assert 'name="presmpt_prce_bgn"' in resp.text
+    assert 'name="presmpt_prce_end"' in resp.text
+
+
+def test_config_save_price_defaults(client):
+    """/config 저장 시 가격 기본값(숫자) 반영, 빈값은 None."""
+    resp = client.post(
+        "/config",
+        data={
+            "interval_minutes": "30",
+            "window_overlap_minutes": "90",
+            "backfill_days": "30",
+            "num_of_rows": "20",
+            "max_retries": "2",
+            "inqry_div": "1",
+            "intrntnl_div_cd": "1",
+            "indstryty_cds": "1426",
+            "presmpt_prce_bgn": "1000000",
+            "presmpt_prce_end": "",
+            "enabled": "1",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    from app import main as _main
+
+    with _main.SessionLocal() as s:
+        cfg = repository.get_config(s)
+        assert cfg.presmpt_prce_bgn == "1000000"
+        assert cfg.presmpt_prce_end is None
+
+
+def test_config_save_price_invalid_returns_400(client):
+    """가격 기본값이 비숫자면 400."""
+    resp = client.post(
+        "/config",
+        data={
+            "interval_minutes": "30",
+            "window_overlap_minutes": "90",
+            "backfill_days": "30",
+            "num_of_rows": "20",
+            "max_retries": "2",
+            "inqry_div": "1",
+            "intrntnl_div_cd": "1",
+            "indstryty_cds": "1426",
+            "presmpt_prce_bgn": "abc",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "추정가격" in resp.text
+
+
+def test_list_price_default_from_config(client):
+    """설정의 가격 기본값이 /list 입력칸 기본값으로 노출(쿼리 미지정 시)."""
+    from app import main as _main
+
+    with _main.SessionLocal() as s:
+        repository.update_config(s, presmpt_prce_bgn="7000000", presmpt_prce_end="8000000")
+
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'value="7000000"' in resp.text
+    assert 'value="8000000"' in resp.text
