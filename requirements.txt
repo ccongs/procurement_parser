@@ -1,0 +1,8 @@
+# Phase 1 - API 호출/응답 형태 확인용 의존성
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+jinja2
+xmltodict
+python-multipart

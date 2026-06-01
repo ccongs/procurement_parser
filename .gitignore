@@ -1,0 +1,31 @@
+# 시크릿 (서비스 키 포함) - 절대 커밋 금지
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# SQLite DB (수집 데이터)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / 에디터
+.DS_Store
+~$*
+
+#Agent관련
+CLAUDE.md
+AGENTS.md
+HANDOFF.md
+# 문서파일
+documents
+# 임시 워드 잠금 파일
+~$*.docx
+
+.idea
+.claude
