@@ -137,6 +137,7 @@ class CollectionRun(Base):
     error_code = Column(String(2))          # 마지막 에러 resultCode
     error_msg = Column(Text)                # 실패 메시지
     detail_json = Column(Text)              # 업종코드별 결과(페이지수·resultCode·건수)
+    source = Column(String(10), nullable=True, default="bid")  # 수집원: bid|pre_spec (Phase 5.4)
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<CollectionRun id={self.id} status={self.status!r}>"
@@ -165,6 +166,9 @@ class AppConfig(Base):
     presmpt_prce_end = Column(String(25))                    # 추정가격 상한(미사용)
     last_success_dt = Column(DateTime)                       # 마지막 성공 윈도우 종료 시각
     updated_at = Column(DateTime)                            # 설정 변경 시각
+    # --- 사전규격 잡(Phase 5.4) — 입찰과 독립 토글·윈도우 기준 ---
+    pre_spec_enabled = Column(Boolean, nullable=False, default=True)  # 사전규격 잡 독립 on/off
+    pre_spec_last_success_dt = Column(DateTime)              # 사전규격 윈도우 산정 기준(마지막 성공 종료 시각)
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<AppConfig id={self.id} enabled={self.enabled} auto_halted={self.auto_halted}>"

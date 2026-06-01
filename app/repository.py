@@ -47,8 +47,13 @@ def create_run(
     trigger: str,
     window_bgn: datetime,
     window_end: datetime,
+    source: str = "bid",
 ) -> CollectionRun:
-    """status='running' 으로 실행 이력을 insert 하고 flush(=id 확보) 후 반환."""
+    """status='running' 으로 실행 이력을 insert 하고 flush(=id 확보) 후 반환.
+
+    source: 수집원 구분(Phase 5.4) — "bid"(기본, 입찰) | "pre_spec"(사전규격).
+    기본값 "bid" 이므로 입찰 collector 의 기존 호출은 무변경(하위호환).
+    """
     run = CollectionRun(
         trigger=trigger,
         run_started_at=datetime.now(),
@@ -59,6 +64,7 @@ def create_run(
         total_new=0,
         total_updated=0,
         retry_count=0,
+        source=source,
     )
     session.add(run)
     session.flush()  # id 확보
@@ -234,11 +240,25 @@ def update_last_success_dt(session: Session, dt: datetime) -> None:
     session.commit()
 
 
+def update_pre_spec_last_success_dt(session: Session, dt: datetime) -> None:
+    """사전규격 마지막 성공 윈도우 종료 시각 갱신(Phase 5.4).
+
+    `update_last_success_dt` 와 동형이되 사전규격 전용 컬럼만 갱신한다. 사전규격 수집이
+    전체 성공(success) 일 때만 pre_spec_collector 가 호출한다(입찰 last_success_dt 와 분리).
+    """
+    cfg = get_config(session)
+    cfg.pre_spec_last_success_dt = dt
+    cfg.updated_at = datetime.now()
+    session.commit()
+
+
 # --- 화면(/list·/config)용 조회 — Phase 3.5 -----------------------------
 # /config 설정 편집에서 갱신을 허용하는 컬럼 화이트리스트(이 외 키는 무시).
 _CONFIG_UPDATABLE: frozenset[str] = frozenset(
     {
         "enabled",
+        # Phase 5.4: 사전규격 잡 독립 토글(/config 토글 UI 는 5.5에서 연결).
+        "pre_spec_enabled",
         "interval_minutes",
         "window_overlap_minutes",
         "backfill_days",

@@ -10,12 +10,15 @@
 이 단계의 수집기는 **윈도우(시작·종료 datetime)와 trigger 를 인자로 받는다.**
 윈도우 자동 산정(last_success_dt)·주기 실행·스케줄러 통합·`/pre-spec` 화면은 5.4 이후.
 
-**halt/last_success 정책(5.3 — 입찰과 분리):**
-- 수동 실행이므로 `app_config.auto_halted` 게이트를 **읽지도 쓰지도 않는다**(전역 halt 는
-  입찰 스케줄러 개념 — 사전규격 연결은 5.4). 즉 `repository.set_halt`·
+**halt/last_success 정책(입찰과 분리, 5.4 갱신):**
+- 전역 halt 를 두지 않는다(사전규격 독립). `app_config.auto_halted` 게이트를 **읽지도 쓰지도
+  않으며**(게이트는 5.4 스케줄러의 `pre_spec_enabled` 단독), `repository.set_halt`·입찰
   `repository.update_last_success_dt` 를 **호출하지 않는다.**
 - halt 코드 만나면 그 run 만 `failed`(저장 0). 재시도 소진(failed)이면 그때까지 받은
   페이지를 저장하고 run `partial`. 전 페이지 정상이면 저장 후 `success`.
+- **5.4**: 전체 `success` 일 때만 `repository.update_pre_spec_last_success_dt(window_end)` 로
+  사전규격 전용 last_success 를 갱신한다(partial/failed/halt 미갱신 → 다음 tick 재수집).
+  `source="pre_spec"` 로 collection_run 을 태깅한다(입찰=`bid`).
 
 순수 헬퍼(`classify_result_code`·`total_pages`·`fmt_dt`)는 입찰 `app.collector` 에서
 import 재사용한다(collector.py 는 무수정). `_call_with_retry`·`_fetch_*`·`_detach_run` 은
@@ -231,7 +234,9 @@ def collect_pre_spec_window(
 
         # collected_at/updated_at 은 run 시작 시각 한 값으로 일관되게 채운다.
         meta_ts = datetime.now()
-        run = repository.create_run(session, trigger, window_bgn, window_end)
+        run = repository.create_run(
+            session, trigger, window_bgn, window_end, source="pre_spec"
+        )
 
         logger.info(
             "사전규격 수집 시작: trigger=%s window=%s~%s swBizObjYn=%s",
@@ -304,7 +309,11 @@ def collect_pre_spec_window(
             error_msg=error_msg,
             detail_json=detail_json,
         )
-        # update_last_success_dt 는 호출하지 않는다(§2 — 5.4 스케줄러 통합에서).
+        # 전체 성공(success) 시에만 사전규격 last_success 를 윈도우 종료로 갱신한다(Phase 5.4).
+        # partial/failed/halt 는 미갱신 → 다음 tick 이 같은 윈도우를 재수집(누락 방지).
+        # 입찰 update_last_success_dt 는 호출하지 않는다(입찰 last_success_dt 와 분리).
+        if status == "success":
+            repository.update_pre_spec_last_success_dt(session, window_end)
 
         logger.info(
             "사전규격 수집 종료: status=%s fetched=%d new=%d updated=%d skipped=%d retry=%d",

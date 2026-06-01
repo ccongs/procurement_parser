@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # .env 로드 (프로젝트 루트의 .env)
@@ -42,17 +42,60 @@ Base = declarative_base()
 
 
 def init_db() -> None:
-    """테이블 4종(bid_notice·collection_run·app_config·pre_spec) 생성 + app_config 기본행 시드.
+    """테이블 4종(bid_notice·collection_run·app_config·pre_spec) 생성 + 자동 마이그레이션 + app_config 기본행 시드.
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
       create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
     - 이미 있는 테이블/행은 건드리지 않는다(create_all 은 멱등, 시드는 존재 검사).
+    - 순서: create_all → _migrate_add_columns(기존 DB 누락 컬럼 ALTER) → _seed_app_config.
+      마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _migrate_add_columns()
     _seed_app_config()
+
+
+def _migrate_add_columns() -> None:
+    """기존(구 스키마) DB 에 Phase 5.4 신규 컬럼이 없으면 ALTER TABLE ADD COLUMN.
+
+    멱등·inspector 가드: 신규 DB 는 create_all 이 이미 컬럼을 만들었으므로 inspector 가
+    present 로 보고 ALTER 를 스킵(no-op)한다. 기존 DB 만 ADD COLUMN 하며 **기존 행은 무손상**
+    (`collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다). init_db() 를 여러 번 호출해도
+    안전하다.
+
+    ⚠️ PostgreSQL 이전 시: boolean 기본값 리터럴 `1`(SQLite 표기)을 `true` 로 바꿔야 한다
+    (SQLite 우선·표준 ALTER 사용). 컬럼 추가만 하므로 그 외 표준 SQL 로 이식 가능하다.
+    """
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+
+    def colset(t: str) -> set[str]:
+        return {c["name"] for c in insp.get_columns(t)}
+
+    stmts: list[str] = []
+    if "collection_run" in tables and "source" not in colset("collection_run"):
+        stmts.append(
+            "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
+        )
+    if "app_config" in tables:
+        ac = colset("app_config")
+        if "pre_spec_enabled" not in ac:
+            # PG 이전 시 DEFAULT 1 → DEFAULT true 로 조정.
+            stmts.append(
+                "ALTER TABLE app_config ADD COLUMN pre_spec_enabled BOOLEAN NOT NULL DEFAULT 1"
+            )
+        if "pre_spec_last_success_dt" not in ac:
+            stmts.append(
+                "ALTER TABLE app_config ADD COLUMN pre_spec_last_success_dt DATETIME"
+            )
+
+    if stmts:
+        with engine.begin() as conn:
+            for s in stmts:
+                conn.execute(text(s))
 
 
 def _seed_app_config() -> None:
@@ -83,6 +126,8 @@ def _seed_app_config() -> None:
                 presmpt_prce_end=None,
                 last_success_dt=None,
                 updated_at=datetime.now(),
+                pre_spec_enabled=True,  # 사전규격 잡 기본 on (Phase 5.4)
+                pre_spec_last_success_dt=None,
             )
         )
         session.commit()
