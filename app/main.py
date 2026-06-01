@@ -560,6 +560,12 @@ BASE_CSS = """
   td.matchind { max-width: 240px; }
   td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
                         white-space: nowrap; }
+  /* 공고기관/수요기관 통합 셀: 위=공고기관(옅은 회색), 아래=수요기관(기본색), 세로 간격 ≥4px */
+  td.insttcell { max-width: 260px; }
+  td.insttcell .ntcorg, td.insttcell .dmnorg { display: block; overflow: hidden;
+                        text-overflow: ellipsis; white-space: nowrap; }
+  td.insttcell .ntcorg { color: #8a93a2; margin-bottom: 5px; }
+  td.insttcell .dmnorg { color: inherit; }
   .pager { display: flex; gap: 10px; align-items: center; margin-top: 14px; font-size: 13px; }
   .pager a { text-decoration: none; color: #1f3a5f; border: 1px solid #cbd2dc; padding: 6px 12px;
              border-radius: 6px; background: #fff; }
@@ -645,11 +651,11 @@ def _fmt_dt(value: Any) -> str:
 
 
 def _fmt_amt(value: Any) -> str:
-    """금액(Numeric)을 천단위 콤마로. None 은 빈 문자열."""
+    """금액(Numeric)을 천단위 콤마 + ` 원` 으로(예: `1,000,000 원`). None/빈값은 빈 문자열."""
     if value is None or value == "":
         return ""
     try:
-        return f"{int(value):,}"
+        return f"{int(value):,} 원"
     except (TypeError, ValueError):
         return str(value)
 
@@ -661,7 +667,8 @@ def _fmt_amt(value: Any) -> str:
 _LIST_COLUMNS: list[tuple[str, str, str]] = [
     ("bid_ntce_no", "text", "공고번호"),
     ("bid_ntce_nm", "link", "공고명"),
-    ("ntce_instt_nm", "text", "공고기관"),
+    ("ntce_instt_nm", "instt", "공고기관/수요기관"),
+    ("asign_bdgt_amt", "amt", "배정예산"),
     ("presmpt_prce", "amt", "추정가격"),
     ("bid_ntce_dt", "dt", "공고일시"),
     ("openg_dt", "dt", "개찰일시"),
@@ -709,14 +716,34 @@ def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
 
 
 def _render_matched_inds(csv: Any) -> str:
-    """매칭업종 CSV → '한글명(코드)' 세로 목록 셀. 셀은 너비 제한+ellipsis, title 로 전체 표시."""
-    labels = industry_codes.matched_labels(str(csv) if csv is not None else None)
-    if not labels:
+    """매칭업종 CSV → '업무명 [코드]' 세로 목록 셀.
+
+    표시는 단축 라벨(`업무명 [코드]`), title(tooltip)은 전체명(`전체명 [코드]`).
+    셀은 너비 제한+ellipsis 로 줄이되 title 로 전체 확인 가능.
+    """
+    pairs = industry_codes.matched_label_pairs(str(csv) if csv is not None else None)
+    if not pairs:
         return "<td></td>"
     rows = "".join(
-        f'<span class="indrow" title="{_e(lbl)}">{_e(lbl)}</span>' for lbl in labels
+        f'<span class="indrow" title="{_e(full)}">{_e(short)}</span>'
+        for short, full in pairs
     )
     return f'<td class="matchind">{rows}</td>'
+
+
+def _render_instt(ntce: Any, dmin: Any) -> str:
+    """공고기관/수요기관 통합 셀. 위=공고기관(옅은 회색), 아래=수요기관(기본색).
+
+    한쪽 데이터가 없으면 그 줄은 생략. 둘 다 없으면 빈 셀.
+    """
+    ntce_s = "" if ntce is None else str(ntce).strip()
+    dmin_s = "" if dmin is None else str(dmin).strip()
+    lines = []
+    if ntce_s:
+        lines.append(f'<span class="ntcorg" title="{_e(ntce_s)}">{_e(ntce_s)}</span>')
+    if dmin_s:
+        lines.append(f'<span class="dmnorg" title="{_e(dmin_s)}">{_e(dmin_s)}</span>')
+    return f'<td class="insttcell">{"".join(lines)}</td>'
 
 
 def _sort_header(col: str, header: str, sort: str, qs: dict[str, str]) -> str:
@@ -763,6 +790,8 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
                 cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
             elif kind == "matchind":
                 cells.append(_render_matched_inds(val))
+            elif kind == "instt":
+                cells.append(_render_instt(val, r.get("dminstt_nm")))
             elif kind == "link":
                 url = r.get("bid_ntce_dtl_url")
                 text = _e(val)
@@ -1004,7 +1033,11 @@ def list_page(
         # 세션 종료 후 lazy 접근 금지 → 필요한 스칼라만 dict 로 추출.
         # 첨부 URL 컬럼은 파일 개수 계산용으로만 읽고(이미 조회한 ORM 행에서 → N+1 없음),
         # 화면에는 개수만 전달한다(drawer 열 때 /files 로 상세 조회).
-        cols = [c for c, _, _ in _LIST_COLUMNS] + ["bid_ntce_dtl_url"] + _SPEC_URL_COLUMNS
+        cols = (
+            [c for c, _, _ in _LIST_COLUMNS]
+            + ["dminstt_nm", "bid_ntce_dtl_url"]
+            + _SPEC_URL_COLUMNS
+        )
         rows = []
         for o in objs:
             d = {c: getattr(o, c, None) for c in cols}

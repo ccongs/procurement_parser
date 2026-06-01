@@ -707,10 +707,16 @@ def test_list_default_date_range_openg_dt():
 
 # --- industry_codes 매핑 ----------------------------------------------
 def test_industry_matched_labels():
+    """라운드2b: 단축 라벨 `업무명 [코드]`(바깥 소프트웨어사업자 래퍼 제거)."""
     labels = industry_codes.matched_labels("1426,1468")
     assert labels == [
-        "소프트웨어사업자(패키지소프트웨어개발·공급사업)(1426)",
-        "소프트웨어사업자(컴퓨터관련서비스사업)(1468)",
+        "패키지소프트웨어개발·공급사업 [1426]",
+        "컴퓨터관련서비스사업 [1468]",
+    ]
+    # 4종 단축명 확인.
+    assert industry_codes.matched_labels("1469,1470") == [
+        "디지털콘텐츠개발서비스사업 [1469]",
+        "데이터베이스제작및검색서비스사업 [1470]",
     ]
 
 
@@ -718,6 +724,16 @@ def test_industry_unknown_code_passthrough():
     assert industry_codes.matched_labels("9999") == ["9999"]
     assert industry_codes.matched_labels("") == []
     assert industry_codes.matched_labels(None) == []
+
+
+def test_industry_matched_label_pairs_tooltip():
+    """라운드2b: (단축 표시, tooltip 전체명) 쌍. 전체명은 래퍼 포함 + [코드]."""
+    pairs = industry_codes.matched_label_pairs("1468")
+    assert pairs == [
+        ("컴퓨터관련서비스사업 [1468]", "소프트웨어사업자(컴퓨터관련서비스사업) [1468]"),
+    ]
+    # 모르는 코드는 단축·전체 모두 코드 그대로.
+    assert industry_codes.matched_label_pairs("9999") == [("9999", "9999")]
 
 
 # --- main 헬퍼: 가격 파싱 ---------------------------------------------
@@ -789,9 +805,12 @@ def test_list_matched_industry_korean_vertical(client):
 
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    # 한글명(코드) 세로(span.indrow) 표기.
+    # 단축 라벨 `업무명 [코드]` 세로(span.indrow) 표기.
     assert 'class="indrow"' in resp.text
-    assert "소프트웨어사업자(컴퓨터관련서비스사업)(1468)" in resp.text
+    assert "컴퓨터관련서비스사업 [1468]" in resp.text
+    assert "패키지소프트웨어개발·공급사업 [1426]" in resp.text
+    # tooltip(title)에는 전체명 유지.
+    assert 'title="소프트웨어사업자(컴퓨터관련서비스사업) [1468]"' in resp.text
 
 
 def test_config_page_has_price_defaults(client):
@@ -862,3 +881,70 @@ def test_list_price_default_from_config(client):
     assert resp.status_code == 200
     assert 'value="7000000"' in resp.text
     assert 'value="8000000"' in resp.text
+
+
+# --- 라운드 2b: 배정예산·원 단위·기관 통합 셀 -------------------------
+def test_fmt_amt_won_unit():
+    """라운드2b: 금액은 천단위 콤마 + ` 원`, 빈값/None 은 빈칸."""
+    assert main._fmt_amt(1_000_000) == "1,000,000 원"
+    assert main._fmt_amt(Decimal("50000000")) == "50,000,000 원"
+    assert main._fmt_amt(0) == "0 원"
+    assert main._fmt_amt(None) == ""
+    assert main._fmt_amt("") == ""
+
+
+def test_render_instt_two_lines():
+    """라운드2b: 공고기관/수요기관 2줄. 위=공고기관(.ntcorg), 아래=수요기관(.dmnorg)."""
+    cell = main._render_instt("발주기관A", "수요기관B")
+    assert 'class="ntcorg"' in cell
+    assert ">발주기관A<" in cell
+    assert 'class="dmnorg"' in cell
+    assert ">수요기관B<" in cell
+    # 한쪽 없으면 그 줄 생략.
+    only_ntce = main._render_instt("발주기관A", None)
+    assert 'class="ntcorg"' in only_ntce
+    assert "dmnorg" not in only_ntce
+    only_dmin = main._render_instt(None, "수요기관B")
+    assert "ntcorg" not in only_dmin
+    assert 'class="dmnorg"' in only_dmin
+    # 둘 다 없으면 빈 셀.
+    assert main._render_instt(None, "") == '<td class="insttcell"></td>'
+
+
+def test_list_budget_column_and_won(client):
+    """라운드2b 라우트 스모크: 배정예산 헤더(추정가격 왼쪽) + 금액 `원` 단위."""
+    from app import main as _main
+
+    with _main.SessionLocal() as s:
+        s.add(
+            BidNotice(
+                bid_ntce_no="B-BUD",
+                bid_ntce_nm="배정예산 표기 공고",
+                ntce_instt_nm="발주기관A",
+                dminstt_nm="수요기관B",
+                bid_ntce_dt=datetime(2026, 5, 6, 9, 0),
+                openg_dt=None,
+                asign_bdgt_amt=Decimal("12345678"),
+                presmpt_prce=Decimal("9000000"),
+                collected_at=datetime(2026, 6, 1, 12, 0),
+                updated_at=datetime(2026, 6, 1, 12, 0),
+            )
+        )
+        s.commit()
+
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    text = resp.text
+    # 배정예산 헤더가 추정가격 헤더 왼쪽에 위치.
+    # ("추정가격"은 검색폼 라벨에도 등장하므로 테이블 thead 구간으로 한정해 비교.)
+    thead = text[text.index("<thead>"):text.index("</thead>")]
+    assert "배정예산" in thead
+    assert "공고기관/수요기관" in thead
+    assert thead.index("배정예산") < thead.index("추정가격")
+    # 금액 `원` 단위(배정예산·추정가격 모두).
+    assert "12,345,678 원" in text
+    assert "9,000,000 원" in text
+    # 기관 통합 셀 2줄.
+    assert 'class="insttcell"' in text
+    assert ">발주기관A<" in text
+    assert ">수요기관B<" in text
