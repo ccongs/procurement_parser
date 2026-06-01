@@ -1,6 +1,14 @@
-"""Phase 1 - 브라우저 기반 API 수동 테스트 화면.
+"""FastAPI 화면 — Phase 3.5.
 
-엔드포인트 선택 + 파라미터 입력 폼 → api_client 호출 → 응답을 표/원문으로 표시.
+화면 3종으로 재편:
+- `/list`  : 저장된 입찰공고 목록(메인). 공고명·공고일 기간·개찰 임박 필터 + 정렬·페이지네이션.
+- `/config`: 수집 설정 편집·자동중단 재개·스케줄러 수동 시작/정지·최근 실행 이력.
+- `/api-test`: Phase 1 의 수동 API 테스트 화면(기존 `/` 로직 이관).
+`/` 는 `/list` 로 리다이렉트한다.
+
+스케줄러는 **수동 모델**: 앱이 떠도 자동 수집하지 않는다(시작은 /config 또는 `python -m app.scheduler`).
+앱 종료 시 켜져 있던 스케줄러만 정리한다.
+
 실행: uvicorn app.main:app --reload
 """
 
@@ -8,13 +16,17 @@ from __future__ import annotations
 
 import calendar
 import html
-from datetime import date
+import logging
+from contextlib import asynccontextmanager
+from datetime import date, datetime
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app import api_client
+from app import api_client, repository, scheduler
+from app.db import SessionLocal
 from app.field_labels import label as field_label
 from app.api_client import (
     COMMON_PARAMS,
@@ -25,7 +37,23 @@ from app.api_client import (
     ParamSpec,
 )
 
-app = FastAPI(title="나라장터 입찰공고 API 테스트 (Phase 1)")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 수동 모델: 시작 시 스케줄러를 자동 기동하지 않는다(로그만).
+    logger.info(
+        "FastAPI 시작 — 스케줄러는 수동 모델입니다. /config 에서 [시작]을 누르거나 "
+        "`python -m app.scheduler` 로 구동하세요."
+    )
+    yield
+    # 종료 시 켜져 있던 스케줄러 정리.
+    scheduler.shutdown_scheduler()
+    logger.info("FastAPI 종료 — 스케줄러를 정리했습니다.")
+
+
+app = FastAPI(title="나라장터 입찰공고 수집 (Phase 3)", lifespan=lifespan)
 
 # 조회일시 영역에서 전용 위젯으로 렌더링하므로 일반 입력 그리드에서는 제외하는 파라미터.
 # (inqryBgnDt/inqryEndDt 는 화면의 날짜 선택값으로부터 서버에서 조립한다)
@@ -275,17 +303,17 @@ PAGE = """<!doctype html>
 </head>
 <body>
   <header>
-    <h1>나라장터 입찰공고 API 테스트</h1>
-    <p>Phase 1 · 엔드포인트를 호출해 응답 형태를 확인합니다 · 베이스 URL: {base_url}</p>
+    <h1>나라장터 입찰공고 API 테스트 <a href="/list" style="color:#cdd9ec;font-size:12px;font-weight:400;">← 목록으로</a></h1>
+    <p>엔드포인트를 호출해 응답 형태를 확인합니다 · 베이스 URL: {base_url}</p>
   </header>
   <main>
-    <form method="post" action="/call">
+    <form method="post" action="/api-test/call">
       <fieldset>
         <legend>엔드포인트</legend>
         <div class="row">
           <label class="field" style="min-width:320px;">
             <span class="flabel">오퍼레이션 선택</span>
-            <select name="operation" onchange="window.location='/?operation='+encodeURIComponent(this.value)">
+            <select name="operation" onchange="window.location='/api-test?operation='+encodeURIComponent(this.value)">
               {endpoint_options}
             </select>
           </label>
@@ -403,14 +431,14 @@ def _dates_to_inqry(call_params: dict[str, str]) -> None:
         call_params["inqryEndDt"] = end.replace("-", "") + "2359"
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(operation: str | None = None) -> HTMLResponse:
+@app.get("/api-test", response_class=HTMLResponse)
+def api_test(operation: str | None = None) -> HTMLResponse:
     op = operation if operation in ENDPOINTS_BY_OP else ENDPOINTS[0].operation
     return HTMLResponse(_render_page(op, api_client.DEFAULT_RESPONSE_TYPE, _default_values()))
 
 
-@app.post("/call", response_class=HTMLResponse)
-async def call(request: Request) -> HTMLResponse:
+@app.post("/api-test/call", response_class=HTMLResponse)
+async def api_test_call(request: Request) -> HTMLResponse:
     form = await request.form()
     data = {k: str(v) for k, v in form.items()}
     operation = data.pop("operation", ENDPOINTS[0].operation)
@@ -431,3 +459,653 @@ async def call(request: Request) -> HTMLResponse:
         error = f"예상치 못한 오류: {exc}"
 
     return HTMLResponse(_render_page(operation, response_type, data, result, error))
+
+
+# =====================================================================
+#  /list · /config  — Phase 3.5 화면(인라인 HTML + 공유 CSS)
+# =====================================================================
+
+# 새 화면(/list·/config)용 공유 CSS. PAGE(api-test)는 자체 CSS 를 유지한다.
+BASE_CSS = """
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 0; background: #f4f5f7; color: #1f2430; }
+  header { background: #1f3a5f; color: #fff; padding: 16px 24px;
+           display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; font-size: 12px; opacity: .8; }
+  .navbtns { display: flex; gap: 8px; }
+  .navbtns a { background: #2d5286; color: #fff; text-decoration: none; font-size: 13px;
+               padding: 7px 14px; border-radius: 7px; }
+  .navbtns a:hover { background: #3a6199; }
+  .navbtns a.active { background: #fff; color: #1f3a5f; font-weight: 600; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px; }
+  .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { margin: 0 0 14px; font-size: 16px; }
+  form.filter, form.cfg { display: block; }
+  .row { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+  .field { display: flex; flex-direction: column; font-size: 13px; }
+  .flabel { margin-bottom: 4px; }
+  .flabel code { background: #eef1f6; padding: 1px 5px; border-radius: 4px; font-size: 11px; color: #4a5568; }
+  input, select { padding: 7px 8px; border: 1px solid #cbd2dc; border-radius: 6px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .tilde { padding-bottom: 8px; color: #8a93a2; }
+  .quick { display: flex; gap: 6px; padding-bottom: 1px; }
+  .quick button, button.ghost { border: 1px solid #cbd2dc; background: #f4f5f7; color: #4a5568;
+                   padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  .quick button:hover, button.ghost:hover { background: #e7ebf2; }
+  .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; padding-bottom: 6px; }
+  .chk input { width: 16px; height: 16px; }
+  button.submit { background: #1f3a5f; color: #fff; border: 0; padding: 10px 22px;
+                  border-radius: 7px; font-size: 14px; cursor: pointer; }
+  button.submit:hover { background: #16294a; }
+  button.danger { background: #b02a25; }
+  button.danger:hover { background: #8f211d; }
+  button.go { background: #1d7a43; }
+  button.go:hover { background: #166035; }
+  .muted { color: #8a93a2; font-size: 13px; }
+  .note { font-size: 12px; color: #6b7280; background: #f0f3f8; border-left: 3px solid #9bb0cf;
+          padding: 8px 12px; border-radius: 4px; margin: 8px 0; }
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 20px; background: #eef1f6; color: #4a5568; }
+  .badge.ok { background: #e3f5e9; color: #1d7a43; }
+  .badge.warn { background: #fdf3df; color: #97720d; }
+  .badge.err { background: #fde3e1; color: #b02a25; }
+  .msg { padding: 10px 14px; border-radius: 7px; font-size: 13px; margin-bottom: 14px; }
+  .msg.ok { background: #e3f5e9; color: #1d7a43; }
+  .msg.err { background: #fde3e1; color: #b02a25; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-size: 12px; width: 100%; }
+  th, td { border: 1px solid #e2e5ea; padding: 6px 8px; text-align: left; vertical-align: top;
+           max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+  th { background: #f4f5f7; }
+  th .col-en { font-weight: 400; font-size: 10px; color: #97a0b0; }
+  tr.bad { background: #fdf1f0; }
+  .pager { display: flex; gap: 10px; align-items: center; margin-top: 14px; font-size: 13px; }
+  .pager a { text-decoration: none; color: #1f3a5f; border: 1px solid #cbd2dc; padding: 6px 12px;
+             border-radius: 6px; background: #fff; }
+  .pager a.disabled { color: #b9c0cc; pointer-events: none; }
+  fieldset { border: 1px solid #e2e5ea; border-radius: 8px; margin: 0 0 16px; padding: 14px 16px; }
+  legend { font-weight: 600; font-size: 13px; color: #1f3a5f; padding: 0 6px; }
+"""
+
+
+def _nav(active: str) -> str:
+    """상단 네비게이션. active in {'list','config','api-test'}."""
+    def cls(name: str) -> str:
+        return ' class="active"' if name == active else ""
+
+    return f"""
+    <div class="navbtns">
+      <a href="/list"{cls('list')}>목록</a>
+      <a href="/config"{cls('config')}>설정</a>
+      <a href="/api-test" target="_blank"{cls('api-test')}>API테스트 ↗</a>
+    </div>"""
+
+
+def _shell(title: str, subtitle: str, active: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{_e(title)}</title>
+  <style>{BASE_CSS}</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{_e(title)}</h1>
+      <p>{_e(subtitle)}</p>
+    </div>
+    {_nav(active)}
+  </header>
+  <main>
+    {body}
+  </main>
+</body>
+</html>"""
+
+
+def _fmt_dt(value: Any) -> str:
+    """DateTime 컬럼값을 'YYYY-MM-DD HH:MM' 로. None/빈값은 빈 문자열."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value)
+
+
+def _fmt_amt(value: Any) -> str:
+    """금액(Numeric)을 천단위 콤마로. None 은 빈 문자열."""
+    if value is None or value == "":
+        return ""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+# --- /list -----------------------------------------------------------
+# (영문 필드명, 표시 종류) — 헤더는 field_label() 로 국문 라벨을 붙인다.
+_LIST_COLUMNS: list[tuple[str, str]] = [
+    ("bid_ntce_no", "text"),
+    ("bid_ntce_nm", "link"),
+    ("ntce_instt_nm", "text"),
+    ("presmpt_prce", "amt"),
+    ("bid_ntce_dt", "dt"),
+    ("openg_dt", "dt"),
+    ("matched_indstryty_cds", "text"),
+]
+
+
+def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
+    """yyyy-mm-dd 문자열 → datetime. 빈값/형식오류는 None. end_of_day=True 면 23:59:59."""
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        return None
+    if end_of_day:
+        return d.replace(hour=23, minute=59, second=59)
+    return d
+
+
+def _render_list_rows(rows: list[dict]) -> str:
+    if not rows:
+        return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
+    head = "".join(
+        f'<th>{_e(field_label(col))}<br><code class="col-en">{_e(col)}</code></th>'
+        for col, _ in _LIST_COLUMNS
+    )
+    body_rows = []
+    for i, r in enumerate(rows, start=1):
+        cells = [f"<td>{i}</td>"]
+        for col, kind in _LIST_COLUMNS:
+            val = r.get(col)
+            if kind == "amt":
+                cells.append(f"<td>{_e(_fmt_amt(val))}</td>")
+            elif kind == "dt":
+                cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
+            elif kind == "link":
+                url = r.get("bid_ntce_dtl_url")
+                text = _e(val)
+                if url:
+                    cells.append(
+                        f'<td><a href="{_e(url)}" target="_blank" rel="noopener">{text}</a></td>'
+                    )
+                else:
+                    cells.append(f"<td>{text}</td>")
+            else:
+                cells.append(f"<td>{_e(val)}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    return f"""
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th>{head}</tr></thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+    </div>"""
+
+
+def _render_pager(total: int, page: int, page_size: int, qs: dict[str, str]) -> str:
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = min(max(1, page), pages)
+
+    def link(target: int, label: str, disabled: bool) -> str:
+        params = {**qs, "page": str(target)}
+        query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+        cls = " disabled" if disabled else ""
+        return f'<a class="pager-btn{cls}" href="/list?{query}">{_e(label)}</a>'
+
+    return f"""
+    <div class="pager">
+      {link(page - 1, '← 이전', page <= 1)}
+      <span>전체 {total:,}건 · {page} / {pages} 페이지</span>
+      {link(page + 1, '다음 →', page >= pages)}
+    </div>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/list", status_code=307)
+
+
+@app.get("/list", response_class=HTMLResponse)
+def list_page(
+    q: str | None = None,
+    dt_from: str | None = None,
+    dt_to: str | None = None,
+    openg_only_future: str | None = None,
+    sort: str = "bid_ntce_dt_desc",
+    page: int = 1,
+) -> HTMLResponse:
+    page_size = 50
+    only_future = openg_only_future in ("1", "on", "true", "Y", "y")
+    sort = sort if sort in ("bid_ntce_dt_desc", "openg_dt_asc") else "bid_ntce_dt_desc"
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+
+    df = _parse_date(dt_from)
+    dtto = _parse_date(dt_to, end_of_day=True)
+
+    with SessionLocal() as session:
+        objs, total = repository.search_bid_notices(
+            session,
+            q=q,
+            dt_from=df,
+            dt_to=dtto,
+            openg_only_future=only_future,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+        )
+        # 세션 종료 후 lazy 접근 금지 → 필요한 스칼라만 dict 로 추출.
+        cols = [c for c, _ in _LIST_COLUMNS] + ["bid_ntce_dtl_url"]
+        rows = [{c: getattr(o, c, None) for c in cols} for o in objs]
+
+    qs = {
+        "q": q or "",
+        "dt_from": dt_from or "",
+        "dt_to": dt_to or "",
+        "openg_only_future": "1" if only_future else "",
+        "sort": sort,
+    }
+
+    body = f"""
+    <div class="card">
+      <h2>공고 검색</h2>
+      <form class="filter" method="get" action="/list">
+        <div class="row">
+          <label class="field" style="min-width:260px;">
+            <span class="flabel">공고명 부분검색 <code>q</code></span>
+            <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
+          </label>
+          <label class="field">
+            <span class="flabel">공고일 시작 <code>dt_from</code></span>
+            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from or '')}">
+          </label>
+          <span class="tilde">~</span>
+          <label class="field">
+            <span class="flabel">공고일 종료 <code>dt_to</code></span>
+            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to or '')}">
+          </label>
+          <div class="quick">
+            <button type="button" onclick="setRecent(1)">최근1개월</button>
+            <button type="button" onclick="setRecent(3)">최근3개월</button>
+            <button type="button" onclick="setRecent(6)">최근6개월</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <label class="chk">
+            <input type="checkbox" name="openg_only_future" value="1"{' checked' if only_future else ''}>
+            개찰 임박(개찰일이 현재 이후인 공고만)
+          </label>
+          <label class="field">
+            <span class="flabel">정렬 <code>sort</code></span>
+            <select name="sort">
+              <option value="bid_ntce_dt_desc"{' selected' if sort == 'bid_ntce_dt_desc' else ''}>최신 공고순</option>
+              <option value="openg_dt_asc"{' selected' if sort == 'openg_dt_asc' else ''}>개찰 임박순</option>
+            </select>
+          </label>
+          <button type="submit" class="submit">검색</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>수집된 공고</h2>
+      {_render_list_rows(rows)}
+      {_render_pager(total, page, page_size, qs)}
+    </div>
+
+    <script>
+      function fmtDate(d) {{
+        var m = ('0' + (d.getMonth() + 1)).slice(-2);
+        var day = ('0' + d.getDate()).slice(-2);
+        return d.getFullYear() + '-' + m + '-' + day;
+      }}
+      function setRecent(n) {{
+        var today = new Date();
+        var bgn = new Date(today.getFullYear(), today.getMonth() - n, today.getDate());
+        var f = document.getElementById('dt_from');
+        var t = document.getElementById('dt_to');
+        if (f) f.value = fmtDate(bgn);
+        if (t) t.value = fmtDate(today);
+      }}
+    </script>"""
+
+    return HTMLResponse(
+        _shell("나라장터 입찰공고 목록", "수집·저장된 공고를 조회합니다.", "list", body)
+    )
+
+
+# --- /config ---------------------------------------------------------
+# (필드명, 라벨, 정수 최소, 정수 최대) — 정수 설정 항목.
+_CONFIG_INT_FIELDS: list[tuple[str, str, int, int]] = [
+    ("interval_minutes", "수집 주기(분)", 1, 100000),
+    ("window_overlap_minutes", "윈도우 겹침(분)", 0, 100000),
+    ("backfill_days", "백필 기간(일)", 1, 366),
+    ("num_of_rows", "페이지 크기", 1, 1000),
+    ("max_retries", "재시도 한도", 0, 10),
+]
+
+
+def _render_runs_table(runs: list[dict]) -> str:
+    if not runs:
+        return '<p class="muted">아직 실행 이력이 없습니다.</p>'
+    headers = [
+        ("id", "ID"),
+        ("trigger", "트리거"),
+        ("status", "상태"),
+        ("window", "윈도우"),
+        ("counts", "fetched/new/updated"),
+        ("retry_count", "재시도"),
+        ("error_code", "에러코드"),
+    ]
+    head = "".join(f"<th>{_e(lbl)}</th>" for _, lbl in headers)
+    body_rows = []
+    for r in runs:
+        bad = r.get("status") in ("failed", "partial")
+        window = f"{_fmt_dt(r.get('window_bgn_dt'))} ~ {_fmt_dt(r.get('window_end_dt'))}"
+        counts = f"{r.get('total_fetched') or 0}/{r.get('total_new') or 0}/{r.get('total_updated') or 0}"
+        status = r.get("status") or ""
+        if status == "success":
+            badge = f'<span class="badge ok">{_e(status)}</span>'
+        elif bad:
+            badge = f'<span class="badge err">{_e(status)}</span>'
+        else:
+            badge = f'<span class="badge">{_e(status)}</span>'
+        cells = [
+            f"<td>{_e(r.get('id'))}</td>",
+            f"<td>{_e(r.get('trigger'))}</td>",
+            f"<td>{badge}</td>",
+            f"<td>{_e(window)}</td>",
+            f"<td>{_e(counts)}</td>",
+            f"<td>{_e(r.get('retry_count'))}</td>",
+            f"<td>{_e(r.get('error_code'))}</td>",
+        ]
+        cls = ' class="bad"' if bad else ""
+        body_rows.append(f"<tr{cls}>{''.join(cells)}</tr>")
+    return f"""
+    <div class="table-wrap">
+      <table>
+        <thead><tr>{head}</tr></thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+    </div>"""
+
+
+def _render_config_page(
+    cfg: dict, runs: list[dict], sched: dict, msg: str | None, err: str | None
+) -> str:
+    msg_html = ""
+    if err:
+        msg_html = f'<div class="msg err">{_e(err)}</div>'
+    elif msg:
+        msg_html = f'<div class="msg ok">{_e(msg)}</div>'
+
+    # 정수 설정 입력
+    int_fields = "\n".join(
+        f"""
+        <label class="field">
+          <span class="flabel">{_e(lbl)} <code>{_e(name)}</code></span>
+          <input type="number" name="{_e(name)}" value="{_e(cfg.get(name))}" min="{lo}" max="{hi}">
+        </label>"""
+        for name, lbl, lo, hi in _CONFIG_INT_FIELDS
+    )
+
+    enabled_checked = " checked" if cfg.get("enabled") else ""
+
+    # 자동중단(halt) 상태
+    if cfg.get("auto_halted"):
+        halt_html = f"""
+        <div class="msg err">
+          <b>자동 중단됨</b> — 비재시도 에러로 스케줄이 멈췄습니다.
+          halt_code=<code>{_e(cfg.get('halt_code'))}</code>,
+          사유: {_e(cfg.get('halt_reason'))}
+        </div>
+        <form method="post" action="/config/resume" style="margin-bottom:16px;">
+          <button type="submit" class="submit danger">자동중단 해제(재개)</button>
+        </form>"""
+    else:
+        halt_html = '<p class="muted" style="margin-bottom:16px;">자동 중단 상태가 아닙니다.</p>'
+
+    # 스케줄러 제어
+    running = sched.get("running")
+    if running:
+        sched_status = '<span class="badge ok">실행 중</span>'
+        next_run = _fmt_dt(sched.get("next_run")) or "(미정)"
+        sched_extra = f" · 다음 실행: {_e(next_run)}"
+    else:
+        sched_status = '<span class="badge">정지</span>'
+        sched_extra = ""
+
+    if cfg.get("auto_halted"):
+        start_block = (
+            '<p class="muted">자동 중단 상태에서는 시작할 수 없습니다. 먼저 위에서 [재개]하세요.</p>'
+        )
+    else:
+        start_block = """
+        <form method="post" action="/config/scheduler/start" style="display:inline-flex; gap:10px; align-items:center;">
+          <label class="chk"><input type="checkbox" name="run_now" value="1"> 시작 직후 1회 즉시 수집</label>
+          <button type="submit" class="submit go">시작</button>
+        </form>"""
+
+    stop_block = """
+        <form method="post" action="/config/scheduler/stop" style="display:inline;">
+          <button type="submit" class="submit danger">정지</button>
+        </form>"""
+
+    body = f"""
+    {msg_html}
+
+    <div class="card">
+      <h2>스케줄러 제어 (수동)</h2>
+      <p>현재 상태: {sched_status}{sched_extra}</p>
+      <div class="row" style="gap:12px;">
+        {start_block}
+        {stop_block}
+      </div>
+      <div class="note">
+        스케줄러가 떠 있어도 설정 <code>enabled=False</code> 면 매 주기 tick 이 수집을 건너뜁니다(게이트).
+        <code>enabled</code>(수집 의도)와 스케줄러 구동(시작/정지)은 별개입니다.
+      </div>
+      <div class="note">
+        <code>last_success_dt</code> 가 비어 있으면 첫 정규 수집은 최근 <b>{_e(cfg.get('backfill_days'))}</b>일 백필입니다
+        (현재 last_success_dt=<code>{_e(_fmt_dt(cfg.get('last_success_dt')) or '없음')}</code>).
+        interval 이 길면 첫 tick 은 그만큼 뒤이므로, 즉시 보려면 [시작 직후 1회] 체크 또는
+        <code>python -m app.collector</code> 백필을 쓰세요.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>자동중단 상태</h2>
+      {halt_html}
+    </div>
+
+    <div class="card">
+      <h2>수집 설정</h2>
+      <form class="cfg" method="post" action="/config">
+        <fieldset>
+          <legend>주기·페이징·재시도</legend>
+          <div class="grid">{int_fields}</div>
+        </fieldset>
+        <fieldset>
+          <legend>조회 파라미터</legend>
+          <div class="grid">
+            <label class="field">
+              <span class="flabel">조회구분 <code>inqry_div</code></span>
+              <select name="inqry_div">
+                <option value="1"{' selected' if cfg.get('inqry_div') == '1' else ''}>1 · 공고게시일시</option>
+                <option value="2"{' selected' if cfg.get('inqry_div') == '2' else ''}>2 · 개찰일시</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="flabel">국내/국제 <code>intrntnl_div_cd</code></span>
+              <select name="intrntnl_div_cd">
+                <option value="1"{' selected' if cfg.get('intrntnl_div_cd') == '1' else ''}>1 · 국내</option>
+                <option value="2"{' selected' if cfg.get('intrntnl_div_cd') == '2' else ''}>2 · 국제</option>
+              </select>
+            </label>
+            <label class="field" style="min-width:260px;">
+              <span class="flabel">업종코드 CSV <code>indstryty_cds</code></span>
+              <input type="text" name="indstryty_cds" value="{_e(cfg.get('indstryty_cds'))}" placeholder="예: 1426,1468,1469,1470">
+            </label>
+          </div>
+        </fieldset>
+        <label class="chk" style="margin-bottom:14px;">
+          <input type="checkbox" name="enabled" value="1"{enabled_checked}>
+          수집 활성화 <code>enabled</code> (체크 해제 시 스케줄러가 떠 있어도 매 tick 건너뜀)
+        </label>
+        <div><button type="submit" class="submit">설정 저장</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>최근 실행 이력</h2>
+      {_render_runs_table(runs)}
+    </div>"""
+
+    return _shell(
+        "나라장터 입찰공고 수집 설정", "수집 설정·스케줄러·실행 이력을 관리합니다.", "config", body
+    )
+
+
+def _load_config_view() -> tuple[dict, list[dict]]:
+    """/config 렌더에 필요한 cfg·runs 스칼라를 세션 안에서 추출(세션 종료 후 lazy 접근 방지)."""
+    cfg_fields = [
+        "enabled", "auto_halted", "halt_code", "halt_reason",
+        "interval_minutes", "window_overlap_minutes", "backfill_days",
+        "num_of_rows", "max_retries", "inqry_div", "intrntnl_div_cd",
+        "indstryty_cds", "last_success_dt",
+    ]
+    run_fields = [
+        "id", "trigger", "status", "window_bgn_dt", "window_end_dt",
+        "total_fetched", "total_new", "total_updated", "retry_count", "error_code",
+    ]
+    with SessionLocal() as session:
+        cfg_obj = repository.get_config(session)
+        cfg = {f: getattr(cfg_obj, f, None) for f in cfg_fields}
+        run_objs = repository.list_recent_runs(session, limit=20)
+        runs = [{f: getattr(r, f, None) for f in run_fields} for r in run_objs]
+    return cfg, runs
+
+
+def _sched_view() -> dict:
+    return {"running": scheduler.is_running(), "next_run": scheduler.get_next_run_time()}
+
+
+@app.get("/config", response_class=HTMLResponse)
+def config_page(saved: str | None = None, err: str | None = None) -> HTMLResponse:
+    cfg, runs = _load_config_view()
+    msg = "설정을 저장했습니다." if saved else None
+    return HTMLResponse(_render_config_page(cfg, runs, _sched_view(), msg, err))
+
+
+@app.post("/config")
+async def config_save(request: Request):
+    form = await request.form()
+    data = {k: str(v) for k, v in form.items()}
+
+    updates: dict[str, Any] = {}
+    errors: list[str] = []
+
+    # 정수 필드 검증
+    for name, lbl, lo, hi in _CONFIG_INT_FIELDS:
+        raw = data.get(name, "").strip()
+        if raw == "":
+            errors.append(f"{lbl}: 값이 비어 있습니다.")
+            continue
+        try:
+            num = int(raw)
+        except ValueError:
+            errors.append(f"{lbl}: 정수가 아닙니다('{raw}').")
+            continue
+        if not (lo <= num <= hi):
+            errors.append(f"{lbl}: {lo}~{hi} 범위를 벗어났습니다({num}).")
+            continue
+        updates[name] = num
+
+    # inqry_div / intrntnl_div_cd
+    inqry_div = data.get("inqry_div", "").strip()
+    if inqry_div not in ("1", "2"):
+        errors.append("조회구분(inqry_div)은 1 또는 2 여야 합니다.")
+    else:
+        updates["inqry_div"] = inqry_div
+
+    intrntnl = data.get("intrntnl_div_cd", "").strip()
+    if intrntnl not in ("1", "2"):
+        errors.append("국내/국제(intrntnl_div_cd)는 1 또는 2 여야 합니다.")
+    else:
+        updates["intrntnl_div_cd"] = intrntnl
+
+    # indstryty_cds CSV (숫자 코드 콤마 구분)
+    csv_raw = data.get("indstryty_cds", "").strip()
+    codes = [c.strip() for c in csv_raw.split(",") if c.strip()]
+    if not codes:
+        errors.append("업종코드(indstryty_cds)는 최소 1개가 필요합니다.")
+    elif not all(c.isdigit() for c in codes):
+        errors.append("업종코드(indstryty_cds)는 숫자 코드의 콤마 구분이어야 합니다.")
+    else:
+        updates["indstryty_cds"] = ",".join(codes)
+
+    # enabled 체크박스(없으면 False)
+    updates["enabled"] = data.get("enabled") in ("1", "on", "true")
+
+    if errors:
+        cfg, runs = _load_config_view()
+        # 입력값을 화면에 되살려 사용자가 고치게 한다.
+        cfg.update({k: v for k, v in updates.items()})
+        html_page = _render_config_page(
+            cfg, runs, _sched_view(), None, " / ".join(errors)
+        )
+        return HTMLResponse(html_page, status_code=400)
+
+    with SessionLocal() as session:
+        repository.update_config(session, **updates)
+
+    # interval 변경을 실행 중 스케줄러에 즉시 반영.
+    if scheduler.is_running():
+        scheduler.reschedule(updates["interval_minutes"])
+
+    return RedirectResponse(url="/config?saved=1", status_code=303)
+
+
+@app.post("/config/resume")
+async def config_resume():
+    with SessionLocal() as session:
+        repository.clear_halt(session)
+    return RedirectResponse(url="/config?saved=1", status_code=303)
+
+
+@app.post("/config/scheduler/start")
+async def scheduler_start(request: Request):
+    form = await request.form()
+    run_now = form.get("run_now") in ("1", "on", "true")
+
+    # 자동중단 상태면 시작을 막는다.
+    with SessionLocal() as session:
+        cfg = repository.get_config(session)
+        halted = cfg.auto_halted
+    if halted:
+        return RedirectResponse(
+            url="/config?err=" + quote("자동 중단 상태입니다. 먼저 재개하세요."),
+            status_code=303,
+        )
+
+    scheduler.start_scheduler(run_now=run_now)
+    return RedirectResponse(url="/config?saved=1", status_code=303)
+
+
+@app.post("/config/scheduler/stop")
+async def scheduler_stop():
+    scheduler.shutdown_scheduler()
+    return RedirectResponse(url="/config?saved=1", status_code=303)

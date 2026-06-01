@@ -6,3 +6,10 @@ python-dotenv
 jinja2
 xmltodict
 python-multipart
+
+# Phase 3 - DB/스케줄러 의존성
+sqlalchemy
+apscheduler<4
+
+# 개발 의존성 (테스트)
+pytest

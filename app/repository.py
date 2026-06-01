@@ -1,0 +1,270 @@
+"""DB 입출력 계층 — Phase 3.3.
+
+collector 가 사용하는 저장소(repository). 정책 판단(재시도/halt/상태 결정)은 collector 가
+담당하고, 이 모듈은 **순수 DB 입출력**만 책임진다: 설정 조회, 실행이력 기록,
+bid_notice upsert, halt 플래그·last_success_dt 갱신.
+
+- 세션은 호출자가 주입한다(`session: Session`). 모듈이 세션을 만들지 않는다.
+- upsert 는 DB별 기능(ON CONFLICT 등)에 의존하지 않고 표준 select→insert/update 로 구현한다
+  (PostgreSQL 이전 대비).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import case, func, select
+from sqlalchemy.orm import Session
+
+from app.models import AppConfig, BidNotice, CollectionRun
+
+# bid_notice 에 실제 존재하는 컬럼명 집합 — values dict 중 컬럼이 아닌 키는 무시한다.
+_BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
+    c.name for c in BidNotice.__table__.columns
+)
+
+
+# --- 설정 ----------------------------------------------------------------
+def get_config(session: Session) -> AppConfig:
+    """단일 설정 행(id=1)을 반환. 없으면 ValueError(init_db 시드 전제)."""
+    cfg = session.get(AppConfig, 1)
+    if cfg is None:
+        raise ValueError(
+            "app_config(id=1) 행이 없습니다. `python -m app.db` 로 init_db() 시드를 먼저 실행하세요."
+        )
+    return cfg
+
+
+# --- 실행 이력 -----------------------------------------------------------
+def create_run(
+    session: Session,
+    trigger: str,
+    window_bgn: datetime,
+    window_end: datetime,
+) -> CollectionRun:
+    """status='running' 으로 실행 이력을 insert 하고 flush(=id 확보) 후 반환."""
+    run = CollectionRun(
+        trigger=trigger,
+        run_started_at=datetime.now(),
+        window_bgn_dt=window_bgn,
+        window_end_dt=window_end,
+        status="running",
+        total_fetched=0,
+        total_new=0,
+        total_updated=0,
+        retry_count=0,
+    )
+    session.add(run)
+    session.flush()  # id 확보
+    return run
+
+
+def finish_run(
+    session: Session,
+    run: CollectionRun,
+    *,
+    status: str,
+    total_fetched: int,
+    total_new: int,
+    total_updated: int,
+    retry_count: int,
+    error_code: str | None = None,
+    error_msg: str | None = None,
+    detail_json: str | None = None,
+) -> None:
+    """실행 이력의 종료 상태·결과를 기록하고 commit 한다."""
+    run.run_finished_at = datetime.now()
+    run.status = status
+    run.total_fetched = total_fetched
+    run.total_new = total_new
+    run.total_updated = total_updated
+    run.retry_count = retry_count
+    run.error_code = error_code
+    run.error_msg = error_msg
+    run.detail_json = detail_json
+    session.commit()
+
+
+# --- bid_notice upsert ---------------------------------------------------
+def upsert_bid_notices(
+    session: Session,
+    values_list: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """bid_ntce_no(PK) 기준 upsert. (new_count, updated_count) 반환.
+
+    - 각 원소는 transform 결과 + 메타(matched_indstryty_cds/collected_at/updated_at)가 합쳐진
+      컬럼값 dict.
+    - 기존 PK 는 `IN` 으로 한 번에 조회해 N+1 을 피한다.
+    - **collected_at(최초 수집 시각)은 insert 시에만 설정하고 update 시 보존**한다.
+      updated_at 등 나머지 컬럼은 항상 갱신.
+    """
+    if not values_list:
+        return (0, 0)
+
+    pks = [v["bid_ntce_no"] for v in values_list if v.get("bid_ntce_no")]
+    existing: dict[str, BidNotice] = {}
+    if pks:
+        rows = (
+            session.execute(select(BidNotice).where(BidNotice.bid_ntce_no.in_(pks)))
+            .scalars()
+            .all()
+        )
+        existing = {r.bid_ntce_no: r for r in rows}
+
+    new_count = 0
+    updated_count = 0
+    for values in values_list:
+        pk = values.get("bid_ntce_no")
+        if not pk:
+            # PK 없는 값은 상위(collector)에서 걸러지지만 방어적으로 건너뛴다.
+            continue
+
+        row = existing.get(pk)
+        if row is None:
+            obj = BidNotice(
+                **{k: v for k, v in values.items() if k in _BID_NOTICE_COLUMNS}
+            )
+            session.add(obj)
+            existing[pk] = obj  # 같은 배치 내 PK 중복 방어(이후 update 로 흡수)
+            new_count += 1
+        else:
+            for key, value in values.items():
+                if key not in _BID_NOTICE_COLUMNS:
+                    continue
+                if key == "collected_at":
+                    continue  # 최초 수집 시각 보존
+                setattr(row, key, value)
+            updated_count += 1
+
+    session.flush()
+    return (new_count, updated_count)
+
+
+# --- halt / last_success ------------------------------------------------
+def set_halt(session: Session, halt_code: str | None, halt_reason: str | None) -> None:
+    """비재시도 에러로 스케줄 자동 중단 — auto_halted=True 와 사유를 기록하고 commit."""
+    cfg = get_config(session)
+    cfg.auto_halted = True
+    cfg.halt_code = halt_code
+    cfg.halt_reason = halt_reason
+    cfg.updated_at = datetime.now()
+    session.commit()
+
+
+def clear_halt(session: Session) -> None:
+    """중단 해제(재개) — auto_halted/halt_code/halt_reason 초기화.
+
+    이번 단계(3.3)에서는 정의만 둔다. 화면(/config) 연결은 3.5.
+    """
+    cfg = get_config(session)
+    cfg.auto_halted = False
+    cfg.halt_code = None
+    cfg.halt_reason = None
+    cfg.updated_at = datetime.now()
+    session.commit()
+
+
+def update_last_success_dt(session: Session, dt: datetime) -> None:
+    """마지막 성공 윈도우 종료 시각 갱신(전체 성공 시에만 collector 가 호출)."""
+    cfg = get_config(session)
+    cfg.last_success_dt = dt
+    cfg.updated_at = datetime.now()
+    session.commit()
+
+
+# --- 화면(/list·/config)용 조회 — Phase 3.5 -----------------------------
+# /config 설정 편집에서 갱신을 허용하는 컬럼 화이트리스트(이 외 키는 무시).
+_CONFIG_UPDATABLE: frozenset[str] = frozenset(
+    {
+        "enabled",
+        "interval_minutes",
+        "window_overlap_minutes",
+        "backfill_days",
+        "num_of_rows",
+        "max_retries",
+        "inqry_div",
+        "intrntnl_div_cd",
+        "indstryty_cds",
+    }
+)
+
+
+def search_bid_notices(
+    session: Session,
+    *,
+    q: str | None = None,
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+    openg_only_future: bool = False,
+    sort: str = "bid_ntce_dt_desc",
+    page: int = 1,
+    page_size: int = 50,
+    now: datetime | None = None,
+) -> tuple[list[BidNotice], int]:
+    """저장된 공고를 필터·정렬·페이지네이션해서 (행 목록, 전체건수)로 반환.
+
+    - q: bid_ntce_nm 부분검색(LIKE %q%, 대소문자 무시).
+    - dt_from/dt_to: bid_ntce_dt 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
+      그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
+    - openg_only_future=True: openg_dt >= now(개찰 임박/미래만). now 는 테스트 결정성을
+      위해 주입 가능(기본 None → datetime.now()).
+    - sort: "bid_ntce_dt_desc"(기본=최신 공고순) 또는 "openg_dt_asc"(개찰 임박순; NULL 뒤로).
+    - page/page_size: LIMIT/OFFSET 페이지네이션. 전체건수는 동일 필터로 count.
+    """
+    conditions = []
+    if q:
+        conditions.append(BidNotice.bid_ntce_nm.ilike(f"%{q}%"))
+    if dt_from is not None:
+        conditions.append(BidNotice.bid_ntce_dt >= dt_from)
+    if dt_to is not None:
+        conditions.append(BidNotice.bid_ntce_dt <= dt_to)
+    if openg_only_future:
+        if now is None:
+            now = datetime.now()
+        conditions.append(BidNotice.openg_dt >= now)
+
+    count_stmt = select(func.count()).select_from(BidNotice)
+    for cond in conditions:
+        count_stmt = count_stmt.where(cond)
+    total = int(session.execute(count_stmt).scalar_one())
+
+    stmt = select(BidNotice)
+    for cond in conditions:
+        stmt = stmt.where(cond)
+
+    if sort == "openg_dt_asc":
+        # NULL(개찰일 미정)은 뒤로: is-null 플래그(0/1)를 1차 정렬키로(이식성↑).
+        stmt = stmt.order_by(
+            case((BidNotice.openg_dt.is_(None), 1), else_=0),
+            BidNotice.openg_dt.asc(),
+        )
+    else:  # 기본: 최신 공고순
+        stmt = stmt.order_by(
+            case((BidNotice.bid_ntce_dt.is_(None), 1), else_=0),
+            BidNotice.bid_ntce_dt.desc(),
+        )
+
+    page = max(1, int(page))
+    page_size = max(1, int(page_size))
+    stmt = stmt.limit(page_size).offset((page - 1) * page_size)
+
+    rows = session.execute(stmt).scalars().all()
+    return list(rows), total
+
+
+def update_config(session: Session, **fields: Any) -> AppConfig:
+    """허용 컬럼(_CONFIG_UPDATABLE)만 갱신 + updated_at. 비허용 키는 무시하고 commit."""
+    cfg = get_config(session)
+    for key, value in fields.items():
+        if key in _CONFIG_UPDATABLE:
+            setattr(cfg, key, value)
+    cfg.updated_at = datetime.now()
+    session.commit()
+    return cfg
+
+
+def list_recent_runs(session: Session, limit: int = 20) -> list[CollectionRun]:
+    """최근 실행 이력을 id DESC 로 limit 건 반환(화면 표시용)."""
+    stmt = select(CollectionRun).order_by(CollectionRun.id.desc()).limit(limit)
+    return list(session.execute(stmt).scalars().all())
