@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import AppConfig, BidNotice, CollectionRun
@@ -197,6 +197,7 @@ def search_bid_notices(
     dt_from: datetime | None = None,
     dt_to: datetime | None = None,
     openg_only_future: bool = False,
+    include_past_openg: bool = True,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -207,8 +208,11 @@ def search_bid_notices(
     - q: bid_ntce_nm 부분검색(LIKE %q%, 대소문자 무시).
     - dt_from/dt_to: bid_ntce_dt 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
       그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
-    - openg_only_future=True: openg_dt >= now(개찰 임박/미래만). now 는 테스트 결정성을
-      위해 주입 가능(기본 None → datetime.now()).
+    - openg_only_future=True: openg_dt >= now(개찰 임박/미래만, NULL 제외). now 는 테스트
+      결정성을 위해 주입 가능(기본 None → datetime.now()).
+    - include_past_openg(기본 True=하위호환): False 면 개찰 지난 공고를 숨긴다 —
+      `(openg_dt >= now) OR (openg_dt IS NULL)`. **개찰일 미정(NULL)은 아직 유효하므로 표시.**
+      openg_only_future 보다 완화된 조건(NULL 포함)이며 /list 기본 동작이 이것이다.
     - sort: "bid_ntce_dt_desc"(기본=최신 공고순) 또는 "openg_dt_asc"(개찰 임박순; NULL 뒤로).
     - page/page_size: LIMIT/OFFSET 페이지네이션. 전체건수는 동일 필터로 count.
     """
@@ -223,6 +227,13 @@ def search_bid_notices(
         if now is None:
             now = datetime.now()
         conditions.append(BidNotice.openg_dt >= now)
+    if not include_past_openg:
+        if now is None:
+            now = datetime.now()
+        # 개찰 지난 공고 숨김. 개찰일 미정(NULL)은 표시(아직 유효).
+        conditions.append(
+            or_(BidNotice.openg_dt >= now, BidNotice.openg_dt.is_(None))
+        )
 
     count_stmt = select(func.count()).select_from(BidNotice)
     for cond in conditions:
@@ -268,3 +279,24 @@ def list_recent_runs(session: Session, limit: int = 20) -> list[CollectionRun]:
     """최근 실행 이력을 id DESC 로 limit 건 반환(화면 표시용)."""
     stmt = select(CollectionRun).order_by(CollectionRun.id.desc()).limit(limit)
     return list(session.execute(stmt).scalars().all())
+
+
+def get_notice_files(session: Session, bid_ntce_no: str) -> list[dict[str, Any]]:
+    """저장된 공고의 첨부 규격서 목록을 반환(Phase 4.1 파일 다운로드용).
+
+    - `ntce_spec_doc_url{i}`(i=1..10)에 URL 이 있으면 첨부 1건으로 본다.
+    - name 은 `ntce_spec_file_nm{i}`, 비어 있으면 `첨부{i}` 로 폴백.
+    - 공고가 없거나 첨부가 없으면 빈 리스트.
+    반환: [{"idx": i, "name": ..., "url": ...}, ...]
+    """
+    notice = session.get(BidNotice, bid_ntce_no)
+    if notice is None:
+        return []
+    files: list[dict[str, Any]] = []
+    for i in range(1, 11):
+        url = getattr(notice, f"ntce_spec_doc_url{i}", None)
+        if not url:
+            continue
+        name = getattr(notice, f"ntce_spec_file_nm{i}", None) or f"첨부{i}"
+        files.append({"idx": i, "name": name, "url": url})
+    return files

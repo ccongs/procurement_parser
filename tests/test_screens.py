@@ -241,7 +241,26 @@ def client(tmp_path, monkeypatch):
                 updated_at=datetime(2026, 1, 1),
             )
         )
-        s.add(_bn("S-1", "스모크 테스트 공고", datetime(2026, 5, 1, 9, 0), datetime(2026, 7, 1, 10, 0)))
+        # 개찰일 NULL → 기본(지난 개찰 숨김)에서도 항상 표시(결정적).
+        s.add(_bn("S-1", "스모크 테스트 공고", datetime(2026, 5, 1, 9, 0), None))
+        # 개찰일이 확실히 과거(2000년) → 기본 숨김, "지난 개찰 포함" 시 노출(결정적).
+        s.add(_bn("S-PAST", "지난 개찰 공고", datetime(2026, 5, 2, 9, 0), datetime(2000, 1, 1, 10, 0)))
+        # 첨부 보유 공고(파일 컬럼·drawer·zip 테스트용). 1·3번 URL 보유, 2번 비어 있음.
+        s.add(
+            BidNotice(
+                bid_ntce_no="S-FILE",
+                bid_ntce_nm="첨부 있는 공고",
+                ntce_instt_nm="테스트기관",
+                bid_ntce_dt=datetime(2026, 5, 3, 9, 0),
+                openg_dt=None,
+                ntce_spec_doc_url1="https://example.test/a.pdf",
+                ntce_spec_file_nm1="규격서.pdf",
+                ntce_spec_doc_url3="https://example.test/c.hwp",
+                # file_nm3 은 비워 폴백(첨부3) 확인.
+                collected_at=datetime(2026, 6, 1, 12, 0),
+                updated_at=datetime(2026, 6, 1, 12, 0),
+            )
+        )
         s.commit()
 
     # 라우트가 참조하는 main.SessionLocal 을 임시 DB 로 교체.
@@ -318,3 +337,174 @@ def test_config_save_invalid_returns_400(client):
     )
     assert resp.status_code == 400
     assert "범위" in resp.text
+
+
+# =====================================================================
+#  Phase 4.1 — 개찰 지난 공고 숨김 · 첨부 파일
+# =====================================================================
+
+# --- search_bid_notices(include_past_openg) ----------------------------
+def test_search_include_past_false_hides_past_keeps_null(session):
+    _seed_notices(session)
+    now = datetime(2026, 6, 1, 12, 0, 0)
+    rows, total = repository.search_bid_notices(
+        session, include_past_openg=False, now=now
+    )
+    # openg>=now(A-1 7/1, A-2 6/20) + NULL(A-4) 유지, 과거(A-3 5/25) 제외.
+    assert total == 3
+    assert {r.bid_ntce_no for r in rows} == {"A-1", "A-2", "A-4"}
+
+
+def test_search_include_past_true_shows_all(session):
+    _seed_notices(session)
+    now = datetime(2026, 6, 1, 12, 0, 0)
+    rows, total = repository.search_bid_notices(
+        session, include_past_openg=True, now=now
+    )
+    assert total == 4
+    assert {r.bid_ntce_no for r in rows} == {"A-1", "A-2", "A-3", "A-4"}
+
+
+# --- get_notice_files --------------------------------------------------
+def test_get_notice_files_url_present_order_and_fallback(session):
+    session.add(
+        BidNotice(
+            bid_ntce_no="F-1",
+            bid_ntce_nm="첨부 테스트",
+            ntce_spec_doc_url1="https://example.test/1.pdf",
+            ntce_spec_file_nm1="규격서.pdf",
+            # 2번은 URL 없음 → 제외
+            ntce_spec_doc_url3="https://example.test/3.hwp",
+            # 3번 파일명 없음 → '첨부3' 폴백
+            collected_at=datetime(2026, 6, 1, 12, 0),
+            updated_at=datetime(2026, 6, 1, 12, 0),
+        )
+    )
+    session.commit()
+
+    files = repository.get_notice_files(session, "F-1")
+    # URL 있는 것만(2건), idx 오름차순
+    assert [f["idx"] for f in files] == [1, 3]
+    assert files[0]["name"] == "규격서.pdf"
+    assert files[1]["name"] == "첨부3"  # 파일명 폴백
+    assert files[1]["url"] == "https://example.test/3.hwp"
+
+
+def test_get_notice_files_missing_notice(session):
+    assert repository.get_notice_files(session, "NOPE") == []
+
+
+# --- 라우트: 기본 숨김 / 토글 -----------------------------------------
+def test_list_default_hides_past_openg(client):
+    resp = client.get("/list")
+    assert resp.status_code == 200
+    # 개찰일 NULL(S-1)·미래 없음 → 표시, 과거(S-PAST)는 기본 숨김.
+    assert "스모크 테스트 공고" in resp.text
+    assert "지난 개찰 공고" not in resp.text
+
+
+def test_list_include_past_shows_past(client):
+    resp = client.get("/list", params={"include_past": "1"})
+    assert resp.status_code == 200
+    assert "지난 개찰 공고" in resp.text
+    # 페이지네이션·쿼리스트링에 include_past 보존
+    assert "include_past=1" in resp.text
+
+
+def test_list_korean_only_headers(client):
+    resp = client.get("/list")
+    # 한글 헤더 노출, 영문 컬럼명/병기 code 미노출.
+    assert "<th>공고번호</th>" in resp.text
+    assert "<th>공고명</th>" in resp.text
+    assert "<th>파일</th>" in resp.text
+    assert "bid_ntce_no</code>" not in resp.text  # /list 표 헤더에 영문 병기 없음
+
+
+# --- 라우트: 파일 목록 JSON -------------------------------------------
+def test_list_files_json(client):
+    resp = client.get("/list/S-FILE/files")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["bid_ntce_no"] == "S-FILE"
+    assert data["bid_ntce_nm"] == "첨부 있는 공고"
+    names = [f["name"] for f in data["files"]]
+    assert names == ["규격서.pdf", "첨부3"]  # 1·3번, 3번은 폴백
+
+
+def test_list_files_json_no_attachments(client):
+    resp = client.get("/list/S-1/files")
+    assert resp.status_code == 200
+    assert resp.json()["files"] == []
+
+
+def test_list_files_json_missing(client):
+    resp = client.get("/list/NOPE/files")
+    assert resp.status_code == 404
+
+
+# --- 라우트: zip (외부 httpx monkeypatch) -----------------------------
+class _FakeResp:
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeAsyncClient:
+    """app.main 의 httpx.AsyncClient 대체 — 외부 호출 없이 가짜 바이트 반환."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url):
+        return _FakeResp(b"FAKEBYTES:" + url.encode("utf-8"))
+
+
+def test_list_files_zip(client, monkeypatch):
+    import zipfile as _zip
+    from io import BytesIO
+
+    from app import main
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", _FakeAsyncClient)
+
+    resp = client.get("/list/S-FILE/files.zip")
+    assert resp.status_code == 200
+    assert resp.content[:4] == b"PK\x03\x04"  # zip 매직넘버
+    assert "attachment" in resp.headers["content-disposition"]
+    assert "UTF-8''" in resp.headers["content-disposition"]
+
+    # zip 내용: 첨부 2건(인덱스 접두)
+    zf = _zip.ZipFile(BytesIO(resp.content))
+    names = zf.namelist()
+    assert len(names) == 2
+    assert any(n.startswith("1_") for n in names)
+    assert any(n.startswith("3_") for n in names)
+
+
+def test_list_files_zip_no_attachments(client, monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", _FakeAsyncClient)
+    resp = client.get("/list/S-1/files.zip")
+    assert resp.status_code == 404
+
+
+def test_list_files_zip_all_fail_returns_502(client, monkeypatch):
+    """외부 다운로드가 전부 실패하면 502(부분 성공 0건)."""
+    from app import main
+
+    class _FailingClient(_FakeAsyncClient):
+        async def get(self, url):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", _FailingClient)
+    resp = client.get("/list/S-FILE/files.zip")
+    assert resp.status_code == 502

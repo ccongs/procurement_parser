@@ -16,17 +16,21 @@ from __future__ import annotations
 
 import calendar
 import html
+import io
 import logging
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Any
 from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from app import api_client, repository, scheduler
 from app.db import SessionLocal
+from app.models import BidNotice
 from app.field_labels import label as field_label
 from app.api_client import (
     COMMON_PARAMS,
@@ -528,6 +532,31 @@ BASE_CSS = """
   .pager a.disabled { color: #b9c0cc; pointer-events: none; }
   fieldset { border: 1px solid #e2e5ea; border-radius: 8px; margin: 0 0 16px; padding: 14px 16px; }
   legend { font-weight: 600; font-size: 13px; color: #1f3a5f; padding: 0 6px; }
+  /* 파일 다운로드 drawer (Phase 4.1) */
+  button.filebtn { border: 1px solid #b6c6df; background: #eef3fb; color: #1f3a5f; padding: 4px 10px;
+                   border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  button.filebtn:hover { background: #dfe9f7; }
+  .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; z-index: 40; }
+  .drawer-backdrop.open { display: block; }
+  .drawer { position: fixed; top: 0; right: 0; height: 100%; width: 380px; max-width: 90vw; background: #fff;
+            box-shadow: -2px 0 10px rgba(0,0,0,.2); transform: translateX(100%); transition: transform .2s ease;
+            z-index: 50; display: flex; flex-direction: column; }
+  .drawer.open { transform: translateX(0); }
+  .drawer .dz-head { background: #1f3a5f; color: #fff; padding: 14px 16px; position: relative; }
+  .drawer .dz-title { font-size: 14px; padding-right: 28px; word-break: break-all; }
+  .drawer .dz-close { position: absolute; top: 10px; right: 12px; background: transparent; border: 0;
+                      color: #fff; font-size: 22px; line-height: 1; cursor: pointer; }
+  .drawer .dz-body { padding: 16px; overflow-y: auto; flex: 1; }
+  .zipall { display: block; text-align: center; background: #1d7a43; color: #fff; text-decoration: none;
+            padding: 9px; border-radius: 7px; margin-bottom: 14px; font-size: 13px; }
+  .zipall:hover { background: #166035; }
+  .filelist { list-style: none; margin: 0; padding: 0; }
+  .filelist li { display: flex; justify-content: space-between; gap: 10px; align-items: center;
+                 padding: 8px 0; border-bottom: 1px solid #eef1f6; font-size: 13px; }
+  .filelist span.fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .filelist a.dl { background: #1f3a5f; color: #fff; text-decoration: none; padding: 5px 10px;
+                   border-radius: 6px; font-size: 12px; white-space: nowrap; }
+  .filelist a.dl:hover { background: #16294a; }
 """
 
 
@@ -588,16 +617,21 @@ def _fmt_amt(value: Any) -> str:
 
 
 # --- /list -----------------------------------------------------------
-# (영문 필드명, 표시 종류) — 헤더는 field_label() 로 국문 라벨을 붙인다.
-_LIST_COLUMNS: list[tuple[str, str]] = [
-    ("bid_ntce_no", "text"),
-    ("bid_ntce_nm", "link"),
-    ("ntce_instt_nm", "text"),
-    ("presmpt_prce", "amt"),
-    ("bid_ntce_dt", "dt"),
-    ("openg_dt", "dt"),
-    ("matched_indstryty_cds", "text"),
+# (컬럼명, 표시 종류, 한글 헤더). /list 는 한글 헤더만 노출한다(영문 병기 없음).
+# field_labels.py(camelCase 키)는 /list 의 snake_case 와 맞지 않아 미해석되므로,
+# 여기서 컬럼별 한글 헤더를 직접 큐레이션한다(field_labels.py 는 /api-test 전용으로 유지).
+_LIST_COLUMNS: list[tuple[str, str, str]] = [
+    ("bid_ntce_no", "text", "공고번호"),
+    ("bid_ntce_nm", "link", "공고명"),
+    ("ntce_instt_nm", "text", "공고기관"),
+    ("presmpt_prce", "amt", "추정가격"),
+    ("bid_ntce_dt", "dt", "공고일시"),
+    ("openg_dt", "dt", "개찰일시"),
+    ("matched_indstryty_cds", "text", "매칭업종"),
 ]
+
+# 첨부 URL 컬럼명(파일 개수 계산·파일 목록 추출에 재사용).
+_SPEC_URL_COLUMNS: list[str] = [f"ntce_spec_doc_url{i}" for i in range(1, 11)]
 
 
 def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
@@ -619,14 +653,12 @@ def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
 def _render_list_rows(rows: list[dict]) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
-    head = "".join(
-        f'<th>{_e(field_label(col))}<br><code class="col-en">{_e(col)}</code></th>'
-        for col, _ in _LIST_COLUMNS
-    )
+    head = "".join(f"<th>{_e(header)}</th>" for _, _, header in _LIST_COLUMNS)
+    head += "<th>파일</th>"
     body_rows = []
     for i, r in enumerate(rows, start=1):
         cells = [f"<td>{i}</td>"]
-        for col, kind in _LIST_COLUMNS:
+        for col, kind, _header in _LIST_COLUMNS:
             val = r.get(col)
             if kind == "amt":
                 cells.append(f"<td>{_e(_fmt_amt(val))}</td>")
@@ -643,6 +675,15 @@ def _render_list_rows(rows: list[dict]) -> str:
                     cells.append(f"<td>{text}</td>")
             else:
                 cells.append(f"<td>{_e(val)}</td>")
+        # 파일 컬럼: 첨부 개수>0 이면 drawer 호출 버튼, 없으면 '-'.
+        cnt = r.get("_file_count", 0)
+        if cnt:
+            cells.append(
+                f'<td><button type="button" class="filebtn" '
+                f'data-no="{_e(r.get("bid_ntce_no"))}">파일 {cnt}</button></td>'
+            )
+        else:
+            cells.append('<td>-</td>')
         body_rows.append(f"<tr>{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
@@ -671,6 +712,88 @@ def _render_pager(total: int, page: int, page_size: int, qs: dict[str, str]) -> 
     </div>"""
 
 
+# /list 클라이언트 스크립트(setRecent + 파일 drawer). 평문 상수라 중괄호 이스케이프 불필요.
+# 파일명은 서버 JSON에서 받아 textContent 로 삽입(XSS 방지). 파일 URL 은 DB 저장 URL 만 사용.
+_LIST_SCRIPT = """
+  function fmtDate(d) {
+    var m = ('0' + (d.getMonth() + 1)).slice(-2);
+    var day = ('0' + d.getDate()).slice(-2);
+    return d.getFullYear() + '-' + m + '-' + day;
+  }
+  function setRecent(n) {
+    var today = new Date();
+    var bgn = new Date(today.getFullYear(), today.getMonth() - n, today.getDate());
+    var f = document.getElementById('dt_from');
+    var t = document.getElementById('dt_to');
+    if (f) f.value = fmtDate(bgn);
+    if (t) t.value = fmtDate(today);
+  }
+
+  (function () {
+    var backdrop = document.getElementById('drawerBackdrop');
+    var drawer = document.getElementById('drawer');
+    var titleEl = document.getElementById('drawerTitle');
+    var listEl = document.getElementById('fileList');
+    var zipAll = document.getElementById('zipAll');
+
+    function closeDrawer() {
+      drawer.classList.remove('open');
+      backdrop.classList.remove('open');
+      drawer.setAttribute('aria-hidden', 'true');
+    }
+    function openDrawer() {
+      drawer.classList.add('open');
+      backdrop.classList.add('open');
+      drawer.setAttribute('aria-hidden', 'false');
+    }
+
+    document.getElementById('drawerClose').addEventListener('click', closeDrawer);
+    backdrop.addEventListener('click', closeDrawer);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeDrawer();
+    });
+
+    document.querySelectorAll('.filebtn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var no = btn.getAttribute('data-no');
+        listEl.innerHTML = '';
+        titleEl.textContent = '불러오는 중…';
+        zipAll.setAttribute('href', '/list/' + encodeURIComponent(no) + '/files.zip');
+        openDrawer();
+        fetch('/list/' + encodeURIComponent(no) + '/files')
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            titleEl.textContent = d.bid_ntce_nm || no;
+            var files = d.files || [];
+            if (!files.length) {
+              var empty = document.createElement('li');
+              empty.textContent = '첨부가 없습니다.';
+              listEl.appendChild(empty);
+              return;
+            }
+            files.forEach(function (f) {
+              var li = document.createElement('li');
+              var span = document.createElement('span');
+              span.className = 'fn';
+              span.textContent = f.name;
+              var a = document.createElement('a');
+              a.className = 'dl';
+              a.href = f.url;
+              a.target = '_blank';
+              a.rel = 'noopener';
+              a.textContent = '다운로드';
+              li.appendChild(span);
+              li.appendChild(a);
+              listEl.appendChild(li);
+            });
+          })
+          .catch(function () { titleEl.textContent = '불러오기 실패'; });
+      });
+    });
+  })();
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def root() -> RedirectResponse:
     return RedirectResponse(url="/list", status_code=307)
@@ -681,12 +804,13 @@ def list_page(
     q: str | None = None,
     dt_from: str | None = None,
     dt_to: str | None = None,
-    openg_only_future: str | None = None,
+    include_past: str | None = None,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
 ) -> HTMLResponse:
     page_size = 50
-    only_future = openg_only_future in ("1", "on", "true", "Y", "y")
+    # 기본 동작 = 개찰 지난 공고 숨김. "지난 개찰 포함" 체크 시에만 전체 노출.
+    include_past_flag = include_past in ("1", "on", "true", "Y", "y")
     sort = sort if sort in ("bid_ntce_dt_desc", "openg_dt_asc") else "bid_ntce_dt_desc"
     try:
         page = max(1, int(page))
@@ -702,20 +826,26 @@ def list_page(
             q=q,
             dt_from=df,
             dt_to=dtto,
-            openg_only_future=only_future,
+            include_past_openg=include_past_flag,
             sort=sort,
             page=page,
             page_size=page_size,
         )
         # 세션 종료 후 lazy 접근 금지 → 필요한 스칼라만 dict 로 추출.
-        cols = [c for c, _ in _LIST_COLUMNS] + ["bid_ntce_dtl_url"]
-        rows = [{c: getattr(o, c, None) for c in cols} for o in objs]
+        # 첨부 URL 컬럼은 파일 개수 계산용으로만 읽고(이미 조회한 ORM 행에서 → N+1 없음),
+        # 화면에는 개수만 전달한다(drawer 열 때 /files 로 상세 조회).
+        cols = [c for c, _, _ in _LIST_COLUMNS] + ["bid_ntce_dtl_url"] + _SPEC_URL_COLUMNS
+        rows = []
+        for o in objs:
+            d = {c: getattr(o, c, None) for c in cols}
+            d["_file_count"] = sum(1 for c in _SPEC_URL_COLUMNS if d.get(c))
+            rows.append(d)
 
     qs = {
         "q": q or "",
         "dt_from": dt_from or "",
         "dt_to": dt_to or "",
-        "openg_only_future": "1" if only_future else "",
+        "include_past": "1" if include_past_flag else "",
         "sort": sort,
     }
 
@@ -745,8 +875,8 @@ def list_page(
         </div>
         <div class="row" style="margin-top:12px;">
           <label class="chk">
-            <input type="checkbox" name="openg_only_future" value="1"{' checked' if only_future else ''}>
-            개찰 임박(개찰일이 현재 이후인 공고만)
+            <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
+            지난 개찰 포함 (기본은 개찰 지난 공고 숨김 · 개찰일 미정은 항상 표시)
           </label>
           <label class="field">
             <span class="flabel">정렬 <code>sort</code></span>
@@ -766,25 +896,102 @@ def list_page(
       {_render_pager(total, page, page_size, qs)}
     </div>
 
-    <script>
-      function fmtDate(d) {{
-        var m = ('0' + (d.getMonth() + 1)).slice(-2);
-        var day = ('0' + d.getDate()).slice(-2);
-        return d.getFullYear() + '-' + m + '-' + day;
-      }}
-      function setRecent(n) {{
-        var today = new Date();
-        var bgn = new Date(today.getFullYear(), today.getMonth() - n, today.getDate());
-        var f = document.getElementById('dt_from');
-        var t = document.getElementById('dt_to');
-        if (f) f.value = fmtDate(bgn);
-        if (t) t.value = fmtDate(today);
-      }}
-    </script>"""
+    <div id="drawerBackdrop" class="drawer-backdrop"></div>
+    <aside id="drawer" class="drawer" aria-hidden="true">
+      <div class="dz-head">
+        <button type="button" class="dz-close" id="drawerClose" aria-label="닫기">&times;</button>
+        <div class="dz-title" id="drawerTitle">첨부 파일</div>
+      </div>
+      <div class="dz-body">
+        <a id="zipAll" class="zipall" href="#">전체 다운로드 (.zip)</a>
+        <ul class="filelist" id="fileList"></ul>
+      </div>
+    </aside>
+
+    <script>{_LIST_SCRIPT}</script>"""
 
     return HTMLResponse(
         _shell("나라장터 입찰공고 목록", "수집·저장된 공고를 조회합니다.", "list", body)
     )
+
+
+# --- /list 파일 다운로드 (Phase 4.1) ---------------------------------
+# zip 스트리밍 가드: 외부 다운로드 타임아웃·누적 총량 상한(메모리 보호).
+_FILE_HTTP_TIMEOUT = 30.0
+_ZIP_TOTAL_LIMIT_BYTES = 300 * 1024 * 1024  # 300MB 누적 상한
+
+
+@app.get("/list/{bid_ntce_no}/files")
+def list_files(bid_ntce_no: str):
+    """공고의 첨부 목록 JSON. drawer 가 fetch 한다. URL 은 DB 저장값만 노출(SSRF 방지)."""
+    with SessionLocal() as session:
+        notice = session.get(BidNotice, bid_ntce_no)
+        if notice is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        nm = notice.bid_ntce_nm
+        files = repository.get_notice_files(session, bid_ntce_no)
+    return JSONResponse(
+        {
+            "bid_ntce_no": bid_ntce_no,
+            "bid_ntce_nm": nm,
+            "files": [{"name": f["name"], "url": f["url"]} for f in files],
+        }
+    )
+
+
+@app.get("/list/{bid_ntce_no}/files.zip")
+async def list_files_zip(bid_ntce_no: str):
+    """공고 첨부를 서버가 받아 zip 으로 묶어 반환.
+
+    - URL 은 **DB 에 저장된 그 공고의 첨부 URL만** 사용(임의 URL 프록시 금지 = SSRF 방지).
+    - 실패 파일은 skip(부분 성공). 성공 0건이면 안내. 파일명 충돌·빈값은 인덱스 접두로 회피.
+    - 리다이렉트 따라감·타임아웃·누적 총량 상한 적용. 한글 파일명 UTF-8.
+    """
+    with SessionLocal() as session:
+        notice = session.get(BidNotice, bid_ntce_no)
+        if notice is None:
+            return Response("공고를 찾을 수 없습니다.", status_code=404)
+        files = repository.get_notice_files(session, bid_ntce_no)
+    if not files:
+        return Response("첨부가 없습니다.", status_code=404)
+
+    buf = io.BytesIO()
+    ok = 0
+    total_bytes = 0
+    used_names: set[str] = set()
+    async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                if total_bytes >= _ZIP_TOTAL_LIMIT_BYTES:
+                    logger.warning(
+                        "zip 누적 총량 상한 도달 — 이후 첨부 skip: no=%s", bid_ntce_no
+                    )
+                    break
+                try:
+                    resp = await client.get(f["url"])
+                    resp.raise_for_status()
+                    content = resp.content
+                except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
+                    logger.warning(
+                        "첨부 다운로드 실패 skip: no=%s idx=%s", bid_ntce_no, f["idx"]
+                    )
+                    continue
+                # 파일명 충돌·빈값 방지: 인덱스 접두.
+                base = f["name"] or f"첨부{f['idx']}"
+                arc = f"{f['idx']}_{base}"
+                if arc in used_names:
+                    arc = f"{f['idx']}_{ok}_{base}"
+                used_names.add(arc)
+                zf.writestr(arc, content)
+                total_bytes += len(content)
+                ok += 1
+
+    if ok == 0:
+        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
+
+    filename = quote(f"{bid_ntce_no}.zip")
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
 
 # --- /config ---------------------------------------------------------
