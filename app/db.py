@@ -75,7 +75,7 @@ def _seed_app_config() -> None:
                 inqry_div="1",
                 intrntnl_div_cd="1",
                 indstryty_cds="1426,1468,1469,1470",
-                prtcpt_lmt_rgn_cd=None,
+                prtcpt_lmt_rgn_cd="00",  # 신규 설치 기본 = 전국(지역제한 없는 공고만)
                 presmpt_prce_bgn=None,
                 presmpt_prce_end=None,
                 last_success_dt=None,

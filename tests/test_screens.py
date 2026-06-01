@@ -948,3 +948,132 @@ def test_list_budget_column_and_won(client):
     assert 'class="insttcell"' in text
     assert ">발주기관A<" in text
     assert ">수요기관B<" in text
+
+
+# =====================================================================
+#  Phase 4.3 — 참가제한지역(prtcptLmtRgnCd) 필터 + /config select
+# =====================================================================
+
+from app import region_codes  # noqa: E402
+
+
+# --- region_codes 모듈 -------------------------------------------------
+def test_region_options_order_and_head():
+    """REGION_OPTIONS: 맨 앞 전체("") → 전국("00") → 코드 오름차순."""
+    opts = region_codes.REGION_OPTIONS
+    assert opts[0] == ("", "전체 (지역제한 무관)")
+    assert opts[1] == ("00", "전국 (지역제한 없는 공고만)")
+    # 이후는 "00" 제외 코드 오름차순.
+    rest_codes = [c for c, _ in opts[2:]]
+    assert rest_codes == sorted(rest_codes)
+    assert "00" not in rest_codes
+    # 알려진 코드가 옵션에 존재.
+    flat = dict(opts)
+    assert flat["11"] == "서울특별시"
+    assert flat["41"] == "경기도"
+
+
+def test_region_is_valid_region():
+    assert region_codes.is_valid_region("") is True   # 전체
+    assert region_codes.is_valid_region(None) is True  # None → 빈값=전체
+    assert region_codes.is_valid_region("00") is True
+    assert region_codes.is_valid_region("28") is True
+    assert region_codes.is_valid_region("99") is True
+    assert region_codes.is_valid_region("ZZ") is False
+    assert region_codes.is_valid_region("9999") is False
+
+
+def test_region_name():
+    assert region_codes.region_name("00") == "전국"
+    assert region_codes.region_name("28") == "인천광역시"
+    assert region_codes.region_name("") == "전체"
+    assert region_codes.region_name(None) == "전체"
+    assert region_codes.region_name("ZZ") == "ZZ"  # 미정의 코드는 코드 그대로
+
+
+# --- update_config 화이트리스트(prtcpt_lmt_rgn_cd) ---------------------
+def test_update_config_region_whitelist(session):
+    cfg = repository.update_config(session, prtcpt_lmt_rgn_cd="28")
+    assert cfg.prtcpt_lmt_rgn_cd == "28"
+    # 빈값(전체) → None 로 갱신 가능.
+    cfg2 = repository.update_config(session, prtcpt_lmt_rgn_cd=None)
+    assert cfg2.prtcpt_lmt_rgn_cd is None
+    # 비허용 키는 여전히 무시(prtcpt_lmt_rgn_cd 만 통과).
+    cfg3 = repository.update_config(session, prtcpt_lmt_rgn_cd="41", bid_ntce_no="X")
+    assert cfg3.prtcpt_lmt_rgn_cd == "41"
+
+
+# --- /config: 참가제한지역 select 렌더 ---------------------------------
+def test_config_page_has_region_select(client):
+    """/config 에 참가제한지역 select·옵션(전국/서울/경기 등) 노출."""
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    assert 'name="prtcpt_lmt_rgn_cd"' in resp.text
+    # 옵션 라벨 노출.
+    assert "전체 (지역제한 무관)" in resp.text
+    assert "전국 (지역제한 없는 공고만)" in resp.text
+    assert "서울특별시" in resp.text
+    assert "경기도" in resp.text
+
+
+def test_config_region_default_selected(client):
+    """시드 기본값('00')이 selected 로 렌더된다."""
+    from app import main as _main
+
+    with _main.SessionLocal() as s:
+        repository.update_config(s, prtcpt_lmt_rgn_cd="00")
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    assert '<option value="00" selected>전국 (지역제한 없는 공고만)</option>' in resp.text
+
+
+# --- /config 저장: 참가제한지역 화이트리스트/거부 ---------------------
+def _cfg_form(**overrides):
+    """유효한 /config 저장 폼 기본값 + overrides."""
+    base = {
+        "interval_minutes": "30",
+        "window_overlap_minutes": "90",
+        "backfill_days": "30",
+        "num_of_rows": "20",
+        "max_retries": "2",
+        "inqry_div": "1",
+        "intrntnl_div_cd": "1",
+        "indstryty_cds": "1426",
+        "prtcpt_lmt_rgn_cd": "00",
+        "enabled": "1",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_config_save_region_valid(client):
+    """유효 지역코드 저장 → 303 + DB 반영."""
+    resp = client.post(
+        "/config", data=_cfg_form(prtcpt_lmt_rgn_cd="28"), follow_redirects=False
+    )
+    assert resp.status_code == 303
+    from app import main as _main
+
+    with _main.SessionLocal() as s:
+        assert repository.get_config(s).prtcpt_lmt_rgn_cd == "28"
+
+
+def test_config_save_region_blank_is_none(client):
+    """빈값(전체) 저장 → None(필터 안 함)으로 저장."""
+    resp = client.post(
+        "/config", data=_cfg_form(prtcpt_lmt_rgn_cd=""), follow_redirects=False
+    )
+    assert resp.status_code == 303
+    from app import main as _main
+
+    with _main.SessionLocal() as s:
+        assert repository.get_config(s).prtcpt_lmt_rgn_cd is None
+
+
+def test_config_save_region_invalid_returns_400(client):
+    """허용 외 지역코드는 400(저장 거부)."""
+    resp = client.post(
+        "/config", data=_cfg_form(prtcpt_lmt_rgn_cd="ZZ"), follow_redirects=False
+    )
+    assert resp.status_code == 400
+    assert "참가제한지역" in resp.text

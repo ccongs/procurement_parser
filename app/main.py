@@ -28,7 +28,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from app import api_client, industry_codes, repository, scheduler
+from app import api_client, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal
 from app.models import BidNotice
 from app.field_labels import label as field_label
@@ -1300,6 +1300,14 @@ def _render_config_page(
 
     enabled_checked = " checked" if cfg.get("enabled") else ""
 
+    # 참가제한지역 select(Phase 4.3). 현재값(빈값=전체) selected. REGION_OPTIONS 순서.
+    cur_rgn = cfg.get("prtcpt_lmt_rgn_cd")
+    cur_rgn = "" if cur_rgn is None else str(cur_rgn)
+    rgn_options = "\n".join(
+        f'<option value="{_e(code)}"{" selected" if code == cur_rgn else ""}>{_e(label)}</option>'
+        for code, label in region_codes.REGION_OPTIONS
+    )
+
     # 자동중단(halt) 상태
     if cfg.get("auto_halted"):
         halt_html = f"""
@@ -1392,6 +1400,13 @@ def _render_config_page(
               </select>
             </label>
             <label class="field" style="min-width:260px;">
+              <span class="flabel">참가제한지역 <code>prtcptLmtRgnCd</code></span>
+              <select name="prtcpt_lmt_rgn_cd">
+                {rgn_options}
+              </select>
+              <span class="help">00=전국(지역제한 없는 공고만), 빈값=전체(필터 안 함). 다음 수집부터 적용.</span>
+            </label>
+            <label class="field" style="min-width:260px;">
               <span class="flabel">업종코드 CSV <code>indstryty_cds</code></span>
               <input type="text" name="indstryty_cds" value="{_e(cfg.get('indstryty_cds'))}" placeholder="예: 1426,1468,1469,1470">
             </label>
@@ -1430,7 +1445,7 @@ def _load_config_view() -> tuple[dict, list[dict]]:
         "enabled", "auto_halted", "halt_code", "halt_reason",
         "interval_minutes", "window_overlap_minutes", "backfill_days",
         "num_of_rows", "max_retries", "inqry_div", "intrntnl_div_cd",
-        "indstryty_cds", "last_success_dt",
+        "indstryty_cds", "prtcpt_lmt_rgn_cd", "last_success_dt",
         "presmpt_prce_bgn", "presmpt_prce_end",
     ]
     run_fields = [
@@ -1502,6 +1517,16 @@ async def config_save(request: Request):
         errors.append("업종코드(indstryty_cds)는 숫자 코드의 콤마 구분이어야 합니다.")
     else:
         updates["indstryty_cds"] = ",".join(codes)
+
+    # 참가제한지역(Phase 4.3) — 허용 코드 ∪ {""}(빈값=전체)만 통과. 그 외 문자열 거부.
+    rgn = data.get("prtcpt_lmt_rgn_cd", "").strip()
+    if region_codes.is_valid_region(rgn):
+        # 빈값은 None(=전체, 필터 안 함)으로 저장.
+        updates["prtcpt_lmt_rgn_cd"] = rgn or None
+    else:
+        errors.append(
+            f"참가제한지역(prtcpt_lmt_rgn_cd)이 허용 코드가 아닙니다('{rgn}')."
+        )
 
     # 추정가격 기본 하한/상한 — 숫자(콤마 허용) 또는 빈값. 빈값은 None(미적용)으로 저장.
     for name, lbl in (

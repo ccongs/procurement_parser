@@ -186,6 +186,8 @@ _CONFIG_UPDATABLE: frozenset[str] = frozenset(
         "inqry_div",
         "intrntnl_div_cd",
         "indstryty_cds",
+        # Phase 4.3: 참가제한지역코드(수집 request 필터). ""=전체 / "00"=전국 / 그 외 특정 지역.
+        "prtcpt_lmt_rgn_cd",
         # Phase 4.2: 추정가격 기본 하한/상한(/list 가격 입력의 기본값으로 사용).
         "presmpt_prce_bgn",
         "presmpt_prce_end",

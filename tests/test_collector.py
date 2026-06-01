@@ -13,13 +13,14 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
-from app import repository
+from app import api_client, collector, repository
 from app.collector import (
     classify_result_code,
     fmt_dt,
     merge_and_dedup,
     total_pages,
 )
+from app.collector import _ConfigSnapshot, _fetch_cd
 from app.db import Base
 from app.models import BidNotice
 
@@ -89,6 +90,77 @@ def test_merge_and_dedup_skips_blank_pk():
 def test_fmt_dt():
     assert fmt_dt(datetime(2025, 7, 1, 9, 0)) == "202507010900"
     assert fmt_dt(datetime(2026, 12, 31, 23, 59)) == "202612312359"
+
+
+# --- 4.5 _fetch_cd base_params: 참가제한지역 prtcptLmtRgnCd (Phase 4.3) ---
+def _snapshot(prtcpt_lmt_rgn_cd):
+    """테스트용 _ConfigSnapshot — 참가제한지역만 가변, 나머지는 고정."""
+    return _ConfigSnapshot(
+        inqry_div="1",
+        intrntnl_div_cd="1",
+        prtcpt_lmt_rgn_cd=prtcpt_lmt_rgn_cd,
+        num_of_rows=20,
+        max_retries=2,
+    )
+
+
+def _capture_base_params(monkeypatch, snapshot):
+    """_fetch_cd 가 만드는 첫 페이지 params(=base_params + pageNo)를 캡처.
+
+    네트워크 없이: _call_with_retry 를 가짜로 바꿔 params 를 기록하고
+    result_code='03'(No Data) 을 돌려 즉시 종료시킨다.
+    """
+    captured: dict = {}
+
+    fake_result = api_client.ApiResult(
+        operation=collector.OPERATION,
+        request_url="",
+        sent_params={},
+        response_type="json",
+        status_code=200,
+        raw_text="",
+        parsed=None,
+        result_code="03",  # No Data → 1페이지 후 종료
+        result_msg="no data",
+        items=[],
+        total_count="0",
+    )
+
+    def _fake_call_with_retry(params, max_retries):
+        captured.update(params)
+        return fake_result, 0, "ok"
+
+    monkeypatch.setattr(collector, "_call_with_retry", _fake_call_with_retry)
+    _fetch_cd("1468", datetime(2026, 5, 1, 0, 0), datetime(2026, 6, 1, 0, 0), snapshot)
+    return captured
+
+
+def test_fetch_cd_base_params_includes_region_when_set(monkeypatch):
+    """prtcpt_lmt_rgn_cd='00' 이면 base_params 에 prtcptLmtRgnCd='00' 포함."""
+    params = _capture_base_params(monkeypatch, _snapshot("00"))
+    assert params["prtcptLmtRgnCd"] == "00"
+    # build_params(12번) 통과 후에도 '00' 은 살아남는다(전송됨).
+    built = api_client.build_params(collector.OPERATION, params, "json")
+    assert built["prtcptLmtRgnCd"] == "00"
+
+
+def test_fetch_cd_base_params_region_specific_code(monkeypatch):
+    """특정 지역코드(예: 28=인천)도 그대로 base_params·build_params 에 들어간다."""
+    params = _capture_base_params(monkeypatch, _snapshot("28"))
+    assert params["prtcptLmtRgnCd"] == "28"
+    built = api_client.build_params(collector.OPERATION, params, "json")
+    assert built["prtcptLmtRgnCd"] == "28"
+
+
+def test_fetch_cd_base_params_drops_region_when_blank(monkeypatch):
+    """prtcpt_lmt_rgn_cd 가 None/'' 이면 base_params 는 빈 문자열, build_params 통과 후 제거(=요청에서 빠짐)."""
+    for blank in (None, ""):
+        params = _capture_base_params(monkeypatch, _snapshot(blank))
+        # base_params 단계에서는 빈 문자열로 들어감(intrntnlDivCd 와 동일 패턴).
+        assert params["prtcptLmtRgnCd"] == ""
+        # build_params(12번)가 빈값을 제거 → 요청에서 빠진다.
+        built = api_client.build_params(collector.OPERATION, params, "json")
+        assert "prtcptLmtRgnCd" not in built
 
 
 # --- 5. upsert_bid_notices (인메모리 SQLite) ----------------------------

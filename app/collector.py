@@ -109,6 +109,7 @@ class _ConfigSnapshot:
 
     inqry_div: str
     intrntnl_div_cd: str | None
+    prtcpt_lmt_rgn_cd: str | None
     num_of_rows: int
     max_retries: int
 
@@ -149,6 +150,8 @@ def _fetch_cd(
     base_params: dict[str, str] = {
         "inqryDiv": config.inqry_div,
         "intrntnlDivCd": config.intrntnl_div_cd or "",  # 빈값이면 build_params 가 제거(=전체)
+        # 참가제한지역(Phase 4.3): "00"=전국(지역제한 없는 공고만), 빈값/None 이면 제거(=전체).
+        "prtcptLmtRgnCd": config.prtcpt_lmt_rgn_cd or "",
         "indstrytyCd": cd,
         "numOfRows": str(config.num_of_rows),
         "inqryBgnDt": fmt_dt(window_bgn),
@@ -299,6 +302,7 @@ def collect_window(
         snapshot = _ConfigSnapshot(
             inqry_div=config.inqry_div,
             intrntnl_div_cd=config.intrntnl_div_cd,
+            prtcpt_lmt_rgn_cd=config.prtcpt_lmt_rgn_cd,
             num_of_rows=config.num_of_rows,
             max_retries=config.max_retries,
         )
