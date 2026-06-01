@@ -5,8 +5,10 @@
 `documents/phase2-collection-spec.md` §5를 기준으로 한다.
 
 - PostgreSQL 이전을 대비해 SQLAlchemy ORM 표준 타입만 사용한다(SQLite 전용 기능 금지).
-- 테이블 3종: bid_notice(입찰공고) / collection_run(실행 이력) / app_config(수집 설정).
+- 테이블 4종: bid_notice(입찰공고) / collection_run(실행 이력) / app_config(수집 설정)
+  / pre_spec(사전규격, Phase 5.1 추가).
 - 수집/변환/스케줄러 로직은 이번 단계(3.1)에서 만들지 않는다.
+- pre_spec 의 변환/수집/화면 로직은 Phase 5.2 이후에서 만든다(5.1은 모델/타입만).
 """
 
 from __future__ import annotations
@@ -166,3 +168,65 @@ class AppConfig(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<AppConfig id={self.id} enabled={self.enabled} auto_halted={self.auto_halted}>"
+
+
+class PreSpec(Base):
+    """사전규격(용역) — 단일 테이블. PK = bf_spec_rgst_no(자연키, 차수 없음).
+
+    op15 getPublicPrcureThngInfoServcPPSSrch 응답을 저장한다(Phase 5.1).
+    변환 규칙(날짜 2형식·금액 콤마·빈값 NULL)·수집/화면은 Phase 5.2 이후.
+    """
+
+    __tablename__ = "pre_spec"
+
+    # --- 식별 (PK = 사전규격등록번호 단일) ---
+    # ⚠️ 명세 크기 10이나 실데이터가 13자 영숫자(예: R26BD00222439, 5.0 실호출 확인) → String(30).
+    bf_spec_rgst_no = Column(String(30), primary_key=True)  # bfSpecRgstNo
+
+    # --- 분류·기관 ---
+    bsns_div_nm = Column(String(20))                    # bsnsDivNm (업무구분명=용역)
+    ref_no = Column(String(105))                        # refNo (참조번호)
+    prdct_clsfc_no_nm = Column(String(200))             # prdctClsfcNoNm (품명/사업명)
+    order_instt_nm = Column(String(200))                # orderInsttNm (발주기관명)
+    rl_dminstt_nm = Column(String(200))                 # rlDminsttNm (실수요기관명)
+
+    # --- 금액 ---
+    asign_bdgt_amt = Column(Numeric(20, 0))             # asignBdgtAmt (배정예산액, 원)
+
+    # --- 일정 (문자열 → DateTime) ---
+    rcpt_dt = Column(DateTime, index=True)              # rcptDt (접수일시, 기간 조회)
+    opnin_rgst_clse_dt = Column(DateTime, index=True)   # opninRgstClseDt (의견등록마감, 임박 조회)
+
+    # --- 담당자 ---
+    ofcl_nm = Column(String(35))                        # ofclNm (담당자명)
+    ofcl_tel_no = Column(String(25))                    # ofclTelNo (담당자전화번호)
+
+    # --- 분류 필터 ---
+    sw_biz_obj_yn = Column(String(1), index=True)       # swBizObjYn (SW사업대상여부, 필터)
+
+    # --- 납품 ---
+    dlvr_tmlmt_dt = Column(DateTime)                    # dlvrTmlmtDt (납품기한일시)
+    dlvr_daynum = Column(Integer)                       # dlvrDaynum (납품일수)
+
+    # --- 첨부 규격서 (1~5 고정 컬럼) ---
+    spec_doc_file_url1 = Column(String(255))            # specDocFileUrl1
+    spec_doc_file_url2 = Column(String(255))            # specDocFileUrl2
+    spec_doc_file_url3 = Column(String(255))            # specDocFileUrl3
+    spec_doc_file_url4 = Column(String(255))            # specDocFileUrl4
+    spec_doc_file_url5 = Column(String(255))            # specDocFileUrl5
+
+    # --- 물품상세·연계 (원문 보존) ---
+    prdct_dtl_list = Column(Text)                       # prdctDtlList (물품상세목록, 최대 4000자)
+    bid_ntce_no_list = Column(Text)                     # bidNtceNoList (관련 입찰공고번호 CSV — 연계 키, 저장만)
+
+    # --- 일정(등록·변경) ---
+    rgst_dt = Column(DateTime)                          # rgstDt (등록일시)
+    chg_dt = Column(DateTime)                           # chgDt (변경일시)
+
+    # --- 수집 메타데이터 ---
+    raw_json = Column(Text)                             # 응답 item 원문 전체(재파싱 대비)
+    collected_at = Column(DateTime, nullable=False)     # 최초 수집 시각(변환/수집 단계에서 부여)
+    updated_at = Column(DateTime, nullable=False)       # 최종 갱신 시각
+
+    def __repr__(self) -> str:  # pragma: no cover - 디버그용
+        return f"<PreSpec {self.bf_spec_rgst_no!r} sw={self.sw_biz_obj_yn!r}>"

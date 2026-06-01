@@ -1,7 +1,8 @@
 """DB 연결·세션·초기화 — Phase 3.1.
 
 SQLAlchemy engine / SessionLocal / Base 를 제공하고, init_db()로
-테이블 3종을 생성한 뒤 app_config 단일 행(id=1)을 기본값으로 시드한다.
+테이블 4종(bid_notice·collection_run·app_config·pre_spec)을 생성한 뒤
+app_config 단일 행(id=1)을 기본값으로 시드한다(pre_spec 시드는 없음).
 
 - DB 경로는 .env 의 DATABASE_URL 에서 로드(없으면 sqlite:///procurement.db).
 - SQLite 파일은 프로젝트 루트에 생성한다.
@@ -41,8 +42,10 @@ Base = declarative_base()
 
 
 def init_db() -> None:
-    """테이블 3종 생성 + app_config 기본행 시드.
+    """테이블 4종(bid_notice·collection_run·app_config·pre_spec) 생성 + app_config 기본행 시드.
 
+    - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
+      create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
     - 이미 있는 테이블/행은 건드리지 않는다(create_all 은 멱등, 시드는 존재 검사).
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
