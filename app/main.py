@@ -332,7 +332,7 @@ PAGE = """<!doctype html>
     .quick button:hover {{ background: #e7ebf2; }}
     .chk {{ display: flex; align-items: center; gap: 6px; font-size: 13px; padding-bottom: 6px; }}
     .chk input {{ width: 16px; height: 16px; }}
-    button.submit {{ background: #1f3a5f; color: #fff; border: 0; padding: 10px 22px;
+    button.submit {{ background: #1f3a5f; color: #fff; border: 0; padding: 8px 22px;
                      border-radius: 7px; font-size: 14px; cursor: pointer; }}
     button.submit:hover {{ background: #16294a; }}
     .muted {{ color: #8a93a2; font-size: 13px; }}
@@ -566,7 +566,7 @@ BASE_CSS = """
   .quick button:hover, button.ghost:hover { background: #e7ebf2; }
   .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; padding-bottom: 6px; }
   .chk input { width: 16px; height: 16px; }
-  button.submit { background: #1f3a5f; color: #fff; border: 0; padding: 10px 22px;
+  button.submit { background: #1f3a5f; color: #fff; border: 0; padding: 8px 22px;
                   border-radius: 7px; font-size: 14px; cursor: pointer; }
   button.submit:hover { background: #16294a; }
   button.danger { background: #b02a25; }
@@ -633,7 +633,7 @@ BASE_CSS = """
   .filter-detail { padding: 0 16px 14px; }
   .filter-collapsed .filter-detail { display: none; }
   .filter-toggle { background: #f4f5f7; border: 1px solid #cbd2dc; color: #4a5568;
-                   padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+                   padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; white-space: nowrap; }
   .filter-toggle:hover { background: #e7ebf2; }
   /* 파일 다운로드 drawer (Phase 4.1) */
   button.filebtn { border: 1px solid #b6c6df; background: #eef3fb; color: #1f3a5f; padding: 4px 10px;
