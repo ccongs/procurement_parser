@@ -31,7 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from app import api_client, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal, init_db
 from app.logging_config import setup_logging
-from app.models import BidNotice
+from app.models import BidNotice, PreSpec
 from app.field_labels import label as field_label
 from app.api_client import (
     COMMON_PARAMS,
@@ -798,6 +798,9 @@ _PRE_SPEC_SORTS: frozenset[str] = frozenset(
 )
 _PRE_SPEC_DEFAULT_SORT = "rcpt_dt_desc"
 
+# 사전규격 첨부 URL 컬럼명(파일 개수 계산·파일 목록 추출에 재사용).
+_PRE_SPEC_FILE_URL_COLUMNS: list[str] = [f"spec_doc_file_url{i}" for i in range(1, 6)]
+
 
 def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
     """yyyy-mm-dd 문자열 → datetime. 빈값/형식오류는 None. end_of_day=True 면 23:59:59."""
@@ -1159,7 +1162,7 @@ _LIST_SCRIPT = """
 
 
 def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
-    """사전규격 목록 테이블 렌더(_render_list_rows 패턴, 파일/링크 컬럼 없음)."""
+    """사전규격 목록 테이블 렌더(_render_list_rows 패턴). 파일 컬럼 포함(4.9-B2)."""
     if not rows:
         return '<p class="muted">조건에 맞는 사전규격이 없습니다.</p>'
     head_cells = []
@@ -1178,6 +1181,7 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
+    head += "<th>파일</th>"
     body_rows = []
     for i, r in enumerate(rows, start=1):
         cells = [f"<td>{i}</td>"]
@@ -1194,6 +1198,15 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
                 # 품명/사업명은 평문 + 전체값 tooltip(긴 값 ellipsis 대비).
                 text = "" if val is None else str(val)
                 cells.append(f'<td title="{_e(text)}">{_e(text)}</td>')
+        # 파일 컬럼: 첨부 개수>0 이면 drawer 호출 버튼, 없으면 '-'.
+        cnt = r.get("_file_count", 0)
+        if cnt:
+            cells.append(
+                f'<td><button type="button" class="filebtn" '
+                f'data-no="{_e(r.get("bf_spec_rgst_no"))}">파일 {cnt}</button></td>'
+            )
+        else:
+            cells.append('<td>-</td>')
         body_rows.append(f"<tr>{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
@@ -1204,7 +1217,8 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
     </div>"""
 
 
-# /pre-spec 클라이언트 스크립트(최근 기간 버튼). 평문 상수라 중괄호 이스케이프 불필요.
+# /pre-spec 클라이언트 스크립트(날짜 버튼 + 파일 drawer). 평문 상수라 중괄호 이스케이프 불필요.
+# 파일명은 서버 JSON에서 받아 textContent 로 삽입(XSS 방지). 파일 URL 은 DB 저장 URL 만 사용.
 _PRE_SPEC_SCRIPT = """
   function fmtDate(d) {
     var m = ('0' + (d.getMonth() + 1)).slice(-2);
@@ -1219,6 +1233,84 @@ _PRE_SPEC_SCRIPT = """
     if (f) f.value = fmtDate(bgn);
     if (t) t.value = fmtDate(today);
   }
+  function setToday() {
+    var today = new Date();
+    var f = document.getElementById('dt_from');
+    var t = document.getElementById('dt_to');
+    if (f) f.value = fmtDate(today);
+    if (t) t.value = fmtDate(today);
+  }
+
+  (function () {
+    var backdrop = document.getElementById('psDrawerBackdrop');
+    var drawer = document.getElementById('psDrawer');
+    var titleEl = document.getElementById('psDrawerTitle');
+    var listEl = document.getElementById('psFileList');
+    var zipAll = document.getElementById('psZipAll');
+
+    function closeDrawer() {
+      drawer.classList.remove('open');
+      backdrop.classList.remove('open');
+      drawer.setAttribute('aria-hidden', 'true');
+    }
+    function openDrawer() {
+      drawer.classList.add('open');
+      backdrop.classList.add('open');
+      drawer.setAttribute('aria-hidden', 'false');
+    }
+
+    document.getElementById('psDrawerClose').addEventListener('click', closeDrawer);
+    backdrop.addEventListener('click', closeDrawer);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeDrawer();
+    });
+
+    document.querySelectorAll('.filebtn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var no = btn.getAttribute('data-no');
+        listEl.innerHTML = '';
+        titleEl.textContent = '불러오는 중…';
+        zipAll.setAttribute('href', '/pre-spec/' + encodeURIComponent(no) + '/files.zip');
+        openDrawer();
+        fetch('/pre-spec/' + encodeURIComponent(no) + '/files')
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            titleEl.textContent = d.bf_spec_rgst_no || no;
+            var files = d.files || [];
+            if (!files.length) {
+              var emptyTr = document.createElement('tr');
+              var emptyTd = document.createElement('td');
+              emptyTd.colSpan = 2;
+              emptyTd.textContent = '첨부가 없습니다.';
+              emptyTr.appendChild(emptyTd);
+              listEl.appendChild(emptyTr);
+              return;
+            }
+            files.forEach(function (f) {
+              var tr = document.createElement('tr');
+              var tdName = document.createElement('td');
+              tdName.className = 'c-fn';
+              // 표시 텍스트는 ellipsis 로 줄이고, title 에 전체 파일명(hover tooltip). XSS 방지 위해 textContent.
+              tdName.textContent = f.name;
+              tdName.title = f.name;
+              var tdDl = document.createElement('td');
+              tdDl.className = 'c-dl';
+              var a = document.createElement('a');
+              a.className = 'dl';
+              a.href = f.url;
+              a.target = '_blank';
+              a.rel = 'noopener';
+              a.textContent = '다운로드';
+              tdDl.appendChild(a);
+              tr.appendChild(tdName);
+              tr.appendChild(tdDl);
+              listEl.appendChild(tr);
+            });
+          })
+          .catch(function () { titleEl.textContent = '불러오기 실패'; });
+      });
+    });
+  })();
 """
 
 
@@ -1231,8 +1323,11 @@ def pre_spec_page(
     include_past: str | None = None,   # 체크 시 의견마감 지난 항목 포함
     sort: str = "rcpt_dt_desc",
     page: int = 1,
+    page_size: int = 50,
 ) -> HTMLResponse:
-    page_size = 50
+    # page_size 허용값: {10, 30, 50, 100}. 그 외는 50으로 폴백.
+    if page_size not in (10, 30, 50, 100):
+        page_size = 50
     # 기본 동작 = 의견마감 지난 항목 숨김. "지난 마감 포함" 체크 시에만 전체 노출(NULL 은 항상 표시).
     include_past_flag = include_past in ("1", "on", "true", "Y", "y")
     # 정렬: 헤더 클릭 6종. 미허용·빈값은 기본(최신 접수일).
@@ -1265,8 +1360,18 @@ def pre_spec_page(
             page_size=page_size,
         )
         # 세션 종료 후 lazy 접근 금지 → 필요한 스칼라만 dict 로 추출.
-        cols = [c for c, _, _ in _PRE_SPEC_COLUMNS] + ["rl_dminstt_nm"]
-        rows = [{c: getattr(o, c, None) for c in cols} for o in objs]
+        # 첨부 URL 컬럼은 파일 개수 계산용으로만 읽고(이미 조회한 ORM 행에서 → N+1 없음),
+        # 화면에는 개수만 전달한다(drawer 열 때 /pre-spec/.../files 로 상세 조회).
+        cols = (
+            [c for c, _, _ in _PRE_SPEC_COLUMNS]
+            + ["rl_dminstt_nm"]
+            + _PRE_SPEC_FILE_URL_COLUMNS
+        )
+        rows = []
+        for o in objs:
+            d = {c: getattr(o, c, None) for c in cols}
+            d["_file_count"] = sum(1 for c in _PRE_SPEC_FILE_URL_COLUMNS if d.get(c))
+            rows.append(d)
 
     # 쿼리스트링 보존(페이지 이동·헤더 정렬 시 다른 필터 유지). 유효 날짜(서버 기본 포함)를 싣는다.
     qs = {
@@ -1276,52 +1381,89 @@ def pre_spec_page(
         "instt": instt or "",
         "include_past": "1" if include_past_flag else "",
         "sort": sort,
+        "page_size": str(page_size),
     }
 
+    # 표기개수 select — 10/30/50/100 옵션
+    ps_options = "".join(
+        f'<option value="{v}"{" selected" if v == page_size else ""}>{v}건</option>'
+        for v in (10, 30, 50, 100)
+    )
+
+    # _filter_card summary: 품명/사업명 검색어 + 검색 버튼.
+    summary_html = f"""
+      <label class="field" style="min-width:260px;">
+        <span class="flabel">품명/사업명 부분검색</span>
+        <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
+      </label>
+      <button type="submit" class="submit">검색</button>"""
+
+    # _filter_card detail: 기관·날짜·지난마감·표기개수.
+    detail_html = f"""
+      <div class="row" style="margin-bottom:10px;">
+        <label class="field" style="min-width:220px;">
+          <span class="flabel">발주/실수요기관 부분검색</span>
+          <input type="text" name="instt" value="{_e(instt or '')}" placeholder="예: 행정안전부">
+        </label>
+        <label class="field">
+          <span class="flabel">접수 시작</span>
+          <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
+        </label>
+        <span class="tilde">~</span>
+        <label class="field">
+          <span class="flabel">접수 종료</span>
+          <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
+        </label>
+        <div class="quick">
+          <button type="button" onclick="setRecent(1)">최근1개월</button>
+          <button type="button" onclick="setRecent(3)">최근3개월</button>
+          <button type="button" onclick="setRecent(6)">최근6개월</button>
+          <button type="button" onclick="setToday()">1일</button>
+        </div>
+      </div>
+      <div class="row">
+        <label class="chk">
+          <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
+          지난 마감 포함
+        </label>
+        <label class="field">
+          <span class="flabel">표기개수</span>
+          <select name="page_size" onchange="this.form.submit()">{ps_options}</select>
+        </label>
+        <input type="hidden" name="sort" value="{_e(sort)}">
+      </div>"""
+
+    filter_card = _filter_card(
+        action="/pre-spec",
+        summary_html=summary_html,
+        detail_html=detail_html,
+        title="사전규격 검색",
+        card_id="filterCard",
+    )
+
     body = f"""
-    <div class="card">
-      <h2>사전규격 검색</h2>
-      <form class="filter" method="get" action="/pre-spec">
-        <div class="row">
-          <label class="field" style="min-width:260px;">
-            <span class="flabel">품명/사업명 부분검색 <code>q</code></span>
-            <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
-          </label>
-          <label class="field" style="min-width:220px;">
-            <span class="flabel">발주/실수요기관 부분검색 <code>instt</code></span>
-            <input type="text" name="instt" value="{_e(instt or '')}" placeholder="예: 행정안전부">
-          </label>
-          <label class="field">
-            <span class="flabel">접수 시작 <code>dt_from</code></span>
-            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
-          </label>
-          <span class="tilde">~</span>
-          <label class="field">
-            <span class="flabel">접수 종료 <code>dt_to</code></span>
-            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
-          </label>
-          <div class="quick">
-            <button type="button" onclick="setRecent(1)">최근1개월</button>
-            <button type="button" onclick="setRecent(3)">최근3개월</button>
-            <button type="button" onclick="setRecent(6)">최근6개월</button>
-          </div>
-        </div>
-        <div class="row" style="margin-top:12px;">
-          <label class="chk">
-            <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
-            지난 마감 포함 (기본은 의견마감 지난 항목 숨김 · 마감일 미정은 항상 표시)
-          </label>
-          <input type="hidden" name="sort" value="{_e(sort)}">
-          <button type="submit" class="submit">검색</button>
-        </div>
-      </form>
-    </div>
+    {filter_card}
 
     <div class="card">
       <h2>수집된 사전규격</h2>
       {_render_pre_spec_rows(rows, sort, qs)}
       {_render_pager(total, page, page_size, qs, base_path="/pre-spec")}
     </div>
+
+    <div id="psDrawerBackdrop" class="drawer-backdrop"></div>
+    <aside id="psDrawer" class="drawer" aria-hidden="true">
+      <div class="dz-head">
+        <button type="button" class="dz-close" id="psDrawerClose" aria-label="닫기">&times;</button>
+        <div class="dz-title" id="psDrawerTitle">첨부 파일</div>
+      </div>
+      <div class="dz-body">
+        <a id="psZipAll" class="zipall" href="#">전체 다운로드 (.zip)</a>
+        <table class="filetable">
+          <thead><tr><th class="c-fn">파일명</th><th class="c-dl">다운로드</th></tr></thead>
+          <tbody id="psFileList"></tbody>
+        </table>
+      </div>
+    </aside>
 
     <script>{_PRE_SPEC_SCRIPT}</script>"""
 
@@ -1598,6 +1740,80 @@ async def list_files_zip(bid_ntce_no: str):
         return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
 
     filename = quote(f"{bid_ntce_no}.zip")
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+
+
+# --- /pre-spec 파일 다운로드 (Phase 4.9-B2) --------------------------
+# 입찰 패턴 이식. SSRF 가드(DB 저장 URL 만)·타임아웃·누적 상한 동일.
+
+@app.get("/pre-spec/{bf_spec_rgst_no}/files")
+def pre_spec_files(bf_spec_rgst_no: str):
+    """사전규격 첨부 목록 JSON. drawer 가 fetch 한다. URL 은 DB 저장값만 노출(SSRF 방지)."""
+    with SessionLocal() as session:
+        spec = session.get(PreSpec, bf_spec_rgst_no)
+        if spec is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
+    return JSONResponse(
+        {
+            "bf_spec_rgst_no": bf_spec_rgst_no,
+            "files": [{"name": f["name"], "url": f["url"]} for f in files],
+        }
+    )
+
+
+@app.get("/pre-spec/{bf_spec_rgst_no}/files.zip")
+async def pre_spec_files_zip(bf_spec_rgst_no: str):
+    """사전규격 첨부를 서버가 받아 zip 으로 묶어 반환.
+
+    - URL 은 **DB 에 저장된 그 사전규격의 첨부 URL만** 사용(임의 URL 프록시 금지 = SSRF 방지).
+    - 실패 파일은 skip(부분 성공). 성공 0건이면 안내. 파일명 충돌·빈값은 인덱스 접두로 회피.
+    - 리다이렉트 따라감·타임아웃·누적 총량 상한 적용. 한글 파일명 UTF-8.
+    """
+    with SessionLocal() as session:
+        spec = session.get(PreSpec, bf_spec_rgst_no)
+        if spec is None:
+            return Response("사전규격을 찾을 수 없습니다.", status_code=404)
+        files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
+    if not files:
+        return Response("첨부가 없습니다.", status_code=404)
+
+    buf = io.BytesIO()
+    ok = 0
+    total_bytes = 0
+    used_names: set[str] = set()
+    async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                if total_bytes >= _ZIP_TOTAL_LIMIT_BYTES:
+                    logger.warning(
+                        "zip 누적 총량 상한 도달 — 이후 첨부 skip: no=%s", bf_spec_rgst_no
+                    )
+                    break
+                try:
+                    resp = await client.get(f["url"])
+                    resp.raise_for_status()
+                    content = resp.content
+                except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
+                    logger.warning(
+                        "첨부 다운로드 실패 skip: no=%s idx=%s", bf_spec_rgst_no, f["idx"]
+                    )
+                    continue
+                # 파일명 충돌·빈값 방지: 인덱스 접두.
+                base = f["name"] or f"첨부{f['idx']}"
+                arc = f"{f['idx']}_{base}"
+                if arc in used_names:
+                    arc = f"{f['idx']}_{ok}_{base}"
+                used_names.add(arc)
+                zf.writestr(arc, content)
+                total_bytes += len(content)
+                ok += 1
+
+    if ok == 0:
+        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
+
+    filename = quote(f"{bf_spec_rgst_no}.zip")
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 

@@ -536,6 +536,26 @@ def list_recent_runs(session: Session, limit: int = 20) -> list[CollectionRun]:
     return list(session.execute(stmt).scalars().all())
 
 
+def get_pre_spec_files(session: Session, bf_spec_rgst_no: str) -> list[dict[str, Any]]:
+    """저장된 사전규격의 첨부 파일 목록을 반환(Phase 4.9-B2 파일 다운로드용).
+
+    - `spec_doc_file_url{i}`(i=1..5)에 URL 이 있으면 첨부 1건으로 본다.
+    - 파일명 컬럼이 없으므로 name 은 `첨부{i}` 폴백.
+    - 사전규격이 없거나 첨부가 없으면 빈 리스트.
+    반환: [{"idx": i, "name": ..., "url": ...}, ...]
+    """
+    spec = session.get(PreSpec, bf_spec_rgst_no)
+    if spec is None:
+        return []
+    files: list[dict[str, Any]] = []
+    for i in range(1, 6):
+        url = getattr(spec, f"spec_doc_file_url{i}", None)
+        if not url:
+            continue
+        files.append({"idx": i, "name": f"첨부{i}", "url": url})
+    return files
+
+
 def get_notice_files(session: Session, bid_ntce_no: str) -> list[dict[str, Any]]:
     """저장된 공고의 첨부 규격서 목록을 반환(Phase 4.1 파일 다운로드용).
 
