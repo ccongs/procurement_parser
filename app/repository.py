@@ -319,6 +319,9 @@ _CONFIG_UPDATABLE: frozenset[str] = frozenset(
         # Phase 4.2: 추정가격 기본 하한/상한(/list 가격 입력의 기본값으로 사용).
         "presmpt_prce_bgn",
         "presmpt_prce_end",
+        # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위(/pre-spec 가격 기본값).
+        "pre_spec_amt_bgn",
+        "pre_spec_amt_end",
     }
 )
 
@@ -444,6 +447,8 @@ def search_pre_specs(
     instt: str | None = None,        # order_instt_nm OR rl_dminstt_nm 부분검색
     dt_from: datetime | None = None,  # rcpt_dt >= dt_from
     dt_to: datetime | None = None,   # rcpt_dt <= dt_to (화면에서 23:59:59 로 넘김)
+    price_min: int | None = None,    # asign_bdgt_amt >= price_min (Phase 4.9-R2-D)
+    price_max: int | None = None,    # asign_bdgt_amt <= price_max (Phase 4.9-R2-D)
     include_past_opnin: bool = True,  # False 면 의견마감 지난 항목 숨김(NULL 은 표시)
     sort: str = "rcpt_dt_desc",
     page: int = 1,
@@ -457,6 +462,9 @@ def search_pre_specs(
     - instt: order_instt_nm 또는 rl_dminstt_nm 부분검색(한 입력으로 두 컬럼 OR LIKE).
     - dt_from/dt_to: rcpt_dt(접수일시) 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
       그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
+    - price_min/price_max(Phase 4.9-R2-D): 배정예산액(asign_bdgt_amt) 범위. 있는 쪽만 적용
+      (>= min / <= max). asign_bdgt_amt 는 Numeric — 정수로 비교. `search_bid_notices` 가격
+      필터 패턴과 동형.
     - include_past_opnin(기본 True=전부): False 면 의견등록마감 지난 항목을 숨긴다 —
       `(opnin_rgst_clse_dt >= now) OR (opnin_rgst_clse_dt IS NULL)`.
       **마감일 미정(NULL)은 아직 유효하므로 항상 표시.** now 는 테스트 결정성을 위해
@@ -480,6 +488,10 @@ def search_pre_specs(
         conditions.append(PreSpec.rcpt_dt >= dt_from)
     if dt_to is not None:
         conditions.append(PreSpec.rcpt_dt <= dt_to)
+    if price_min is not None:
+        conditions.append(PreSpec.asign_bdgt_amt >= price_min)
+    if price_max is not None:
+        conditions.append(PreSpec.asign_bdgt_amt <= price_max)
     if not include_past_opnin:
         if now is None:
             now = datetime.now()

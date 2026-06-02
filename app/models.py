@@ -169,6 +169,9 @@ class AppConfig(Base):
     # --- 사전규격 잡(Phase 5.4) — 입찰과 독립 토글·윈도우 기준 ---
     pre_spec_enabled = Column(Boolean, nullable=False, default=True)  # 사전규격 잡 독립 on/off
     pre_spec_last_success_dt = Column(DateTime)              # 사전규격 윈도우 산정 기준(마지막 성공 종료 시각)
+    # --- 사전규격 검색 기본값(Phase 4.9-R2-D) — /pre-spec 배정예산액 기본 범위 ---
+    pre_spec_amt_bgn = Column(String(25))                    # 배정예산액 기본 하한(미사용=null)
+    pre_spec_amt_end = Column(String(25))                    # 배정예산액 기본 상한(미사용=null)
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<AppConfig id={self.id} enabled={self.enabled} auto_halted={self.auto_halted}>"
