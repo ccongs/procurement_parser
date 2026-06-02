@@ -143,3 +143,29 @@ def test_tick_swallows_collect_exception(monkeypatch):
     _patch_tick(monkeypatch, _FakeConfig(enabled=True), collect_fn=boom)
     # 예외가 tick 밖으로 전파되지 않아야 한다(로그만).
     scheduler.tick()
+
+
+# --- 4. should_autostart 진리표 -----------------------------------------
+def test_should_autostart_bid_only():
+    """입찰 게이트만 충족(enabled=T, halted=F, pre_spec=F) → True."""
+    assert scheduler.should_autostart(True, False, False) is True
+
+
+def test_should_autostart_pre_spec_only():
+    """사전규격만 충족(enabled=F, halted=F, pre_spec=T) → True."""
+    assert scheduler.should_autostart(False, False, True) is True
+
+
+def test_should_autostart_both_false():
+    """둘 다 미충족(enabled=F, halted=F, pre_spec=F) → False."""
+    assert scheduler.should_autostart(False, False, False) is False
+
+
+def test_should_autostart_halted_and_pre_spec_off():
+    """입찰 halt·사전규격 off(enabled=T, halted=T, pre_spec=F) → False."""
+    assert scheduler.should_autostart(True, True, False) is False
+
+
+def test_should_autostart_halted_but_pre_spec_on():
+    """입찰 halt여도 사전규격 on(enabled=F, halted=T, pre_spec=T) → True."""
+    assert scheduler.should_autostart(False, True, True) is True

@@ -66,6 +66,13 @@ def should_run(enabled: bool, auto_halted: bool) -> bool:
     return bool(enabled) and not bool(auto_halted)
 
 
+def should_autostart(enabled: bool, auto_halted: bool, pre_spec_enabled: bool) -> bool:
+    """앱 기동 시 스케줄러를 자동 start 할지. 입찰 게이트(should_run) 또는
+    사전규격 게이트(pre_spec_enabled) 중 하나라도 충족하면 True.
+    (스케줄러가 뜨면 각 tick 이 입찰/사전규격을 per-job 게이트로 개별 판정한다.)"""
+    return should_run(enabled, auto_halted) or bool(pre_spec_enabled)
+
+
 # --- 주기 잡 ------------------------------------------------------------
 def tick(now: datetime | None = None) -> None:
     """주기마다 1회: 게이트 확인 → 윈도우 산정 → collect_window(trigger='scheduled').

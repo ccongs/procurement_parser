@@ -29,7 +29,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from app import api_client, industry_codes, region_codes, repository, scheduler
-from app.db import SessionLocal
+from app.db import SessionLocal, init_db
 from app.models import BidNotice
 from app.field_labels import label as field_label
 from app.api_client import (
@@ -46,13 +46,31 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 수동 모델: 시작 시 스케줄러를 자동 기동하지 않는다(로그만).
-    logger.info(
-        "FastAPI 시작 — 스케줄러는 수동 모델입니다. /config 에서 [시작]을 누르거나 "
-        "`python -m app.scheduler` 로 구동하세요."
-    )
+    try:
+        init_db()  # 테이블+config seed 보장(멱등) 후 게이트 읽기
+        with SessionLocal() as session:
+            cfg = repository.get_config(session)
+            enabled = cfg.enabled
+            auto_halted = cfg.auto_halted
+            pre_spec_enabled = cfg.pre_spec_enabled
+            halt_code = cfg.halt_code
+        if scheduler.should_autostart(enabled, auto_halted, pre_spec_enabled):
+            logger.info(
+                "자동시작 게이트 통과 → 스케줄러 시작(run_now=False): "
+                "enabled=%s auto_halted=%s pre_spec_enabled=%s",
+                enabled, auto_halted, pre_spec_enabled,
+            )
+            scheduler.start_scheduler(run_now=False)
+        else:
+            logger.info(
+                "자동시작 게이트 미충족 → 스케줄러 미시작: "
+                "enabled=%s auto_halted=%s halt_code=%s pre_spec_enabled=%s. "
+                "/config 에서 [시작]으로 수동 기동 가능.",
+                enabled, auto_halted, halt_code, pre_spec_enabled,
+            )
+    except Exception:  # noqa: BLE001 — 자동시작 실패가 앱 기동을 막지 않게(화면은 떠야 /config 로 복구).
+        logger.exception("자동시작 처리 중 예외 — 스케줄러 미시작(앱은 계속 기동).")
     yield
-    # 종료 시 켜져 있던 스케줄러 정리.
     scheduler.shutdown_scheduler()
     logger.info("FastAPI 종료 — 스케줄러를 정리했습니다.")
 
