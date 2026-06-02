@@ -186,7 +186,7 @@ def test_upsert_insert_then_update_preserves_collected_at(session):
     t2 = datetime(2026, 6, 1, 11, 0, 0)
 
     # 최초 insert
-    new, updated = repository.upsert_bid_notices(
+    new, updated, ord_changes = repository.upsert_bid_notices(
         session,
         [
             {
@@ -199,10 +199,11 @@ def test_upsert_insert_then_update_preserves_collected_at(session):
         ],
     )
     assert (new, updated) == (1, 0)
+    assert ord_changes == []  # insert 는 차수변경 아님
     assert _count(session) == 1
 
     # 같은 PK 재삽입 → update. collected_at 보존, 나머지 갱신.
-    new, updated = repository.upsert_bid_notices(
+    new, updated, ord_changes = repository.upsert_bid_notices(
         session,
         [
             {
@@ -215,6 +216,7 @@ def test_upsert_insert_then_update_preserves_collected_at(session):
         ],
     )
     assert (new, updated) == (0, 1)
+    assert ord_changes == []  # bid_ntce_ord 없이 업데이트 — 차수변경 없음
     assert _count(session) == 1  # 행 수 그대로
 
     row = session.get(BidNotice, "R26BK0001")
@@ -225,7 +227,8 @@ def test_upsert_insert_then_update_preserves_collected_at(session):
 
 
 def test_upsert_empty_list(session):
-    assert repository.upsert_bid_notices(session, []) == (0, 0)
+    new, updated, ord_changes = repository.upsert_bid_notices(session, [])
+    assert (new, updated, ord_changes) == (0, 0, [])
     assert _count(session) == 0
 
 
@@ -235,7 +238,7 @@ def test_upsert_mixed_new_and_existing(session):
         session,
         [{"bid_ntce_no": "P1", "collected_at": t, "updated_at": t}],
     )
-    new, updated = repository.upsert_bid_notices(
+    new, updated, ord_changes = repository.upsert_bid_notices(
         session,
         [
             {"bid_ntce_no": "P1", "collected_at": t, "updated_at": t},  # 기존
@@ -243,4 +246,156 @@ def test_upsert_mixed_new_and_existing(session):
         ],
     )
     assert (new, updated) == (1, 1)
+    assert ord_changes == []  # bid_ntce_ord 없음 → 차수변경 없음
     assert _count(session) == 2
+
+
+# --- 6. 차수변경(bidNtceOrd) 감지 테스트 (Phase 4.7) -------------------
+def test_upsert_ord_change_detected(session):
+    """기존 ord='1' → 새 ord='2': ord_changes 에 기록, 행 갱신."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD001", "bid_ntce_ord": "1", "collected_at": t, "updated_at": t}],
+    )
+    new, updated, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD001", "bid_ntce_ord": "2", "collected_at": t, "updated_at": t}],
+    )
+    assert (new, updated) == (0, 1)
+    assert ord_changes == [{"no": "ORD001", "old": "1", "new": "2"}]
+    row = session.get(BidNotice, "ORD001")
+    assert row.bid_ntce_ord == "2"
+
+
+def test_upsert_ord_no_change_same_value(session):
+    """ord '2' → '2': 변경 없음 → ord_changes 비어 있음."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD002", "bid_ntce_ord": "2", "collected_at": t, "updated_at": t}],
+    )
+    _, _, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD002", "bid_ntce_ord": "2", "collected_at": t, "updated_at": t}],
+    )
+    assert ord_changes == []
+
+
+def test_upsert_ord_no_change_int_normalization(session):
+    """'1' 저장 후 '01' 로 업데이트 → 정규화 후 동일(int 1) → 오탐 없음."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD003", "bid_ntce_ord": "1", "collected_at": t, "updated_at": t}],
+    )
+    _, _, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD003", "bid_ntce_ord": "01", "collected_at": t, "updated_at": t}],
+    )
+    assert ord_changes == []
+
+
+def test_upsert_ord_none_new_not_recorded(session):
+    """new 가 None 이면 차수 변경으로 기록하지 않는다."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD004", "bid_ntce_ord": "1", "collected_at": t, "updated_at": t}],
+    )
+    _, _, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD004", "bid_ntce_ord": None, "collected_at": t, "updated_at": t}],
+    )
+    assert ord_changes == []
+
+
+def test_upsert_ord_empty_string_new_not_recorded(session):
+    """new 가 빈 문자열이면 차수 변경으로 기록하지 않는다."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD005", "bid_ntce_ord": "1", "collected_at": t, "updated_at": t}],
+    )
+    _, _, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD005", "bid_ntce_ord": "", "collected_at": t, "updated_at": t}],
+    )
+    assert ord_changes == []
+
+
+def test_upsert_ord_old_none_new_value_recorded(session):
+    """old 가 None(미정)이고 new 가 유효값이면 기록(차수 신규 부여)."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    # bid_ntce_ord 없이 최초 삽입 → None
+    repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD006", "collected_at": t, "updated_at": t}],
+    )
+    _, _, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD006", "bid_ntce_ord": "1", "collected_at": t, "updated_at": t}],
+    )
+    assert len(ord_changes) == 1
+    assert ord_changes[0]["no"] == "ORD006"
+    assert ord_changes[0]["old"] is None
+    assert ord_changes[0]["new"] == "1"
+
+
+def test_upsert_insert_not_counted_as_ord_change(session):
+    """신규 insert 는 차수변경 아님 — ord 값이 있어도 ord_changes 비어 있음."""
+    t = datetime(2026, 6, 1, 10, 0, 0)
+    new, updated, ord_changes = repository.upsert_bid_notices(
+        session,
+        [{"bid_ntce_no": "ORD007", "bid_ntce_ord": "3", "collected_at": t, "updated_at": t}],
+    )
+    assert (new, updated) == (1, 0)
+    assert ord_changes == []
+
+
+# --- 7. _build_detail_json 구조 테스트 (Phase 4.7) ----------------------
+from app.collector import _build_detail_json  # noqa: E402
+
+
+def _make_result(cd: str, outcome: str = "ok") -> dict:
+    return {
+        "cd": cd,
+        "outcome": outcome,
+        "pages": 1,
+        "last_code": "00",
+        "items": [{"bidNtceNo": "X"}],
+        "retry_count": 0,
+    }
+
+
+def test_build_detail_json_structure():
+    """_build_detail_json 이 by_cd / ord_changes / ord_changed_count 객체를 반환."""
+    import json
+
+    results = [_make_result("1468"), _make_result("1470")]
+    ord_changes = [{"no": "ABC", "old": "1", "new": "2"}]
+    raw = _build_detail_json(results, ord_changes)
+    data = json.loads(raw)
+
+    assert "by_cd" in data
+    assert "ord_changes" in data
+    assert "ord_changed_count" in data
+    assert data["ord_changed_count"] == 1
+    assert data["ord_changes"] == [{"no": "ABC", "old": "1", "new": "2"}]
+    # by_cd 는 cd 기준 정렬된 리스트
+    assert [d["indstrytyCd"] for d in data["by_cd"]] == ["1468", "1470"]
+    # by_cd 각 원소 필드 확인
+    assert data["by_cd"][0]["outcome"] == "ok"
+    assert data["by_cd"][0]["items"] == 1
+
+
+def test_build_detail_json_empty_ord_changes():
+    """ord_changes 빈 배열 → ord_changed_count=0."""
+    import json
+
+    results = [_make_result("1426")]
+    raw = _build_detail_json(results, [])
+    data = json.loads(raw)
+    assert data["ord_changes"] == []
+    assert data["ord_changed_count"] == 0
+    assert len(data["by_cd"]) == 1

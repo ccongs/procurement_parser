@@ -108,20 +108,41 @@ def finish_run(
 
 
 # --- bid_notice upsert ---------------------------------------------------
+def _normalize_ord(value: Any) -> tuple[Any, bool]:
+    """차수값을 정규화해 비교 가능한 형태로 변환.
+
+    반환: (normalized_value, is_valid) — 정수 파싱 가능이면 (int, True),
+    문자열로만 비교 가능하면 (strip된 str, True). None / 빈 문자열은 (None, False).
+    """
+    if value is None:
+        return (None, False)
+    s = str(value).strip()
+    if not s:
+        return (None, False)
+    try:
+        return (int(s), True)
+    except ValueError:
+        return (s, True)
+
+
 def upsert_bid_notices(
     session: Session,
     values_list: list[dict[str, Any]],
-) -> tuple[int, int]:
-    """bid_ntce_no(PK) 기준 upsert. (new_count, updated_count) 반환.
+) -> tuple[int, int, list[dict[str, Any]]]:
+    """bid_ntce_no(PK) 기준 upsert. (new_count, updated_count, ord_changes) 반환.
 
     - 각 원소는 transform 결과 + 메타(matched_indstryty_cds/collected_at/updated_at)가 합쳐진
       컬럼값 dict.
     - 기존 PK 는 `IN` 으로 한 번에 조회해 N+1 을 피한다.
     - **collected_at(최초 수집 시각)은 insert 시에만 설정하고 update 시 보존**한다.
       updated_at 등 나머지 컬럼은 항상 갱신.
+    - ord_changes: update 경로에서 bid_ntce_ord 가 바뀐 공고 목록. 각 원소
+      {"no": <bid_ntce_no>, "old": <저장차수 원본 str>, "new": <들어온차수 원본 str>}.
+      비교는 정규화(int 파싱 가능이면 int, 아니면 strip 문자열) 후 수행해 오탐을 방지한다
+      ("1"↔"01" 은 동일). new 가 None/빈값이면 기록하지 않는다.
     """
     if not values_list:
-        return (0, 0)
+        return (0, 0, [])
 
     pks = [v["bid_ntce_no"] for v in values_list if v.get("bid_ntce_no")]
     existing: dict[str, BidNotice] = {}
@@ -135,6 +156,8 @@ def upsert_bid_notices(
 
     new_count = 0
     updated_count = 0
+    ord_changes: list[dict[str, Any]] = []
+
     for values in values_list:
         pk = values.get("bid_ntce_no")
         if not pk:
@@ -150,6 +173,20 @@ def upsert_bid_notices(
             existing[pk] = obj  # 같은 배치 내 PK 중복 방어(이후 update 로 흡수)
             new_count += 1
         else:
+            # --- 차수변경 감지: update 경로에서만, 덮어쓰기 전에 캡처 ---
+            incoming_ord_raw = values.get("bid_ntce_ord")
+            new_norm, new_valid = _normalize_ord(incoming_ord_raw)
+            if new_valid:
+                old_raw = row.bid_ntce_ord
+                old_norm, _ = _normalize_ord(old_raw)
+                if new_norm != old_norm:
+                    # 원본 문자열(strip만)로 기록. old가 None이면 None 그대로.
+                    ord_changes.append({
+                        "no": pk,
+                        "old": str(old_raw).strip() if old_raw is not None else None,
+                        "new": str(incoming_ord_raw).strip(),
+                    })
+
             for key, value in values.items():
                 if key not in _BID_NOTICE_COLUMNS:
                     continue
@@ -159,7 +196,7 @@ def upsert_bid_notices(
             updated_count += 1
 
     session.flush()
-    return (new_count, updated_count)
+    return (new_count, updated_count, ord_changes)
 
 
 # --- pre_spec upsert (Phase 5.3) ----------------------------------------

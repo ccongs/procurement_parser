@@ -256,9 +256,21 @@ def _detach_run(session, run: CollectionRun) -> CollectionRun:
     return run
 
 
-def _build_detail_json(results: list[dict[str, Any]]) -> str:
-    """업종코드별 결과를 detail_json(문자열)으로 직렬화."""
-    detail = [
+def _build_detail_json(
+    results: list[dict[str, Any]],
+    ord_changes: list[dict[str, Any]],
+) -> str:
+    """업종코드별 결과와 차수변경 목록을 detail_json(문자열)으로 직렬화.
+
+    반환 JSON 구조:
+    {
+        "by_cd": [ {"indstrytyCd": ..., "outcome": ..., "pages": ...,
+                    "last_result_code": ..., "items": ..., "retry_count": ...}, ... ],
+        "ord_changes": [ {"no": "...", "old": "1", "new": "2"}, ... ],
+        "ord_changed_count": <len(ord_changes)>
+    }
+    """
+    by_cd = [
         {
             "indstrytyCd": r["cd"],
             "outcome": r["outcome"],
@@ -269,7 +281,14 @@ def _build_detail_json(results: list[dict[str, Any]]) -> str:
         }
         for r in sorted(results, key=lambda x: str(x["cd"]))
     ]
-    return json.dumps(detail, ensure_ascii=False)
+    return json.dumps(
+        {
+            "by_cd": by_cd,
+            "ord_changes": ord_changes,
+            "ord_changed_count": len(ord_changes),
+        },
+        ensure_ascii=False,
+    )
 
 
 # --- 진입 함수 -----------------------------------------------------------
@@ -331,7 +350,6 @@ def collect_window(
                     results.append(fut.result())
 
         total_retry = sum(r["retry_count"] for r in results)
-        detail_json = _build_detail_json(results)
 
         # --- halt 발생: 저장하지 않고 중단(failed) ---
         halt_results = [r for r in results if r["outcome"] == "halt"]
@@ -353,7 +371,7 @@ def collect_window(
                 retry_count=total_retry,
                 error_code=halt_code,
                 error_msg=halt_reason,
-                detail_json=detail_json,
+                detail_json=_build_detail_json(results, []),
             )
             return _detach_run(session, run)
 
@@ -376,8 +394,14 @@ def collect_window(
             values["updated_at"] = meta_ts
             values_list.append(values)
 
-        new_count, updated_count = repository.upsert_bid_notices(session, values_list)
+        new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)
         total_fetched = len(deduped_items)
+
+        # --- 차수변경 로그 ---
+        for change in ord_changes:
+            logger.info("차수변경 %s: %s -> %s", change["no"], change["old"], change["new"])
+
+        detail_json = _build_detail_json(results, ord_changes)
 
         # --- 상태 판정 ---
         failed_results = [r for r in results if r["outcome"] == "failed"]
@@ -412,13 +436,14 @@ def collect_window(
             repository.update_last_success_dt(session, window_end)
 
         logger.info(
-            "수집 종료: status=%s fetched=%d new=%d updated=%d skipped=%d retry=%d",
+            "수집 종료: status=%s fetched=%d new=%d updated=%d skipped=%d retry=%d ord_changed=%d",
             status,
             total_fetched,
             new_count,
             updated_count,
             skipped,
             total_retry,
+            len(ord_changes),
         )
         return _detach_run(session, run)
     finally:
