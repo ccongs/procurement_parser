@@ -582,3 +582,229 @@ def test_pre_spec_config_has_api_test_link(client):
     assert resp.status_code == 200
     assert 'href="/api-test"' in resp.text
     assert "API테스트 열기" in resp.text
+
+
+# =====================================================================
+#  Phase 4.9-B2: get_pre_spec_files + 파일 라우트 + 파일 헤더 + 영문병기 부재
+# =====================================================================
+
+def _ps_with_files(no, nm, *, url1=None, url2=None, **kwargs):
+    """파일 URL을 가진 테스트용 PreSpec."""
+    spec = _ps(no, nm, **kwargs)
+    if url1:
+        spec.spec_doc_file_url1 = url1
+    if url2:
+        spec.spec_doc_file_url2 = url2
+    return spec
+
+
+# --- get_pre_spec_files 단위 테스트 -----------------------------------
+def test_get_pre_spec_files_returns_files(session):
+    """URL 이 있는 컬럼은 첨부로 반환(폴백명 '첨부N')."""
+    spec = _ps_with_files(
+        "F-1", "파일있는규격",
+        url1="https://example.com/file1.hwp",
+        url2="https://example.com/file2.pdf",
+        rcpt=datetime(2026, 5, 1, 9, 0),
+    )
+    session.add(spec)
+    session.commit()
+    files = repository.get_pre_spec_files(session, "F-1")
+    assert len(files) == 2
+    assert files[0]["idx"] == 1
+    assert files[0]["name"] == "첨부1"
+    assert files[0]["url"] == "https://example.com/file1.hwp"
+    assert files[1]["idx"] == 2
+    assert files[1]["name"] == "첨부2"
+
+
+def test_get_pre_spec_files_no_url_returns_empty(session):
+    """URL 이 없으면 빈 리스트."""
+    spec = _ps("F-2", "파일없는규격", rcpt=datetime(2026, 5, 1, 9, 0))
+    session.add(spec)
+    session.commit()
+    files = repository.get_pre_spec_files(session, "F-2")
+    assert files == []
+
+
+def test_get_pre_spec_files_not_found_returns_empty(session):
+    """존재하지 않는 PK 는 빈 리스트."""
+    files = repository.get_pre_spec_files(session, "NONEXISTENT")
+    assert files == []
+
+
+def test_get_pre_spec_files_partial_urls(session):
+    """일부 컬럼만 URL 있는 경우 해당 컬럼만 반환."""
+    spec = _ps_with_files(
+        "F-3", "일부파일규격",
+        url2="https://example.com/file2.hwp",
+        rcpt=datetime(2026, 5, 1, 9, 0),
+    )
+    session.add(spec)
+    session.commit()
+    files = repository.get_pre_spec_files(session, "F-3")
+    assert len(files) == 1
+    assert files[0]["idx"] == 2
+    assert files[0]["name"] == "첨부2"
+
+
+# --- <th>파일</th> 헤더 존재 -------------------------------------------
+def test_pre_spec_table_has_file_column_header(client):
+    """목록 테이블에 '파일' 헤더가 존재한다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert "<th>파일</th>" in resp.text
+
+
+# --- 파일 버튼 렌더 (첨부 있는 시드) -----------------------------------
+@pytest.fixture
+def client_with_files(tmp_path, monkeypatch):
+    """파일 URL이 설정된 사전규격 시드를 포함한 TestClient."""
+    from fastapi.testclient import TestClient
+    from app import main
+
+    db_path = tmp_path / "pre_spec_files_test.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        future=True,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    Local = sessionmaker(bind=engine, autoflush=False, future=True)
+
+    with Local() as s:
+        s.add(_cfg())
+        spec_with_files = _ps_with_files(
+            "FW-1", "파일있는사전규격",
+            order="행정안전부", rl="국세청",
+            amt=20000000,
+            rcpt=datetime(2026, 5, 20, 9, 0),
+            opnin=datetime(2099, 1, 1, 10, 0),
+            url1="https://example.com/spec1.hwp",
+            url2="https://example.com/spec2.pdf",
+        )
+        s.add(spec_with_files)
+        spec_no_files = _ps(
+            "FW-2", "파일없는사전규격",
+            order="조달청", rl=None,
+            rcpt=datetime(2026, 5, 21, 9, 0),
+            opnin=datetime(2099, 1, 1, 10, 0),
+        )
+        s.add(spec_no_files)
+        s.commit()
+
+    monkeypatch.setattr(main, "SessionLocal", Local)
+    return TestClient(main.app)
+
+
+def test_pre_spec_file_button_rendered_for_spec_with_files(client_with_files):
+    """첨부 있는 사전규격에 파일 버튼이 렌더된다."""
+    resp = client_with_files.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'class="filebtn"' in resp.text
+    assert "파일 2" in resp.text  # 2개 첨부
+
+
+def test_pre_spec_file_button_dash_for_spec_without_files(client_with_files):
+    """첨부 없는 사전규격은 '-' 렌더."""
+    resp = client_with_files.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    # FW-2는 파일 없음 → '-'
+    # 파일 버튼이 존재하면서 동시에 '-'도 있는 상태(혼재).
+    assert "<td>-</td>" in resp.text
+
+
+def test_pre_spec_files_route_200_json(client_with_files):
+    """/pre-spec/{no}/files 라우트가 200 + JSON을 반환한다."""
+    resp = client_with_files.get("/pre-spec/FW-1/files")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["bf_spec_rgst_no"] == "FW-1"
+    assert len(data["files"]) == 2
+    assert data["files"][0]["name"] == "첨부1"
+    assert data["files"][0]["url"] == "https://example.com/spec1.hwp"
+
+
+def test_pre_spec_files_route_404_for_missing(client_with_files):
+    """/pre-spec/{no}/files 는 존재하지 않는 PK 에 404를 반환한다."""
+    resp = client_with_files.get("/pre-spec/NONEXISTENT/files")
+    assert resp.status_code == 404
+
+
+def test_pre_spec_files_zip_route_responds(client_with_files):
+    """/pre-spec/{no}/files.zip 라우트가 zip Content-Type 또는 오류를 반환한다(네트워크 X)."""
+    # 실제 URL을 다운로드하지 않으므로 네트워크 실패 → 502 또는 404.
+    # 라우트가 존재하고 DB 조회까지는 수행됨을 확인(405 미발생).
+    resp = client_with_files.get("/pre-spec/FW-1/files.zip")
+    # 네트워크 접근 실패(외부 URL 없음) → 502. 파일 없는 경우 404.
+    # 라우트가 살아 있으면 405(Method Not Allowed)나 422(Unprocessable Entity)가 아니어야 함.
+    assert resp.status_code in (200, 404, 502)
+
+
+def test_pre_spec_files_zip_404_for_no_attachments(client_with_files):
+    """/pre-spec/{no}/files.zip 은 첨부 없는 사전규격에 404."""
+    resp = client_with_files.get("/pre-spec/FW-2/files.zip")
+    assert resp.status_code == 404
+
+
+# --- 영문병기 부재(code 태그 없음) ------------------------------------
+def test_pre_spec_no_code_label_in_filter(client):
+    """필터 라벨에 <code>q</code> 같은 영문병기가 없다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    # <code>q</code> 나 <code>instt</code> 같은 영문 병기 미존재
+    assert "<code>q</code>" not in resp.text
+    assert "<code>instt</code>" not in resp.text
+    assert "<code>dt_from</code>" not in resp.text
+    assert "<code>dt_to</code>" not in resp.text
+
+
+# --- page_size 동작 ---------------------------------------------------
+def test_pre_spec_page_size_param_accepted(client):
+    """page_size=10 파라미터가 받아들여져 200을 반환한다."""
+    resp = client.get("/pre-spec", params={**_WIDE, "page_size": "10"})
+    assert resp.status_code == 200
+    # select 에 10이 선택되어 있어야 한다.
+    assert 'value="10" selected' in resp.text
+
+
+def test_pre_spec_page_size_default_50(client):
+    """기본 page_size=50 선택이 select에 반영된다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'value="50" selected' in resp.text
+
+
+def test_pre_spec_page_size_invalid_falls_back_to_50(client):
+    """허용 외 page_size는 50으로 폴백된다."""
+    resp = client.get("/pre-spec", params={**_WIDE, "page_size": "999"})
+    assert resp.status_code == 200
+    assert 'value="50" selected' in resp.text
+
+
+# --- 정렬/페이저 경로 /pre-spec 유지 ----------------------------------
+def test_pre_spec_sort_links_use_pre_spec_path(client):
+    """정렬 헤더 링크가 /pre-spec? 경로를 사용한다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert "/pre-spec?" in resp.text
+
+
+def test_pre_spec_pager_uses_pre_spec_path(client):
+    """페이저 링크가 /pre-spec? 경로를 사용한다(데이터 충분 시)."""
+    # 3개 시드, page_size=1 → 페이지 3개 → 페이저 링크 존재.
+    resp = client.get("/pre-spec", params={**_WIDE, "page_size": "1", "include_past": "1"})
+    assert resp.status_code == 200
+    # 페이저에 /pre-spec? 경로가 있거나 전체건수 정보가 있어야 함.
+    assert "/pre-spec?" in resp.text or "전체" in resp.text
+
+
+# --- drawer DOM 존재 --------------------------------------------------
+def test_pre_spec_drawer_dom_present(client):
+    """사전규격 페이지에 drawer DOM 요소가 존재한다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert "psDrawerBackdrop" in resp.text
+    assert "psDrawer" in resp.text
+    assert "psFileList" in resp.text
+    assert "psZipAll" in resp.text
