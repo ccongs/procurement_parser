@@ -542,7 +542,7 @@ BASE_CSS = """
   .hdr-btn:hover { background: #3a6199; }
   .hdr-btn.active { background: #fff; color: #1f3a5f; font-weight: 600; }
   /* 탭바 */
-  .tab-bar { display: flex; gap: 0; border-bottom: 2px solid #1f3a5f; margin-bottom: 18px; }
+  .tab-bar { display: flex; gap: 0; border-bottom: 2px solid #1f3a5f; }
   .tab-bar a { text-decoration: none; color: #4a5568; font-size: 14px;
                padding: 10px 20px; border-radius: 8px 8px 0 0; }
   .tab-bar a:hover { background: #eef1f6; color: #1f3a5f; }
