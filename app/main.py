@@ -532,15 +532,21 @@ BASE_CSS = """
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
          margin: 0; background: #f4f5f7; color: #1f2430; }
-  header { background: #1f3a5f; color: #fff; padding: 16px 24px;
+  header { background: #1f3a5f; color: #fff; padding: 12px 24px;
            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
   header h1 { margin: 0; font-size: 18px; }
   header p { margin: 4px 0 0; font-size: 12px; opacity: .8; }
-  .navbtns { display: flex; gap: 8px; }
-  .navbtns a { background: #2d5286; color: #fff; text-decoration: none; font-size: 13px;
-               padding: 7px 14px; border-radius: 7px; }
-  .navbtns a:hover { background: #3a6199; }
-  .navbtns a.active { background: #fff; color: #1f3a5f; font-weight: 600; }
+  /* 헤더 우측 설정 버튼 */
+  .hdr-btn { background: #2d5286; color: #fff; text-decoration: none; font-size: 13px;
+             padding: 7px 14px; border-radius: 7px; }
+  .hdr-btn:hover { background: #3a6199; }
+  .hdr-btn.active { background: #fff; color: #1f3a5f; font-weight: 600; }
+  /* 탭바 */
+  .tab-bar { display: flex; gap: 0; border-bottom: 2px solid #1f3a5f; margin-bottom: 18px; }
+  .tab-bar a { text-decoration: none; color: #4a5568; font-size: 14px;
+               padding: 10px 20px; border-radius: 8px 8px 0 0; }
+  .tab-bar a:hover { background: #eef1f6; color: #1f3a5f; }
+  .tab-bar a.active { background: #1f3a5f; color: #fff; font-weight: 600; }
   main { max-width: 1920px; margin: 0 auto; padding: 20px; }
   .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px;
           box-shadow: 0 1px 3px rgba(0,0,0,.08); }
@@ -585,10 +591,13 @@ BASE_CSS = """
   th .col-en { font-weight: 400; font-size: 10px; color: #97a0b0; }
   tbody tr:hover { background: #f5f8ff; }
   tr.bad { background: #fdf1f0; }
+  /* sticky thead: 필터카드 접힘 바(44px) + 탭바(42px) 아래에 고정 */
+  table thead th { position: sticky; top: 0; z-index: 10; background: #f4f5f7; }
   /* 정렬 가능한 컬럼 헤더(Phase 4.2): 클릭 가능 표시 + 방향 화살표 */
   th a.sortcol { text-decoration: none; color: inherit; display: inline-block; cursor: pointer; }
   th a.sortcol:hover { color: #1f3a5f; }
   th a.sortcol .arrow { color: #1f3a5f; font-size: 11px; }
+  th a.sortcol .arrow.neutral { color: #b9c0cc; font-size: 11px; }
   /* 매칭업종 컬럼: 한글(코드) 세로 목록 + 너비 제한 + ellipsis(tooltip 으로 전체 확인) */
   td.matchind { max-width: 240px; }
   td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
@@ -599,12 +608,31 @@ BASE_CSS = """
                         text-overflow: ellipsis; white-space: nowrap; }
   td.insttcell .ntcorg { color: #8a93a2; margin-bottom: 5px; }
   td.insttcell .dmnorg { color: inherit; }
-  .pager { display: flex; gap: 10px; align-items: center; margin-top: 14px; font-size: 13px; }
-  .pager a { text-decoration: none; color: #1f3a5f; border: 1px solid #cbd2dc; padding: 6px 12px;
-             border-radius: 6px; background: #fff; }
-  .pager a.disabled { color: #b9c0cc; pointer-events: none; }
+  /* sticky 페이저 래퍼: 화면 하단 고정 */
+  .pager-wrap { position: sticky; bottom: 0; background: #fff; padding: 8px 16px;
+                box-shadow: 0 -2px 6px rgba(0,0,0,.08); border-top: 1px solid #e2e5ea; }
+  .pager { display: flex; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+  .pager a, .pager-btn { text-decoration: none; color: #1f3a5f; border: 1px solid #cbd2dc;
+             padding: 5px 10px; border-radius: 6px; background: #fff; font-size: 12px; }
+  .pager a:hover, .pager-btn:hover { background: #eef1f6; }
+  .pager a.disabled, .pager-btn.disabled { color: #b9c0cc; pointer-events: none; }
+  .pager .cur-page { font-weight: 600; color: #fff; background: #1f3a5f;
+                     border: 1px solid #1f3a5f; padding: 5px 10px; border-radius: 6px; font-size: 12px; }
+  .pager .pager-info { color: #6b7280; font-size: 12px; }
+  .pager .pager-ellipsis { color: #8a93a2; padding: 5px 4px; font-size: 12px; }
   fieldset { border: 1px solid #e2e5ea; border-radius: 8px; margin: 0 0 16px; padding: 14px 16px; }
   legend { font-weight: 600; font-size: 13px; color: #1f3a5f; padding: 0 6px; }
+  /* 플로팅 필터 카드: 상단 sticky + 접힘/펼침 */
+  .filter-card { position: sticky; top: 0; z-index: 20; background: #fff;
+                 border-radius: 0 0 8px 8px; box-shadow: 0 2px 6px rgba(0,0,0,.1);
+                 margin-bottom: 16px; }
+  .filter-summary { display: flex; gap: 10px; align-items: center; padding: 10px 16px;
+                    flex-wrap: wrap; }
+  .filter-detail { padding: 0 16px 14px; }
+  .filter-collapsed .filter-detail { display: none; }
+  .filter-toggle { background: #f4f5f7; border: 1px solid #cbd2dc; color: #4a5568;
+                   padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .filter-toggle:hover { background: #e7ebf2; }
   /* 파일 다운로드 drawer (Phase 4.1) */
   button.filebtn { border: 1px solid #b6c6df; background: #eef3fb; color: #1f3a5f; padding: 4px 10px;
                    border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
@@ -638,20 +666,27 @@ BASE_CSS = """
 
 
 def _nav(active: str) -> str:
-    """상단 네비게이션. active in {'list','pre-spec','config','api-test'}."""
-    def cls(name: str) -> str:
-        return ' class="active"' if name == active else ""
+    """헤더 우측 설정 버튼. active in {'list','pre-spec','config','api-test'}.
 
+    헤더 우측에는 '설정' 링크 하나만 노출. 탭바는 _shell 에서 <main> 최상단에 렌더한다.
+    """
+    cfg_cls = ' class="hdr-btn active"' if active == "config" else ' class="hdr-btn"'
+    return f'<a href="/config"{cfg_cls}>설정</a>'
+
+
+def _tab_bar(active: str) -> str:
+    """<main> 최상단 탭바. active in {'list','pre-spec'} 일 때 해당 탭 강조."""
+    list_cls = ' class="active"' if active == "list" else ""
+    ps_cls = ' class="active"' if active == "pre-spec" else ""
     return f"""
-    <div class="navbtns">
-      <a href="/list"{cls('list')}>목록</a>
-      <a href="/pre-spec"{cls('pre-spec')}>사전규격</a>
-      <a href="/config"{cls('config')}>설정</a>
-      <a href="/api-test" target="_blank"{cls('api-test')}>API테스트 ↗</a>
-    </div>"""
+    <nav class="tab-bar">
+      <a href="/list"{list_cls}>입찰공고목록</a>
+      <a href="/pre-spec"{ps_cls}>사전규격목록</a>
+    </nav>"""
 
 
 def _shell(title: str, subtitle: str, active: str, body: str) -> str:
+    """공통 HTML 셸. subtitle 인자는 호환성 위해 유지하나 헤더에 렌더하지 않는다."""
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -662,13 +697,11 @@ def _shell(title: str, subtitle: str, active: str, body: str) -> str:
 </head>
 <body>
   <header>
-    <div>
-      <h1>{_e(title)}</h1>
-      <p>{_e(subtitle)}</p>
-    </div>
+    <h1>{_e(title)}</h1>
     {_nav(active)}
   </header>
   <main>
+    {_tab_bar(active)}
     {body}
   </main>
 </body>
@@ -834,11 +867,13 @@ def _sort_header(
     cur_asc = sort == f"{base}_asc"
     # 현재 이 컬럼으로 정렬 중이면 반대 방향, 아니면 처음엔 desc(추정가격·일시 모두 큰 값/최신 먼저).
     next_sort = f"{base}_asc" if cur_desc else f"{base}_desc"
-    arrow = ""
     if cur_desc:
         arrow = ' <span class="arrow">▼</span>'
     elif cur_asc:
         arrow = ' <span class="arrow">▲</span>'
+    else:
+        # 미정렬: 중립 양방향 표시(흐린 색).
+        arrow = ' <span class="arrow neutral">↕</span>'
     params = {**qs, "sort": next_sort, "page": "1"}
     query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
     return (
@@ -908,21 +943,108 @@ def _render_pager(
     *,
     base_path: str = "/list",
 ) -> str:
+    """sticky 하단 고정 페이저. 현재 페이지 중심 최대 5개 번호 링크 + … 처리."""
     pages = max(1, (total + page_size - 1) // page_size)
     page = min(max(1, page), pages)
 
-    def link(target: int, label: str, disabled: bool) -> str:
+    def page_link(target: int, label: str, *, disabled: bool = False, current: bool = False) -> str:
+        if current:
+            return f'<span class="cur-page">{_e(label)}</span>'
         params = {**qs, "page": str(target)}
         query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
         cls = " disabled" if disabled else ""
         return f'<a class="pager-btn{cls}" href="{base_path}?{query}">{_e(label)}</a>'
 
+    # 번호 링크: 현재 페이지 중심 최대 5개, 범위 밖은 … 처리.
+    num_parts: list[str] = []
+    if pages <= 7:
+        # 전체 페이지가 7 이하면 모두 표시.
+        show_range = range(1, pages + 1)
+    else:
+        # 현재 페이지 중심 ±2 (= 최대 5개).
+        lo = max(1, page - 2)
+        hi = min(pages, page + 2)
+        # 윈도우가 5개 미만이면 한쪽으로 당김.
+        if hi - lo < 4:
+            if lo == 1:
+                hi = min(pages, lo + 4)
+            else:
+                lo = max(1, hi - 4)
+        show_range = range(lo, hi + 1)
+
+    first_shown = show_range[0] if show_range else 1
+    last_shown = show_range[-1] if show_range else pages
+
+    if pages > 7:
+        if first_shown > 1:
+            num_parts.append(page_link(1, "1"))
+            if first_shown > 2:
+                num_parts.append('<span class="pager-ellipsis">…</span>')
+        for p in show_range:
+            num_parts.append(page_link(p, str(p), current=(p == page)))
+        if last_shown < pages:
+            if last_shown < pages - 1:
+                num_parts.append('<span class="pager-ellipsis">…</span>')
+            num_parts.append(page_link(pages, str(pages)))
+    else:
+        for p in show_range:
+            num_parts.append(page_link(p, str(p), current=(p == page)))
+
+    nums_html = " ".join(num_parts)
+
     return f"""
-    <div class="pager">
-      {link(page - 1, '← 이전', page <= 1)}
-      <span>전체 {total:,}건 · {page} / {pages} 페이지</span>
-      {link(page + 1, '다음 →', page >= pages)}
+    <div class="pager-wrap">
+      <div class="pager">
+        {page_link(page - 1, '← 이전', disabled=(page <= 1))}
+        {nums_html}
+        {page_link(page + 1, '다음 →', disabled=(page >= pages))}
+        <span class="pager-info">전체 {total:,}건 · {page} / {pages} 페이지</span>
+      </div>
     </div>"""
+
+
+def _filter_card(
+    *,
+    action: str,
+    summary_html: str,
+    detail_html: str,
+    title: str = "검색",
+    card_id: str = "filterCard",
+) -> str:
+    """플로팅 필터 카드 헬퍼 (Wave A 신설 — B-1/B-2 에서 list_page/pre_spec_page 에 적용).
+
+    동작:
+    - 상단 sticky (position: sticky; top: 0).
+    - 기본 접힘(filter-collapsed 클래스) → 접힘 시 summary_html 만 노출.
+    - 토글 버튼으로 detail_html 펼침/접힘(인라인 onclick, 클래스 토글).
+    - 전체를 <form method="get" action="{action}"> 으로 감싸 한 폼에서 제출.
+    - CSS 클래스는 BASE_CSS 에 정의(.filter-card, .filter-collapsed, .filter-toggle, .filter-detail).
+
+    Args:
+        action: 폼 제출 경로 (예: "/list", "/pre-spec").
+        summary_html: 접힘 상태에서도 항상 보이는 핵심 입력
+                      (검색어 input + 검색 버튼 + 펼침/접힘 토글 포함).
+        detail_html: 토글로 펼쳐지는 나머지 필터 영역.
+        title: 카드 aria-label(기본 "검색").
+        card_id: 카드 element id(기본 "filterCard").
+    """
+    toggle_js = (
+        f"var c=document.getElementById('{card_id}');"
+        f"c.classList.toggle('filter-collapsed');"
+        f"var b=c.querySelector('.filter-toggle');"
+        f"b.textContent=c.classList.contains('filter-collapsed')?'▾ 필터 펼침':'▴ 필터 접힘';"
+    )
+    return (
+        f'<div class="filter-card filter-collapsed" id="{_e(card_id)}" aria-label="{_e(title)}">'
+        f'<form method="get" action="{_e(action)}">'
+        f'<div class="filter-summary">'
+        f'{summary_html}'
+        f'<button type="button" class="filter-toggle" onclick="{_e(toggle_js)}">▾ 필터 펼침</button>'
+        f'</div>'
+        f'<div class="filter-detail">{detail_html}</div>'
+        f'</form>'
+        f'</div>'
+    )
 
 
 # /list 클라이언트 스크립트(setRecent + 파일 drawer). 평문 상수라 중괄호 이스케이프 불필요.
@@ -1701,6 +1823,21 @@ def _render_config_page(
         <div class="note">사전규격 토글은 입찰 <code>auto_halted</code> 와 무관합니다(독립 게이트).</div>
         <div><button type="submit" class="submit">설정 저장</button></div>
       </form>
+    </div>
+
+    <div class="card">
+      <h2>도구</h2>
+      <fieldset>
+        <legend>외부 도구</legend>
+        <a href="/api-test" target="_blank" rel="noopener"
+           style="display:inline-block; background:#1f3a5f; color:#fff; text-decoration:none;
+                  padding:9px 18px; border-radius:7px; font-size:13px;">
+          API테스트 열기 ↗
+        </a>
+        <p class="muted" style="margin:8px 0 0; font-size:12px;">
+          원시 API 응답을 확인하거나 엔드포인트를 직접 호출할 때 사용합니다 (새 탭으로 열림).
+        </p>
+      </fieldset>
     </div>
 
     <div class="card">

@@ -1077,3 +1077,116 @@ def test_config_save_region_invalid_returns_400(client):
     )
     assert resp.status_code == 400
     assert "참가제한지역" in resp.text
+
+
+# =====================================================================
+#  Phase 4.9-A — Wave A: 헤더·탭·CSS·페이저·정렬·설정·필터헬퍼
+# =====================================================================
+
+
+def test_tab_bar_exists_on_list(client):
+    """/list 에 탭바(입찰공고목록·사전규격목록) 링크가 존재하며, 입찰공고목록이 active."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'href="/list"' in resp.text
+    assert 'href="/pre-spec"' in resp.text
+    # /list 활성 탭
+    assert 'href="/list" class="active"' in resp.text
+
+
+def test_tab_bar_pre_spec_active_on_pre_spec(client):
+    """/pre-spec 에서 사전규격목록 탭이 active."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'href="/pre-spec" class="active"' in resp.text
+    # 입찰공고목록 탭은 비활성
+    assert 'href="/list" class="active"' not in resp.text
+
+
+def test_tab_bar_no_active_on_config(client):
+    """/config 에서 탭은 비활성(설정 버튼이 active)."""
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    # 탭 링크는 존재하지만 active 아님
+    assert 'href="/list"' in resp.text
+    assert 'href="/pre-spec"' in resp.text
+    assert 'href="/list" class="active"' not in resp.text
+    assert 'href="/pre-spec" class="active"' not in resp.text
+    # 설정 버튼이 active
+    assert 'hdr-btn active' in resp.text
+
+
+def test_config_has_api_test_link(client):
+    """/config 에 'API테스트 열기 ↗' 링크(새 탭)가 존재한다."""
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    assert 'href="/api-test"' in resp.text
+    assert 'target="_blank"' in resp.text
+    assert "API테스트 열기" in resp.text
+
+
+def test_pager_has_page_numbers(client):
+    """페이저에 번호 링크가 존재하고 전체건수 텍스트도 포함된다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 전체건수 텍스트 보존(테스트 의존)
+    assert "전체" in resp.text
+    assert "페이지" in resp.text
+    # 페이저 링크(이전/다음)
+    assert "← 이전" in resp.text
+    assert "다음 →" in resp.text
+
+
+def test_sort_header_neutral_arrow_on_unsorted_column(client):
+    """미정렬 컬럼에 ↕ 중립 화살표가, 현재 정렬 컬럼에 ▼/▲ 방향 화살표가 표시된다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 기본 정렬(bid_ntce_dt_desc) → 공고일 컬럼 ▼, 다른 컬럼(미정렬) ↕
+    assert "▼" in resp.text
+    assert "↕" in resp.text  # 미정렬 중립 화살표
+
+
+def test_filter_card_helper_basic():
+    """_filter_card 시그니처 및 기본 동작 확인."""
+    from app.main import _filter_card
+
+    html = _filter_card(
+        action="/list",
+        summary_html='<input name="q" value="">',
+        detail_html='<input name="dt_from">',
+    )
+    # filter-card + filter-collapsed(기본 접힘) 클래스
+    assert 'filter-card' in html
+    assert 'filter-collapsed' in html
+    # form action
+    assert 'action="/list"' in html
+    assert 'method="get"' in html
+    # summary·detail 내용
+    assert 'name="q"' in html
+    assert 'name="dt_from"' in html
+    # 토글 버튼
+    assert 'filter-toggle' in html
+
+
+def test_filter_card_helper_custom_id_and_title():
+    """card_id·title 커스텀 인자가 반영된다."""
+    from app.main import _filter_card
+
+    html = _filter_card(
+        action="/pre-spec",
+        summary_html="",
+        detail_html="",
+        title="사전규격 검색",
+        card_id="myCard",
+    )
+    assert 'id="myCard"' in html
+    assert 'aria-label="사전규격 검색"' in html
+    assert 'action="/pre-spec"' in html
+
+
+def test_header_no_subtitle_rendered(client):
+    """헤더에 subtitle <p> 태그가 렌더되지 않는다(파라미터는 유지, 화면엔 미노출)."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 기존 subtitle 텍스트("수집·저장된 공고를 조회합니다.")가 헤더에 없음.
+    assert "수집·저장된 공고를 조회합니다." not in resp.text

@@ -540,3 +540,45 @@ def test_list_page_still_uses_list_path_in_sort_and_pager(client):
     # /list 정렬·페이저 링크는 여전히 /list 경로(일반화로 인한 회귀 없음).
     assert "/list?" in resp.text
     assert "/pre-spec?" not in resp.text
+
+
+# =====================================================================
+#  Phase 4.9-A Wave A 회귀: 탭 active·페이저·정렬 화살표
+# =====================================================================
+
+def test_pre_spec_tab_active_on_pre_spec_page(client):
+    """/pre-spec 에서 사전규격목록 탭이 active, 입찰공고목록 탭은 비활성."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'href="/pre-spec" class="active"' in resp.text
+    assert 'href="/list" class="active"' not in resp.text
+
+
+def test_list_tab_present_on_pre_spec_page(client):
+    """/pre-spec 에 /list 탭 링크가 존재한다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'href="/list"' in resp.text
+
+
+def test_pre_spec_pager_has_page_info(client):
+    """페이저에 전체건수·페이지 텍스트가 보존된다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert "전체" in resp.text
+    assert "페이지" in resp.text
+
+
+def test_pre_spec_sort_header_neutral_arrow(client):
+    """미정렬 컬럼에 ↕ 중립 화살표가 존재한다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert "↕" in resp.text
+
+
+def test_pre_spec_config_has_api_test_link(client):
+    """/config 에 API테스트 링크(새 탭)가 존재한다."""
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    assert 'href="/api-test"' in resp.text
+    assert "API테스트 열기" in resp.text
