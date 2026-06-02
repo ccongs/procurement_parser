@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from app import api_client, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal, init_db
+from app.logging_config import setup_logging
 from app.models import BidNotice
 from app.field_labels import label as field_label
 from app.api_client import (
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_logging()  # 중앙 로깅 초기화 — 핸들러 없이 버려지는 로그 방지(멱등)
     try:
         init_db()  # 테이블+config seed 보장(멱등) 후 게이트 읽기
         with SessionLocal() as session:

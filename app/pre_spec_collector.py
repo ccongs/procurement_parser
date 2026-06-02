@@ -356,8 +356,6 @@ def _run_backfill() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from app.logging_config import setup_logging  # noqa: PLC0415
+    setup_logging()
     _run_backfill()

@@ -276,10 +276,8 @@ def get_next_run_time(job_id: str = _JOB_ID) -> datetime | None:
 
 # --- 독립 실행 진입점(검증용) -------------------------------------------
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from app.logging_config import setup_logging  # noqa: PLC0415
+    setup_logging()
     start_scheduler(run_now=True)
     # BackgroundScheduler 는 데몬 스레드이므로 메인 스레드를 살려 둔다.
     try:
