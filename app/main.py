@@ -584,7 +584,7 @@ BASE_CSS = """
   .msg.ok { background: #e3f5e9; color: #1d7a43; }
   .msg.err { background: #fde3e1; color: #b02a25; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .table-wrap { overflow-x: auto; }
+  .table-wrap { overflow: auto; max-height: var(--table-maxh, 60vh); }
   table { border-collapse: collapse; font-size: 12px; width: 100%; }
   th, td { border: 1px solid #e2e5ea; padding: 6px 8px; text-align: left; vertical-align: top;
            max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
@@ -592,8 +592,8 @@ BASE_CSS = """
   th .col-en { font-weight: 400; font-size: 10px; color: #97a0b0; }
   tbody tr:hover { background: #f5f8ff; }
   tr.bad { background: #fdf1f0; }
-  /* sticky thead: JS 가 측정한 --stack-h(탭바+필터카드 합산) 아래에 고정 */
-  table thead th { position: sticky; top: var(--stack-h, 96px); z-index: 10; background: #f4f5f7; }
+  /* sticky thead: table-wrap 스크롤 컨테이너 상단에 고정(top:0), 뷰포트 기준 아님 */
+  table thead th { position: sticky; top: 0; z-index: 10; background: #f4f5f7; }
   /* 정렬 가능한 컬럼 헤더(Phase 4.2): 클릭 가능 표시 + 방향 화살표 */
   th a.sortcol { text-decoration: none; color: inherit; display: inline-block; cursor: pointer; }
   th a.sortcol:hover { color: #1f3a5f; }
@@ -697,6 +697,14 @@ _STICKY_STACK_SCRIPT = """(function () {
     var root = document.documentElement;
     root.style.setProperty('--tabbar-h', tabH + 'px');
     root.style.setProperty('--stack-h', (tabH + filterH) + 'px');
+    /* --table-maxh: table-wrap 스크롤 박스 가용 높이 (페이저 여유 64px 확보) */
+    var tableWrap = document.querySelector('.table-wrap');
+    if (tableWrap) {
+      var topOffset = tableWrap.getBoundingClientRect().top;
+      var maxh = window.innerHeight - topOffset - 64;
+      if (maxh < 200) maxh = 200;
+      root.style.setProperty('--table-maxh', maxh + 'px');
+    }
   }
   updateStackVars();
   if (typeof ResizeObserver !== 'undefined') {
@@ -706,6 +714,8 @@ _STICKY_STACK_SCRIPT = """(function () {
     if (tabBar) ro.observe(tabBar);
     if (filterCard) ro.observe(filterCard);
   }
+  window.addEventListener('resize', updateStackVars);
+  window.addEventListener('scroll', updateStackVars);
 })();"""
 
 
