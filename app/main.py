@@ -1353,6 +1353,8 @@ def pre_spec_page(
     dt_from: str | None = None,
     dt_to: str | None = None,
     instt: str | None = None,
+    price_min: str | None = None,    # 배정예산액 최소(Phase 4.9-R2-D)
+    price_max: str | None = None,    # 배정예산액 최대(Phase 4.9-R2-D)
     include_past: str | None = None,   # 체크 시 의견마감 지난 항목 포함
     sort: str = "rcpt_dt_desc",
     page: int = 1,
@@ -1380,13 +1382,27 @@ def pre_spec_page(
     df = _parse_date(dt_from_eff)
     dtto = _parse_date(dt_to_eff, end_of_day=True)
 
+    # 가격: 화면 입력값 우선, 비었으면 설정 기본값(cfg.pre_spec_amt_bgn/end).
+    # list_page 의 cfg 기본값 로직과 동형.
     with SessionLocal() as session:
+        cfg = repository.get_config(session)
+        cfg_amt_bgn = cfg.pre_spec_amt_bgn
+        cfg_amt_end = cfg.pre_spec_amt_end
+
+        price_min_in = price_min if (price_min is not None and str(price_min).strip()) else None
+        price_max_in = price_max if (price_max is not None and str(price_max).strip()) else None
+        # 입력칸에 표시할 값(숫자 정규화). 입력이 없으면 설정 기본값.
+        price_min_disp = _parse_price(price_min_in) if price_min_in is not None else _parse_price(cfg_amt_bgn)
+        price_max_disp = _parse_price(price_max_in) if price_max_in is not None else _parse_price(cfg_amt_end)
+
         objs, total = repository.search_pre_specs(
             session,
             q=q,
             instt=instt,
             dt_from=df,
             dt_to=dtto,
+            price_min=price_min_disp,
+            price_max=price_max_disp,
             include_past_opnin=include_past_flag,
             sort=sort,
             page=page,
@@ -1406,12 +1422,18 @@ def pre_spec_page(
             d["_file_count"] = sum(1 for c in _PRE_SPEC_FILE_URL_COLUMNS if d.get(c))
             rows.append(d)
 
+    # 입력칸 표시값(문자열). 정규화된 정수를 그대로 보여준다(없으면 빈칸).
+    price_min_field = "" if price_min_disp is None else str(price_min_disp)
+    price_max_field = "" if price_max_disp is None else str(price_max_disp)
+
     # 쿼리스트링 보존(페이지 이동·헤더 정렬 시 다른 필터 유지). 유효 날짜(서버 기본 포함)를 싣는다.
     qs = {
         "q": q or "",
         "dt_from": dt_from_eff or "",
         "dt_to": dt_to_eff or "",
         "instt": instt or "",
+        "price_min": price_min_field,
+        "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
         "sort": sort,
         "page_size": str(page_size),
@@ -1431,7 +1453,7 @@ def pre_spec_page(
       </label>
       <button type="submit" class="submit">검색</button>"""
 
-    # _filter_card detail: 기관·날짜·지난마감·표기개수.
+    # _filter_card detail: 기관·날짜·가격·지난마감·표기개수.
     detail_html = f"""
       <div class="row" style="margin-bottom:10px;">
         <label class="field" style="min-width:220px;">
@@ -1453,6 +1475,17 @@ def pre_spec_page(
           <button type="button" onclick="setRecent(6)">최근6개월</button>
           <button type="button" onclick="setToday()">1일</button>
         </div>
+      </div>
+      <div class="row" style="margin-bottom:10px;">
+        <label class="field">
+          <span class="flabel">배정예산액 최소</span>
+          <input type="number" name="price_min" id="ps_price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
+        </label>
+        <span class="tilde">~</span>
+        <label class="field">
+          <span class="flabel">배정예산액 최대</span>
+          <input type="number" name="price_max" id="ps_price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
+        </label>
       </div>
       <div class="row">
         <label class="chk">
@@ -2066,6 +2099,9 @@ def _render_config_page(
               <span class="flabel">업종코드 CSV <code>indstryty_cds</code></span>
               <input type="text" name="indstryty_cds" value="{_e(cfg.get('indstryty_cds'))}" placeholder="예: 1426,1468,1469,1470">
             </label>
+          </div>
+          <div class="note" style="margin-top:8px;">입찰공고 검색 기본값(추정가격)</div>
+          <div class="grid" style="margin-top:4px;">
             <label class="field">
               <span class="flabel">추정가격 기본 하한 <code>presmpt_prce_bgn</code></span>
               <input type="number" name="presmpt_prce_bgn" value="{_e(cfg.get('presmpt_prce_bgn'))}" placeholder="비우면 미적용" min="0">
@@ -2075,7 +2111,18 @@ def _render_config_page(
               <input type="number" name="presmpt_prce_end" value="{_e(cfg.get('presmpt_prce_end'))}" placeholder="비우면 미적용" min="0">
             </label>
           </div>
-          <div class="note">목록(/list) 추정가격 검색의 기본값으로 쓰입니다(비우면 기본 미적용).</div>
+          <div class="note" style="margin-top:8px;">사전규격 검색 기본값(배정예산액)</div>
+          <div class="grid" style="margin-top:4px;">
+            <label class="field">
+              <span class="flabel">배정예산액 기본 하한 <code>pre_spec_amt_bgn</code></span>
+              <input type="number" name="pre_spec_amt_bgn" value="{_e(cfg.get('pre_spec_amt_bgn'))}" placeholder="비우면 미적용" min="0">
+            </label>
+            <label class="field">
+              <span class="flabel">배정예산액 기본 상한 <code>pre_spec_amt_end</code></span>
+              <input type="number" name="pre_spec_amt_end" value="{_e(cfg.get('pre_spec_amt_end'))}" placeholder="비우면 미적용" min="0">
+            </label>
+          </div>
+          <div class="note">목록(/list) 추정가격·(/pre-spec) 배정예산액 검색의 기본값으로 쓰입니다(비우면 기본 미적용).</div>
         </fieldset>
         <label class="chk" style="margin-bottom:8px;">
           <input type="checkbox" name="enabled" value="1"{enabled_checked}>
@@ -2125,6 +2172,8 @@ def _load_config_view() -> tuple[dict, list[dict]]:
         "presmpt_prce_bgn", "presmpt_prce_end",
         # Phase 5.5: 사전규격 잡 토글·마지막 성공 시각.
         "pre_spec_enabled", "pre_spec_last_success_dt",
+        # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위.
+        "pre_spec_amt_bgn", "pre_spec_amt_end",
     ]
     run_fields = [
         "id", "trigger", "status", "window_bgn_dt", "window_end_dt",
@@ -2213,10 +2262,13 @@ async def config_save(request: Request):
             f"참가제한지역(prtcpt_lmt_rgn_cd)이 허용 코드가 아닙니다('{rgn}')."
         )
 
-    # 추정가격 기본 하한/상한 — 숫자(콤마 허용) 또는 빈값. 빈값은 None(미적용)으로 저장.
+    # 추정가격 기본 하한/상한 + 사전규격 배정예산액 기본 하한/상한 —
+    # 숫자(콤마 허용) 또는 빈값. 빈값은 None(미적용)으로 저장.
     for name, lbl in (
         ("presmpt_prce_bgn", "추정가격 기본 하한"),
         ("presmpt_prce_end", "추정가격 기본 상한"),
+        ("pre_spec_amt_bgn", "배정예산액 기본 하한"),
+        ("pre_spec_amt_end", "배정예산액 기본 상한"),
     ):
         raw = data.get(name, "").strip().replace(",", "")
         if raw == "":

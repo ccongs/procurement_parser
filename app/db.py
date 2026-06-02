@@ -137,6 +137,15 @@ def _migrate_add_columns() -> None:
             stmts.append(
                 "ALTER TABLE app_config ADD COLUMN pre_spec_last_success_dt DATETIME"
             )
+        # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위(신규 컬럼 2개).
+        if "pre_spec_amt_bgn" not in ac:
+            stmts.append(
+                "ALTER TABLE app_config ADD COLUMN pre_spec_amt_bgn VARCHAR(25)"
+            )
+        if "pre_spec_amt_end" not in ac:
+            stmts.append(
+                "ALTER TABLE app_config ADD COLUMN pre_spec_amt_end VARCHAR(25)"
+            )
 
     if stmts:
         with engine.begin() as conn:
