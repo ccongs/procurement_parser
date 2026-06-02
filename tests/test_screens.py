@@ -1303,11 +1303,35 @@ def test_filter_card_uses_tabbar_h_var(client):
     assert "var(--tabbar-h" in resp.text
 
 
-def test_thead_th_uses_stack_h_var(client):
-    """table thead th 의 top 값이 var(--stack-h, ...) 를 사용한다."""
+def test_thead_th_top_zero(client):
+    """table thead th 의 top 값이 0 이다(table-wrap 스크롤 컨테이너 상단 기준)."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    assert "var(--stack-h" in resp.text
+    text = resp.text
+    # CSS 에 'table thead th' 블록이 top: 0 으로 선언돼야 한다
+    idx = text.find("table thead th {")
+    assert idx != -1, "table thead th 규칙이 CSS 에 없음"
+    block = text[idx: idx + 120]
+    assert "top: 0" in block, f"thead th 에 top:0 이 없음: {block!r}"
+
+
+def test_table_wrap_overflow_and_maxh(client):
+    """.table-wrap 에 overflow:auto 와 max-height:var(--table-maxh) 가 선언돼 있다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    text = resp.text
+    idx = text.find(".table-wrap {")
+    assert idx != -1, ".table-wrap 규칙이 CSS 에 없음"
+    block = text[idx: idx + 120]
+    assert "overflow: auto" in block, f".table-wrap overflow:auto 없음: {block!r}"
+    assert "var(--table-maxh" in block, f".table-wrap max-height var 없음: {block!r}"
+
+
+def test_sticky_script_has_table_maxh_calc(client):
+    """공유 스크립트에 --table-maxh 계산 코드가 존재한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "--table-maxh" in resp.text
 
 
 def test_shell_sticky_script_present(client):
