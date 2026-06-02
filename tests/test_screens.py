@@ -1271,3 +1271,73 @@ def test_list_sort_links_use_list_path(client):
     # 페이저 경로
     assert "← 이전" in resp.text
     assert "다음 →" in resp.text
+
+
+# =====================================================================
+#  Phase 4.9-R2-S — sticky 스택·버튼 세로정렬 테스트
+# =====================================================================
+
+
+def test_tab_bar_sticky_style_in_css(client):
+    """.tab-bar 에 position:sticky / z-index:30 / background 가 CSS 에 존재한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    css_block = resp.text
+    # sticky 선언 존재
+    assert "position: sticky" in css_block
+    # z-index 30 존재(탭바)
+    assert "z-index: 30" in css_block
+    # .tab-bar 에 background 가 명시됨(비침 방지)
+    assert ".tab-bar" in css_block
+    # tab-bar 블록에 background 포함 여부 — 마크업에서 .tab-bar 정의 부분 확인
+    tab_bar_idx = css_block.find(".tab-bar {")
+    assert tab_bar_idx != -1
+    tab_bar_block = css_block[tab_bar_idx: tab_bar_idx + 200]
+    assert "background" in tab_bar_block
+
+
+def test_filter_card_uses_tabbar_h_var(client):
+    """.filter-card 의 top 값이 var(--tabbar-h, ...) 를 사용한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "var(--tabbar-h" in resp.text
+
+
+def test_thead_th_uses_stack_h_var(client):
+    """table thead th 의 top 값이 var(--stack-h, ...) 를 사용한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "var(--stack-h" in resp.text
+
+
+def test_shell_sticky_script_present(client):
+    """_shell 이 포함한 공유 스크립트에 ResizeObserver / --stack-h 가 존재한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "ResizeObserver" in resp.text
+    assert "--stack-h" in resp.text
+    assert "--tabbar-h" in resp.text
+
+
+def test_shell_sticky_script_on_pre_spec(client):
+    """사전규격 페이지에도 공유 스크립트가 존재한다."""
+    resp = client.get("/pre-spec", params=_WIDE)
+    assert resp.status_code == 200
+    assert "ResizeObserver" in resp.text
+    assert "--stack-h" in resp.text
+
+
+def test_shell_sticky_script_on_config(client):
+    """설정 페이지(filterCard 없음)에도 공유 스크립트가 존재하고 null 가드 코드가 있다."""
+    resp = client.get("/config")
+    assert resp.status_code == 200
+    assert "ResizeObserver" in resp.text
+    # filterCard null 가드: getElementById('filterCard') 가 null 일 수 있음 → if(filterCard) 로 방어
+    assert "filterCard" in resp.text
+
+
+def test_filter_summary_flex_end(client):
+    """.filter-summary 에 align-items: flex-end 가 CSS 에 존재한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "align-items: flex-end" in resp.text

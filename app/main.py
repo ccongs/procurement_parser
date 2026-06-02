@@ -541,8 +541,9 @@ BASE_CSS = """
              padding: 7px 14px; border-radius: 7px; }
   .hdr-btn:hover { background: #3a6199; }
   .hdr-btn.active { background: #fff; color: #1f3a5f; font-weight: 600; }
-  /* 탭바 */
-  .tab-bar { display: flex; gap: 0; border-bottom: 2px solid #1f3a5f; }
+  /* 탭바 — sticky 상단 고정(z-index 30, 불투명 배경) */
+  .tab-bar { display: flex; gap: 0; border-bottom: 2px solid #1f3a5f;
+             position: sticky; top: 0; z-index: 30; background: #f4f5f7; }
   .tab-bar a { text-decoration: none; color: #4a5568; font-size: 14px;
                padding: 10px 20px; border-radius: 8px 8px 0 0; }
   .tab-bar a:hover { background: #eef1f6; color: #1f3a5f; }
@@ -591,8 +592,8 @@ BASE_CSS = """
   th .col-en { font-weight: 400; font-size: 10px; color: #97a0b0; }
   tbody tr:hover { background: #f5f8ff; }
   tr.bad { background: #fdf1f0; }
-  /* sticky thead: 필터카드 접힘 바(44px) + 탭바(42px) 아래에 고정 */
-  table thead th { position: sticky; top: 0; z-index: 10; background: #f4f5f7; }
+  /* sticky thead: JS 가 측정한 --stack-h(탭바+필터카드 합산) 아래에 고정 */
+  table thead th { position: sticky; top: var(--stack-h, 96px); z-index: 10; background: #f4f5f7; }
   /* 정렬 가능한 컬럼 헤더(Phase 4.2): 클릭 가능 표시 + 방향 화살표 */
   th a.sortcol { text-decoration: none; color: inherit; display: inline-block; cursor: pointer; }
   th a.sortcol:hover { color: #1f3a5f; }
@@ -622,11 +623,12 @@ BASE_CSS = """
   .pager .pager-ellipsis { color: #8a93a2; padding: 5px 4px; font-size: 12px; }
   fieldset { border: 1px solid #e2e5ea; border-radius: 8px; margin: 0 0 16px; padding: 14px 16px; }
   legend { font-weight: 600; font-size: 13px; color: #1f3a5f; padding: 0 6px; }
-  /* 플로팅 필터 카드: 상단 sticky + 접힘/펼침 */
-  .filter-card { position: sticky; top: 0; z-index: 20; background: #fff;
+  /* 플로팅 필터 카드: 탭바 아래 sticky(--tabbar-h) + 접힘/펼침 */
+  .filter-card { position: sticky; top: var(--tabbar-h, 42px); z-index: 20; background: #fff;
                  border-radius: 0 0 8px 8px; box-shadow: 0 2px 6px rgba(0,0,0,.1);
                  margin-bottom: 16px; }
-  .filter-summary { display: flex; gap: 10px; align-items: center; padding: 10px 16px;
+  /* 버튼 세로정렬: 검색·토글 버튼이 좌측 input 하단과 정렬 */
+  .filter-summary { display: flex; gap: 10px; align-items: flex-end; padding: 10px 16px;
                     flex-wrap: wrap; }
   .filter-detail { padding: 0 16px 14px; }
   .filter-collapsed .filter-detail { display: none; }
@@ -685,6 +687,28 @@ def _tab_bar(active: str) -> str:
     </nav>"""
 
 
+_STICKY_STACK_SCRIPT = """(function () {
+  'use strict';
+  function updateStackVars() {
+    var tabBar = document.querySelector('.tab-bar');
+    var filterCard = document.getElementById('filterCard');
+    var tabH = tabBar ? tabBar.getBoundingClientRect().height : 0;
+    var filterH = filterCard ? filterCard.getBoundingClientRect().height : 0;
+    var root = document.documentElement;
+    root.style.setProperty('--tabbar-h', tabH + 'px');
+    root.style.setProperty('--stack-h', (tabH + filterH) + 'px');
+  }
+  updateStackVars();
+  if (typeof ResizeObserver !== 'undefined') {
+    var ro = new ResizeObserver(updateStackVars);
+    var tabBar = document.querySelector('.tab-bar');
+    var filterCard = document.getElementById('filterCard');
+    if (tabBar) ro.observe(tabBar);
+    if (filterCard) ro.observe(filterCard);
+  }
+})();"""
+
+
 def _shell(title: str, subtitle: str, active: str, body: str) -> str:
     """공통 HTML 셸. subtitle 인자는 호환성 위해 유지하나 헤더에 렌더하지 않는다."""
     return f"""<!doctype html>
@@ -704,6 +728,7 @@ def _shell(title: str, subtitle: str, active: str, body: str) -> str:
     {_tab_bar(active)}
     {body}
   </main>
+  <script>{_STICKY_STACK_SCRIPT}</script>
 </body>
 </html>"""
 
