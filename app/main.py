@@ -618,13 +618,14 @@ BASE_CSS = """
 
 
 def _nav(active: str) -> str:
-    """상단 네비게이션. active in {'list','config','api-test'}."""
+    """상단 네비게이션. active in {'list','pre-spec','config','api-test'}."""
     def cls(name: str) -> str:
         return ' class="active"' if name == active else ""
 
     return f"""
     <div class="navbtns">
       <a href="/list"{cls('list')}>목록</a>
+      <a href="/pre-spec"{cls('pre-spec')}>사전규격</a>
       <a href="/config"{cls('config')}>설정</a>
       <a href="/api-test" target="_blank"{cls('api-test')}>API테스트 ↗</a>
     </div>"""
@@ -712,6 +713,39 @@ _DEFAULT_SORT = "bid_ntce_dt_desc"
 _SPEC_URL_COLUMNS: list[str] = [f"ntce_spec_doc_url{i}" for i in range(1, 11)]
 
 
+# --- /pre-spec (Phase 5.5) -------------------------------------------
+# (컬럼명, 표시 종류, 한글 헤더). /pre-spec 도 한글 헤더만 노출(영문 병기 없음).
+# instt2 = 발주기관(위)/실수요기관(아래) 2줄 셀(입찰 /list 의 instt 와 동형).
+_PRE_SPEC_COLUMNS: list[tuple[str, str, str]] = [
+    ("bf_spec_rgst_no", "text", "사전규격번호"),
+    ("prdct_clsfc_no_nm", "text", "품명/사업명"),
+    ("order_instt_nm", "instt2", "발주기관/실수요기관"),
+    ("asign_bdgt_amt", "amt", "배정예산"),
+    ("rcpt_dt", "dt", "접수일시"),
+    ("opnin_rgst_clse_dt", "dt", "의견마감일시"),
+]
+
+# 컬럼 헤더 클릭 정렬이 가능한 컬럼 → 정렬 sort 키 접두(asc/desc 토글에 사용).
+_PRE_SPEC_SORTABLE_COLUMNS: dict[str, str] = {
+    "rcpt_dt": "rcpt_dt",
+    "opnin_rgst_clse_dt": "opnin_rgst_clse_dt",
+    "asign_bdgt_amt": "asign_bdgt_amt",
+}
+
+# /pre-spec 정렬 허용값(repository._PRE_SPEC_SORT_COLUMNS 와 동일). 미허용·빈값은 기본 폴백.
+_PRE_SPEC_SORTS: frozenset[str] = frozenset(
+    {
+        "rcpt_dt_desc",
+        "rcpt_dt_asc",
+        "opnin_rgst_clse_dt_desc",
+        "opnin_rgst_clse_dt_asc",
+        "asign_bdgt_amt_desc",
+        "asign_bdgt_amt_asc",
+    }
+)
+_PRE_SPEC_DEFAULT_SORT = "rcpt_dt_desc"
+
+
 def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
     """yyyy-mm-dd 문자열 → datetime. 빈값/형식오류는 None. end_of_day=True 면 23:59:59."""
     if not s:
@@ -759,12 +793,23 @@ def _render_instt(ntce: Any, dmin: Any) -> str:
     return f'<td class="insttcell">{"".join(lines)}</td>'
 
 
-def _sort_header(col: str, header: str, sort: str, qs: dict[str, str]) -> str:
+def _sort_header(
+    col: str,
+    header: str,
+    sort: str,
+    qs: dict[str, str],
+    *,
+    base_path: str = "/list",
+    sortable: dict[str, str] = _SORTABLE_COLUMNS,
+) -> str:
     """정렬 가능한 컬럼 헤더 — 클릭 시 asc↔desc 토글, 현재 정렬 방향을 화살표로 표시.
 
     링크는 현재 필터(qs)를 보존하고 sort 만 교체한다. page 는 정렬 변경 시 1 로 초기화.
+
+    base_path/sortable 은 하위호환 키워드(기본 = /list 동작 불변). 사전규격 화면은
+    base_path="/pre-spec" + 사전규격 정렬맵을 넘겨 동일 로직을 재사용한다.
     """
-    base = _SORTABLE_COLUMNS[col]
+    base = sortable[col]
     cur_desc = sort == f"{base}_desc"
     cur_asc = sort == f"{base}_asc"
     # 현재 이 컬럼으로 정렬 중이면 반대 방향, 아니면 처음엔 desc(추정가격·일시 모두 큰 값/최신 먼저).
@@ -777,7 +822,7 @@ def _sort_header(col: str, header: str, sort: str, qs: dict[str, str]) -> str:
     params = {**qs, "sort": next_sort, "page": "1"}
     query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
     return (
-        f'<th><a class="sortcol" href="/list?{query}">{_e(header)}{arrow}</a></th>'
+        f'<th><a class="sortcol" href="{base_path}?{query}">{_e(header)}{arrow}</a></th>'
     )
 
 
@@ -835,7 +880,14 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     </div>"""
 
 
-def _render_pager(total: int, page: int, page_size: int, qs: dict[str, str]) -> str:
+def _render_pager(
+    total: int,
+    page: int,
+    page_size: int,
+    qs: dict[str, str],
+    *,
+    base_path: str = "/list",
+) -> str:
     pages = max(1, (total + page_size - 1) // page_size)
     page = min(max(1, page), pages)
 
@@ -843,7 +895,7 @@ def _render_pager(total: int, page: int, page_size: int, qs: dict[str, str]) -> 
         params = {**qs, "page": str(target)}
         query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
         cls = " disabled" if disabled else ""
-        return f'<a class="pager-btn{cls}" href="/list?{query}">{_e(label)}</a>'
+        return f'<a class="pager-btn{cls}" href="{base_path}?{query}">{_e(label)}</a>'
 
     return f"""
     <div class="pager">
@@ -962,6 +1014,178 @@ _LIST_SCRIPT = """
     });
   })();
 """
+
+
+def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
+    """사전규격 목록 테이블 렌더(_render_list_rows 패턴, 파일/링크 컬럼 없음)."""
+    if not rows:
+        return '<p class="muted">조건에 맞는 사전규격이 없습니다.</p>'
+    head_cells = []
+    for col, _kind, header in _PRE_SPEC_COLUMNS:
+        if col in _PRE_SPEC_SORTABLE_COLUMNS:
+            head_cells.append(
+                _sort_header(
+                    col,
+                    header,
+                    sort,
+                    qs,
+                    base_path="/pre-spec",
+                    sortable=_PRE_SPEC_SORTABLE_COLUMNS,
+                )
+            )
+        else:
+            head_cells.append(f"<th>{_e(header)}</th>")
+    head = "".join(head_cells)
+    body_rows = []
+    for i, r in enumerate(rows, start=1):
+        cells = [f"<td>{i}</td>"]
+        for col, kind, _header in _PRE_SPEC_COLUMNS:
+            val = r.get(col)
+            if kind == "amt":
+                cells.append(f"<td>{_e(_fmt_amt(val))}</td>")
+            elif kind == "dt":
+                cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
+            elif kind == "instt2":
+                # 위=발주기관(order_instt_nm), 아래=실수요기관(rl_dminstt_nm). 입찰 instt 셀 재사용.
+                cells.append(_render_instt(val, r.get("rl_dminstt_nm")))
+            else:
+                # 품명/사업명은 평문 + 전체값 tooltip(긴 값 ellipsis 대비).
+                text = "" if val is None else str(val)
+                cells.append(f'<td title="{_e(text)}">{_e(text)}</td>')
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    return f"""
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th>{head}</tr></thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+    </div>"""
+
+
+# /pre-spec 클라이언트 스크립트(최근 기간 버튼). 평문 상수라 중괄호 이스케이프 불필요.
+_PRE_SPEC_SCRIPT = """
+  function fmtDate(d) {
+    var m = ('0' + (d.getMonth() + 1)).slice(-2);
+    var day = ('0' + d.getDate()).slice(-2);
+    return d.getFullYear() + '-' + m + '-' + day;
+  }
+  function setRecent(n) {
+    var today = new Date();
+    var bgn = new Date(today.getFullYear(), today.getMonth() - n, today.getDate());
+    var f = document.getElementById('dt_from');
+    var t = document.getElementById('dt_to');
+    if (f) f.value = fmtDate(bgn);
+    if (t) t.value = fmtDate(today);
+  }
+"""
+
+
+@app.get("/pre-spec", response_class=HTMLResponse)
+def pre_spec_page(
+    q: str | None = None,
+    dt_from: str | None = None,
+    dt_to: str | None = None,
+    instt: str | None = None,
+    include_past: str | None = None,   # 체크 시 의견마감 지난 항목 포함
+    sort: str = "rcpt_dt_desc",
+    page: int = 1,
+) -> HTMLResponse:
+    page_size = 50
+    # 기본 동작 = 의견마감 지난 항목 숨김. "지난 마감 포함" 체크 시에만 전체 노출(NULL 은 항상 표시).
+    include_past_flag = include_past in ("1", "on", "true", "Y", "y")
+    # 정렬: 헤더 클릭 6종. 미허용·빈값은 기본(최신 접수일).
+    sort = sort if sort in _PRE_SPEC_SORTS else _PRE_SPEC_DEFAULT_SORT
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+
+    # 접수일 기본 기간: 쿼리에 값이 없을 때만 최근 1개월(오늘-1개월 ~ 오늘)을 채운다(사용자 입력 우선).
+    today = date.today()
+    def_from = _months_ago(today, 1).isoformat()
+    def_to = today.isoformat()
+    dt_from_eff = dt_from if (dt_from and dt_from.strip()) else def_from
+    dt_to_eff = dt_to if (dt_to and dt_to.strip()) else def_to
+
+    df = _parse_date(dt_from_eff)
+    dtto = _parse_date(dt_to_eff, end_of_day=True)
+
+    with SessionLocal() as session:
+        objs, total = repository.search_pre_specs(
+            session,
+            q=q,
+            instt=instt,
+            dt_from=df,
+            dt_to=dtto,
+            include_past_opnin=include_past_flag,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+        )
+        # 세션 종료 후 lazy 접근 금지 → 필요한 스칼라만 dict 로 추출.
+        cols = [c for c, _, _ in _PRE_SPEC_COLUMNS] + ["rl_dminstt_nm"]
+        rows = [{c: getattr(o, c, None) for c in cols} for o in objs]
+
+    # 쿼리스트링 보존(페이지 이동·헤더 정렬 시 다른 필터 유지). 유효 날짜(서버 기본 포함)를 싣는다.
+    qs = {
+        "q": q or "",
+        "dt_from": dt_from_eff or "",
+        "dt_to": dt_to_eff or "",
+        "instt": instt or "",
+        "include_past": "1" if include_past_flag else "",
+        "sort": sort,
+    }
+
+    body = f"""
+    <div class="card">
+      <h2>사전규격 검색</h2>
+      <form class="filter" method="get" action="/pre-spec">
+        <div class="row">
+          <label class="field" style="min-width:260px;">
+            <span class="flabel">품명/사업명 부분검색 <code>q</code></span>
+            <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
+          </label>
+          <label class="field" style="min-width:220px;">
+            <span class="flabel">발주/실수요기관 부분검색 <code>instt</code></span>
+            <input type="text" name="instt" value="{_e(instt or '')}" placeholder="예: 행정안전부">
+          </label>
+          <label class="field">
+            <span class="flabel">접수 시작 <code>dt_from</code></span>
+            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
+          </label>
+          <span class="tilde">~</span>
+          <label class="field">
+            <span class="flabel">접수 종료 <code>dt_to</code></span>
+            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
+          </label>
+          <div class="quick">
+            <button type="button" onclick="setRecent(1)">최근1개월</button>
+            <button type="button" onclick="setRecent(3)">최근3개월</button>
+            <button type="button" onclick="setRecent(6)">최근6개월</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <label class="chk">
+            <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
+            지난 마감 포함 (기본은 의견마감 지난 항목 숨김 · 마감일 미정은 항상 표시)
+          </label>
+          <input type="hidden" name="sort" value="{_e(sort)}">
+          <button type="submit" class="submit">검색</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>수집된 사전규격</h2>
+      {_render_pre_spec_rows(rows, sort, qs)}
+      {_render_pager(total, page, page_size, qs, base_path="/pre-spec")}
+    </div>
+
+    <script>{_PRE_SPEC_SCRIPT}</script>"""
+
+    return HTMLResponse(
+        _shell("나라장터 사전규격 목록", "수집·저장된 사전규격을 조회합니다.", "pre-spec", body)
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1252,6 +1476,7 @@ def _render_runs_table(runs: list[dict]) -> str:
         return '<p class="muted">아직 실행 이력이 없습니다.</p>'
     headers = [
         ("id", "ID"),
+        ("source", "수집원"),
         ("trigger", "트리거"),
         ("status", "상태"),
         ("window", "윈도우"),
@@ -1272,8 +1497,12 @@ def _render_runs_table(runs: list[dict]) -> str:
             badge = f'<span class="badge err">{_e(status)}</span>'
         else:
             badge = f'<span class="badge">{_e(status)}</span>'
+        # 수집원(Phase 5.5): bid|pre_spec. NULL/빈값은 입찰(bid)로 표기.
+        source = r.get("source") or "bid"
+        source_badge = f'<span class="badge">{_e(source)}</span>'
         cells = [
             f"<td>{_e(r.get('id'))}</td>",
+            f"<td>{source_badge}</td>",
             f"<td>{_e(r.get('trigger'))}</td>",
             f"<td>{badge}</td>",
             f"<td>{_e(window)}</td>",
@@ -1312,6 +1541,7 @@ def _render_config_page(
     )
 
     enabled_checked = " checked" if cfg.get("enabled") else ""
+    pre_spec_enabled_checked = " checked" if cfg.get("pre_spec_enabled") else ""
 
     # 참가제한지역 select(Phase 4.3). 현재값(빈값=전체) selected. REGION_OPTIONS 순서.
     cur_rgn = cfg.get("prtcpt_lmt_rgn_cd")
@@ -1340,7 +1570,9 @@ def _render_config_page(
     if running:
         sched_status = '<span class="badge ok">실행 중</span>'
         next_run = _fmt_dt(sched.get("next_run")) or "(미정)"
-        sched_extra = f" · 다음 실행: {_e(next_run)}"
+        sched_extra = f" · 다음 실행(입찰): {_e(next_run)}"
+        pre_next_run = _fmt_dt(sched.get("pre_spec_next_run")) or "(미정)"
+        sched_extra += f" · 다음 실행(사전규격): {_e(pre_next_run)}"
     else:
         sched_status = '<span class="badge">정지</span>'
         sched_extra = ""
@@ -1380,6 +1612,10 @@ def _render_config_page(
         (현재 last_success_dt=<code>{_e(_fmt_dt(cfg.get('last_success_dt')) or '없음')}</code>).
         interval 이 길면 첫 tick 은 그만큼 뒤이므로, 즉시 보려면 [시작 직후 1회] 체크 또는
         <code>python -m app.collector</code> 백필을 쓰세요.
+      </div>
+      <div class="note">
+        사전규격 마지막 성공 시각: <code>{_e(_fmt_dt(cfg.get('pre_spec_last_success_dt')) or '없음')}</code>
+        (사전규격 잡은 <code>pre_spec_enabled</code> 로만 게이트되며 입찰 자동중단과 무관합니다).
       </div>
     </div>
 
@@ -1434,10 +1670,15 @@ def _render_config_page(
           </div>
           <div class="note">목록(/list) 추정가격 검색의 기본값으로 쓰입니다(비우면 기본 미적용).</div>
         </fieldset>
-        <label class="chk" style="margin-bottom:14px;">
+        <label class="chk" style="margin-bottom:8px;">
           <input type="checkbox" name="enabled" value="1"{enabled_checked}>
           수집 활성화 <code>enabled</code> (체크 해제 시 스케줄러가 떠 있어도 매 tick 건너뜀)
         </label>
+        <label class="chk" style="margin-bottom:14px;">
+          <input type="checkbox" name="pre_spec_enabled" value="1"{pre_spec_enabled_checked}>
+          사전규격 수집 활성화 <code>pre_spec_enabled</code> (입찰 수집과 독립 토글 · 체크 해제 시 사전규격 잡만 매 tick 건너뜀)
+        </label>
+        <div class="note">사전규격 토글은 입찰 <code>auto_halted</code> 와 무관합니다(독립 게이트).</div>
         <div><button type="submit" class="submit">설정 저장</button></div>
       </form>
     </div>
@@ -1460,10 +1701,14 @@ def _load_config_view() -> tuple[dict, list[dict]]:
         "num_of_rows", "max_retries", "inqry_div", "intrntnl_div_cd",
         "indstryty_cds", "prtcpt_lmt_rgn_cd", "last_success_dt",
         "presmpt_prce_bgn", "presmpt_prce_end",
+        # Phase 5.5: 사전규격 잡 토글·마지막 성공 시각.
+        "pre_spec_enabled", "pre_spec_last_success_dt",
     ]
     run_fields = [
         "id", "trigger", "status", "window_bgn_dt", "window_end_dt",
         "total_fetched", "total_new", "total_updated", "retry_count", "error_code",
+        # Phase 5.5: 실행이력 수집원(bid|pre_spec) 표시.
+        "source",
     ]
     with SessionLocal() as session:
         cfg_obj = repository.get_config(session)
@@ -1474,7 +1719,12 @@ def _load_config_view() -> tuple[dict, list[dict]]:
 
 
 def _sched_view() -> dict:
-    return {"running": scheduler.is_running(), "next_run": scheduler.get_next_run_time()}
+    return {
+        "running": scheduler.is_running(),
+        "next_run": scheduler.get_next_run_time(),
+        # Phase 5.5: 사전규격 잡 다음 실행 시각(5.4에서 get_next_run_time 에 job_id 추가).
+        "pre_spec_next_run": scheduler.get_next_run_time("collect_pre_spec"),
+    }
 
 
 @app.get("/config", response_class=HTMLResponse)
@@ -1562,6 +1812,8 @@ async def config_save(request: Request):
 
     # enabled 체크박스(없으면 False)
     updates["enabled"] = data.get("enabled") in ("1", "on", "true")
+    # pre_spec_enabled 체크박스(Phase 5.5, 없으면 False) — 입찰 enabled 와 독립 토글.
+    updates["pre_spec_enabled"] = data.get("pre_spec_enabled") in ("1", "on", "true")
 
     if errors:
         cfg, runs = _load_config_view()

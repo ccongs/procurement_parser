@@ -288,6 +288,16 @@ _SORT_COLUMNS: dict[str, tuple[str, bool]] = {
 # 날짜 범위를 적용할 컬럼 허용값(공고일/개찰일).
 _DATE_FIELDS: frozenset[str] = frozenset({"bid_ntce_dt", "openg_dt"})
 
+# /pre-spec 헤더 정렬 허용값 → (정렬 컬럼, 내림차순 여부). NULL 은 항상 뒤로.
+_PRE_SPEC_SORT_COLUMNS: dict[str, tuple[str, bool]] = {
+    "rcpt_dt_desc": ("rcpt_dt", True),
+    "rcpt_dt_asc": ("rcpt_dt", False),
+    "opnin_rgst_clse_dt_desc": ("opnin_rgst_clse_dt", True),
+    "opnin_rgst_clse_dt_asc": ("opnin_rgst_clse_dt", False),
+    "asign_bdgt_amt_desc": ("asign_bdgt_amt", True),
+    "asign_bdgt_amt_asc": ("asign_bdgt_amt", False),
+}
+
 
 def search_bid_notices(
     session: Session,
@@ -366,6 +376,88 @@ def search_bid_notices(
         sort, _SORT_COLUMNS["bid_ntce_dt_desc"]
     )
     sort_col = getattr(BidNotice, sort_col_name)
+    direction = sort_col.desc() if descending else sort_col.asc()
+    stmt = stmt.order_by(
+        case((sort_col.is_(None), 1), else_=0),
+        direction,
+    )
+
+    page = max(1, int(page))
+    page_size = max(1, int(page_size))
+    stmt = stmt.limit(page_size).offset((page - 1) * page_size)
+
+    rows = session.execute(stmt).scalars().all()
+    return list(rows), total
+
+
+def search_pre_specs(
+    session: Session,
+    *,
+    q: str | None = None,            # prdct_clsfc_no_nm 부분검색
+    instt: str | None = None,        # order_instt_nm OR rl_dminstt_nm 부분검색
+    dt_from: datetime | None = None,  # rcpt_dt >= dt_from
+    dt_to: datetime | None = None,   # rcpt_dt <= dt_to (화면에서 23:59:59 로 넘김)
+    include_past_opnin: bool = True,  # False 면 의견마감 지난 항목 숨김(NULL 은 표시)
+    sort: str = "rcpt_dt_desc",
+    page: int = 1,
+    page_size: int = 50,
+    now: datetime | None = None,     # 테스트 결정성 위해 주입 가능
+) -> tuple[list[PreSpec], int]:
+    """저장된 사전규격을 필터·정렬·페이지네이션해서 (행 목록, 전체건수)로 반환.
+
+    `search_bid_notices` 와 동형(컬럼·조건만 다름):
+    - q: prdct_clsfc_no_nm 부분검색(LIKE %q%, 대소문자 무시).
+    - instt: order_instt_nm 또는 rl_dminstt_nm 부분검색(한 입력으로 두 컬럼 OR LIKE).
+    - dt_from/dt_to: rcpt_dt(접수일시) 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
+      그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
+    - include_past_opnin(기본 True=전부): False 면 의견등록마감 지난 항목을 숨긴다 —
+      `(opnin_rgst_clse_dt >= now) OR (opnin_rgst_clse_dt IS NULL)`.
+      **마감일 미정(NULL)은 아직 유효하므로 항상 표시.** now 는 테스트 결정성을 위해
+      주입 가능(기본 None → datetime.now()).
+    - sort: _PRE_SPEC_SORT_COLUMNS 의 6종 허용
+      (rcpt_dt/opnin_rgst_clse_dt/asign_bdgt_amt × asc/desc). NULL 은 항상 뒤로.
+      기본·미허용값은 "rcpt_dt_desc"(최신 접수순).
+    - page/page_size: LIMIT/OFFSET 페이지네이션. 전체건수는 동일 필터로 count.
+    """
+    conditions = []
+    if q:
+        conditions.append(PreSpec.prdct_clsfc_no_nm.ilike(f"%{q}%"))
+    if instt:
+        conditions.append(
+            or_(
+                PreSpec.order_instt_nm.ilike(f"%{instt}%"),
+                PreSpec.rl_dminstt_nm.ilike(f"%{instt}%"),
+            )
+        )
+    if dt_from is not None:
+        conditions.append(PreSpec.rcpt_dt >= dt_from)
+    if dt_to is not None:
+        conditions.append(PreSpec.rcpt_dt <= dt_to)
+    if not include_past_opnin:
+        if now is None:
+            now = datetime.now()
+        # 의견마감 지난 항목 숨김. 마감일 미정(NULL)은 표시(아직 유효).
+        conditions.append(
+            or_(
+                PreSpec.opnin_rgst_clse_dt >= now,
+                PreSpec.opnin_rgst_clse_dt.is_(None),
+            )
+        )
+
+    count_stmt = select(func.count()).select_from(PreSpec)
+    for cond in conditions:
+        count_stmt = count_stmt.where(cond)
+    total = int(session.execute(count_stmt).scalar_one())
+
+    stmt = select(PreSpec)
+    for cond in conditions:
+        stmt = stmt.where(cond)
+
+    # 정렬: 허용 6종 → (컬럼, 내림차순). NULL 은 항상 뒤로(is-null 플래그를 1차 키로, 이식성↑).
+    sort_col_name, descending = _PRE_SPEC_SORT_COLUMNS.get(
+        sort, _PRE_SPEC_SORT_COLUMNS["rcpt_dt_desc"]
+    )
+    sort_col = getattr(PreSpec, sort_col_name)
     direction = sort_col.desc() if descending else sort_col.asc()
     stmt = stmt.order_by(
         case((sort_col.is_(None), 1), else_=0),
