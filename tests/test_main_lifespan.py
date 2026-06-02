@@ -23,6 +23,17 @@ from app.db import Base
 from app.models import AppConfig
 
 
+@pytest.fixture(autouse=True)
+def _no_logging_setup(monkeypatch):
+    """lifespan 의 setup_logging(4.5) 이 테스트 중 실제 로깅을 건드리지 않게 무력화.
+
+    setup_logging 은 루트 로거에 핸들러를 붙이고 logs/app.log 파일을 만든다(전역 부작용).
+    lifespan 을 with 로 구동하는 이 파일의 테스트가 그걸 트리거하면 파일 생성·전역 핸들러
+    오염(다른 테스트의 caplog 영향)이 나므로 no-op 으로 대체한다.
+    """
+    monkeypatch.setattr(main, "setup_logging", lambda *a, **k: None)
+
+
 # ---------------------------------------------------------------------------
 # 헬퍼: 케이스별 임시 DB 를 돌려주는 컨텍스트
 # ---------------------------------------------------------------------------
