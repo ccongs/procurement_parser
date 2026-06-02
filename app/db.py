@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # .env 로드 (프로젝트 루트의 .env)
@@ -39,6 +39,52 @@ engine = create_engine(DATABASE_URL, future=True, connect_args=_connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 Base = declarative_base()
+
+
+# --- SQLite 동시성 PRAGMA (운영 핫픽스) ----------------------------------
+# 입찰/사전규격 두 수집 잡이 동시 tick 으로 뜨면, 한쪽이 쓰기 트랜잭션을 연 채로 긴
+# 네트워크 페이징을 진행하는 동안 다른 잡의 INSERT 가 잠금을 못 얻어 `database is locked`
+# 가 났다. WAL(읽기가 쓰기를 막지 않음)·busy_timeout(즉시 실패 대신 대기)·synchronous=NORMAL
+# 로 잠금 경쟁을 흡수한다. SQLite 연결마다(풀에서 새 연결이 열릴 때) 적용한다.
+#
+# ⚠️ SQLite 전용. PostgreSQL 이전 시에는 적용하지 않는다(아래 가드).
+# ⚠️ `:memory:` DB 는 WAL 을 지원하지 않아 journal_mode 가 `memory` 로 떨어질 수 있으나
+#    에러 없이 무시된다(반환값을 단정하지 않는다).
+def _apply_sqlite_pragmas(dbapi_connection, connection_record) -> None:  # noqa: ANN001
+    """SQLite 연결마다 동시성 PRAGMA 를 설정한다(connect 이벤트 리스너).
+
+    드라이버 커서로 직접 실행한다. 여러 PRAGMA 를 순차 실행하며, 한 줄이 실패해도
+    (예: `:memory:` 의 WAL 미지원) 다른 PRAGMA 적용을 막지 않도록 개별 try 로 감싼다.
+    """
+    pragmas = (
+        "PRAGMA journal_mode=WAL",      # 읽기/쓰기 동시성↑ (웹 GET 이 수집 쓰기를 막지 않음)
+        "PRAGMA busy_timeout=30000",    # 잠금 대기 30초 (짧은 쓰기 경쟁 흡수)
+        "PRAGMA synchronous=NORMAL",    # WAL 과 함께 안전·고속
+    )
+    for stmt in pragmas:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(stmt)
+        finally:
+            cursor.close()
+
+
+def _is_sqlite_engine(eng) -> bool:  # noqa: ANN001
+    """엔진이 SQLite dialect 인지 — PRAGMA 리스너 부착 가드(PG 미적용)."""
+    return eng.dialect.name == "sqlite"
+
+
+def _register_sqlite_pragmas(eng) -> None:  # noqa: ANN001
+    """SQLite 엔진이면 connect 이벤트에 PRAGMA 리스너를 1회 등록한다(PG 엔진엔 미부착).
+
+    테스트에서 임의로 만든 SQLite 엔진에도 동일 PRAGMA 를 적용할 수 있도록 헬퍼로 분리.
+    """
+    if _is_sqlite_engine(eng):
+        event.listen(eng, "connect", _apply_sqlite_pragmas)
+
+
+# 모듈 전역 engine(실 운영용)에 PRAGMA 리스너 부착(SQLite 한정).
+_register_sqlite_pragmas(engine)
 
 
 def init_db() -> None:

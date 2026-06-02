@@ -13,6 +13,10 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+# WAL 모드 사이드카 파일(journal_mode=WAL 운영 시 생성)
+*.db-wal
+*.db-shm
+*.db-journal
 
 # OS / 에디터
 .DS_Store

@@ -49,10 +49,20 @@ def create_run(
     window_end: datetime,
     source: str = "bid",
 ) -> CollectionRun:
-    """status='running' 으로 실행 이력을 insert 하고 flush(=id 확보) 후 반환.
+    """status='running' 으로 실행 이력을 insert 하고 즉시 commit(=id 확보·쓰기 잠금 해제) 후 반환.
 
     source: 수집원 구분(Phase 5.4) — "bid"(기본, 입찰) | "pre_spec"(사전규격).
     기본값 "bid" 이므로 입찰 collector 의 기존 호출은 무변경(하위호환).
+
+    ⚠️ 운영 핫픽스(SQLite 동시성): 과거에는 `session.flush()` 로 쓰기 트랜잭션을 **연 채**
+    이후의 긴 네트워크 페이징을 끝까지 진행하다가 `finish_run` 에서야 commit 했다. 입찰·사전규격
+    두 잡이 동시 tick 으로 뜨면 한쪽이 이 트랜잭션의 쓰기 잠금을 길게 쥐고 있어 다른 잡의
+    `create_run` INSERT 가 `database is locked` 로 실패했다. 여기서 **즉시 commit** 해
+    "running" run 행을 영속화하고 쓰기 잠금을 바로 놓으면, 이후 네트워크 fetch 구간에는 열린
+    쓰기 트랜잭션이 없어 동시 실행이 안전해진다(짧은 쓰기 경쟁은 db.py 의 busy_timeout 이 흡수).
+    commit 으로 run 속성이 만료되지만 `run.id` 접근 시 자동 refresh 되고, `finish_run` 의
+    `run.status=...` 후 commit·collector 의 `_detach_run`(refresh→expunge) 도 정상 동작한다.
+    반환값은 그대로 status="running" 인 run(반환 타입·동작 불변).
     """
     run = CollectionRun(
         trigger=trigger,
@@ -67,7 +77,7 @@ def create_run(
         source=source,
     )
     session.add(run)
-    session.flush()  # id 확보
+    session.commit()  # 쓰기 잠금을 네트워크 fetch 전에 해제(id 는 commit 후 접근 시 자동 refresh)
     return run
 
 
