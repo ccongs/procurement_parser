@@ -1190,3 +1190,84 @@ def test_header_no_subtitle_rendered(client):
     assert resp.status_code == 200
     # 기존 subtitle 텍스트("수집·저장된 공고를 조회합니다.")가 헤더에 없음.
     assert "수집·저장된 공고를 조회합니다." not in resp.text
+
+
+# =====================================================================
+#  Phase 4.9-B1 — Wave B-1: list 페이지 개선
+# =====================================================================
+
+
+def test_list_filter_card_used(client):
+    """/list 에 _filter_card 가 적용됐는지 확인(filter-card 클래스 + filter-collapsed 기본 접힘)."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'filter-card' in resp.text
+    assert 'filter-collapsed' in resp.text
+    # 폼 action=/list
+    assert 'action="/list"' in resp.text
+
+
+def test_list_no_code_labels(client):
+    """/list 필터 라벨에 <code>…</code> 영문 병기가 없다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 라벨에 code 태그를 통한 영문 필드명 병기가 없어야 함.
+    assert "q</code>" not in resp.text
+    assert "date_field</code>" not in resp.text
+    assert "dt_from</code>" not in resp.text
+    assert "dt_to</code>" not in resp.text
+    assert "price_min</code>" not in resp.text
+    assert "price_max</code>" not in resp.text
+
+
+def test_list_checkbox_no_parentheses(client):
+    """/list 체크박스 라벨에 괄호 설명이 없다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 라벨 단순화: 괄호 설명 없이 "지난 개찰 포함" 만.
+    assert "지난 개찰 포함" in resp.text
+    # 기존 괄호 설명 텍스트 미존재 확인.
+    assert "기본은 개찰 지난 공고 숨김" not in resp.text
+
+
+def test_list_today_button_exists(client):
+    """/list 날짜 quick 버튼에 '1일' 버튼이 존재한다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "setToday()" in resp.text
+    assert "1일" in resp.text
+
+
+def test_list_page_size_default_50(client):
+    """기본 page_size=50 — 표기개수 select 에 50건이 selected."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert 'name="page_size"' in resp.text
+    assert '<option value="50" selected>50건</option>' in resp.text
+
+
+def test_list_page_size_10(client):
+    """page_size=10 파라미터가 동작한다 — select 에 10건이 selected, qs 에 보존."""
+    resp = client.get("/list", params={**_WIDE, "page_size": "10"})
+    assert resp.status_code == 200
+    assert '<option value="10" selected>10건</option>' in resp.text
+    # qs 에 page_size 보존(페이지 이동 링크에서 유지).
+    assert "page_size=10" in resp.text
+
+
+def test_list_page_size_invalid_falls_back_to_50(client):
+    """허용 외 page_size(999) → 50으로 폴백."""
+    resp = client.get("/list", params={**_WIDE, "page_size": "999"})
+    assert resp.status_code == 200
+    assert '<option value="50" selected>50건</option>' in resp.text
+
+
+def test_list_sort_links_use_list_path(client):
+    """정렬 링크·페이저가 /list 경로를 사용한다(B-1 영역 확인)."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    # 정렬 링크 경로
+    assert 'href="/list?' in resp.text
+    # 페이저 경로
+    assert "← 이전" in resp.text
+    assert "다음 →" in resp.text

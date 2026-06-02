@@ -1063,6 +1063,14 @@ _LIST_SCRIPT = """
     if (f) f.value = fmtDate(bgn);
     if (t) t.value = fmtDate(today);
   }
+  function setToday() {
+    var today = new Date();
+    var s = fmtDate(today);
+    var f = document.getElementById('dt_from');
+    var t = document.getElementById('dt_to');
+    if (f) f.value = s;
+    if (t) t.value = s;
+  }
 
   // 날짜 기준(공고일/개찰일) 변경 시 날짜 입력 기본값을 해당 필드 기본 기간으로 갱신.
   // 공고일: 오늘-1개월 ~ 오늘 / 개찰일: 오늘 ~ 오늘+1개월. (서버도 동일 기본 적용)
@@ -1363,8 +1371,10 @@ def list_page(
     include_past: str | None = None,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
+    page_size: int = 50,
 ) -> HTMLResponse:
-    page_size = 50
+    # page_size 정규화: 허용값 {10,30,50,100}, 그 외/오류는 50.
+    page_size = page_size if page_size in (10, 30, 50, 100) else 50
     # 기본 동작 = 개찰 지난 공고 숨김. "지난 개찰 포함" 체크 시에만 전체 노출.
     include_past_flag = include_past in ("1", "on", "true", "Y", "y")
     # 정렬: 헤더 클릭 6종. 미허용·빈값은 기본(최신 공고일).
@@ -1437,63 +1447,77 @@ def list_page(
         "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
         "sort": sort,
+        "page_size": str(page_size),
     }
 
     nf_sel = " selected" if date_field == "bid_ntce_dt" else ""
     og_sel = " selected" if date_field == "openg_dt" else ""
 
+    # 표기개수 select 옵션
+    ps_opts = "".join(
+        f'<option value="{v}"{" selected" if v == page_size else ""}>{v}건</option>'
+        for v in (10, 30, 50, 100)
+    )
+
+    # summary_html: 접힘 상태에서도 항상 보이는 검색어 입력 + 검색 버튼
+    summary_html = f"""
+      <label class="field" style="min-width:260px;">
+        <span class="flabel">공고명 부분검색</span>
+        <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
+      </label>
+      <button type="submit" class="submit">검색</button>"""
+
+    # detail_html: 토글로 펼쳐지는 상세 필터
+    detail_html = f"""
+      <div class="row">
+        <label class="field">
+          <span class="flabel">날짜 기준</span>
+          <select name="date_field" id="date_field">
+            <option value="bid_ntce_dt"{nf_sel}>공고일</option>
+            <option value="openg_dt"{og_sel}>개찰일</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="flabel">시작</span>
+          <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
+        </label>
+        <span class="tilde">~</span>
+        <label class="field">
+          <span class="flabel">종료</span>
+          <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
+        </label>
+        <div class="quick">
+          <button type="button" onclick="setToday()">1일</button>
+          <button type="button" onclick="setRecent(1)">최근1개월</button>
+          <button type="button" onclick="setRecent(3)">최근3개월</button>
+          <button type="button" onclick="setRecent(6)">최근6개월</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <label class="field">
+          <span class="flabel">추정가격 최소</span>
+          <input type="number" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
+        </label>
+        <span class="tilde">~</span>
+        <label class="field">
+          <span class="flabel">추정가격 최대</span>
+          <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
+        </label>
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <label class="chk">
+          <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
+          지난 개찰 포함
+        </label>
+        <label class="field">
+          <span class="flabel">표기개수</span>
+          <select name="page_size" onchange="this.form.submit()">{ps_opts}</select>
+        </label>
+        <input type="hidden" name="sort" value="{_e(sort)}">
+      </div>"""
+
     body = f"""
-    <div class="card">
-      <h2>공고 검색</h2>
-      <form class="filter" method="get" action="/list">
-        <div class="row">
-          <label class="field" style="min-width:260px;">
-            <span class="flabel">공고명 부분검색 <code>q</code></span>
-            <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
-          </label>
-          <label class="field">
-            <span class="flabel">날짜 기준 <code>date_field</code></span>
-            <select name="date_field" id="date_field">
-              <option value="bid_ntce_dt"{nf_sel}>공고일</option>
-              <option value="openg_dt"{og_sel}>개찰일</option>
-            </select>
-          </label>
-          <label class="field">
-            <span class="flabel">시작 <code>dt_from</code></span>
-            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
-          </label>
-          <span class="tilde">~</span>
-          <label class="field">
-            <span class="flabel">종료 <code>dt_to</code></span>
-            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
-          </label>
-          <div class="quick">
-            <button type="button" onclick="setRecent(1)">최근1개월</button>
-            <button type="button" onclick="setRecent(3)">최근3개월</button>
-            <button type="button" onclick="setRecent(6)">최근6개월</button>
-          </div>
-        </div>
-        <div class="row" style="margin-top:12px;">
-          <label class="field">
-            <span class="flabel">추정가격 최소 <code>price_min</code></span>
-            <input type="number" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
-          </label>
-          <span class="tilde">~</span>
-          <label class="field">
-            <span class="flabel">추정가격 최대 <code>price_max</code></span>
-            <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
-          </label>
-        </div>
-        <div class="row" style="margin-top:12px;">
-          <label class="chk">
-            <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
-            지난 개찰 포함 (기본은 개찰 지난 공고 숨김 · 개찰일 미정은 항상 표시)
-          </label>
-          <input type="hidden" name="sort" value="{_e(sort)}">
-          <button type="submit" class="submit">검색</button>
-        </div>
-      </form>
-    </div>
+    {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard")}
 
     <div class="card">
       <h2>수집된 공고</h2>
