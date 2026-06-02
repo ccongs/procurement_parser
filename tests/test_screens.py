@@ -1303,43 +1303,25 @@ def test_filter_card_uses_tabbar_h_var(client):
     assert "var(--tabbar-h" in resp.text
 
 
-def test_thead_th_top_zero(client):
-    """table thead th 의 top 값이 0 이다(table-wrap 스크롤 컨테이너 상단 기준)."""
-    resp = client.get("/list", params=_WIDE)
-    assert resp.status_code == 200
-    text = resp.text
-    # CSS 에 'table thead th' 블록이 top: 0 으로 선언돼야 한다
-    idx = text.find("table thead th {")
-    assert idx != -1, "table thead th 규칙이 CSS 에 없음"
-    block = text[idx: idx + 120]
-    assert "top: 0" in block, f"thead th 에 top:0 이 없음: {block!r}"
-
-
-def test_table_wrap_overflow_and_maxh(client):
-    """.table-wrap 에 overflow:auto 와 max-height:var(--table-maxh) 가 선언돼 있다."""
+def test_table_wrap_overflow_x_only(client):
+    """.table-wrap 이 overflow-x: auto (가로 스크롤만, 내부 세로 스크롤 없음) 로 원복됐다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     text = resp.text
     idx = text.find(".table-wrap {")
     assert idx != -1, ".table-wrap 규칙이 CSS 에 없음"
-    block = text[idx: idx + 120]
-    assert "overflow: auto" in block, f".table-wrap overflow:auto 없음: {block!r}"
-    assert "var(--table-maxh" in block, f".table-wrap max-height var 없음: {block!r}"
-
-
-def test_sticky_script_has_table_maxh_calc(client):
-    """공유 스크립트에 --table-maxh 계산 코드가 존재한다."""
-    resp = client.get("/list", params=_WIDE)
-    assert resp.status_code == 200
-    assert "--table-maxh" in resp.text
+    block = text[idx: idx + 60]
+    assert "overflow-x: auto" in block, f".table-wrap overflow-x:auto 없음: {block!r}"
+    # sticky thead/table-maxh 제거 확인
+    assert "table thead th" not in text or "position: sticky" not in text[text.find("table thead th"):text.find("table thead th") + 80] if "table thead th" in text else True
+    assert "var(--table-maxh" not in text, "--table-maxh 가 제거되지 않음"
 
 
 def test_shell_sticky_script_present(client):
-    """_shell 이 포함한 공유 스크립트에 ResizeObserver / --stack-h 가 존재한다."""
+    """_shell 이 포함한 공유 스크립트에 ResizeObserver / --tabbar-h 가 존재한다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     assert "ResizeObserver" in resp.text
-    assert "--stack-h" in resp.text
     assert "--tabbar-h" in resp.text
 
 
@@ -1348,16 +1330,15 @@ def test_shell_sticky_script_on_pre_spec(client):
     resp = client.get("/pre-spec", params=_WIDE)
     assert resp.status_code == 200
     assert "ResizeObserver" in resp.text
-    assert "--stack-h" in resp.text
+    assert "--tabbar-h" in resp.text
 
 
 def test_shell_sticky_script_on_config(client):
-    """설정 페이지(filterCard 없음)에도 공유 스크립트가 존재하고 null 가드 코드가 있다."""
+    """설정 페이지(filterCard 없음)에도 공유 스크립트가 존재한다."""
     resp = client.get("/config")
     assert resp.status_code == 200
     assert "ResizeObserver" in resp.text
-    # filterCard null 가드: getElementById('filterCard') 가 null 일 수 있음 → if(filterCard) 로 방어
-    assert "filterCard" in resp.text
+    assert "--tabbar-h" in resp.text
 
 
 def test_filter_summary_flex_end(client):
