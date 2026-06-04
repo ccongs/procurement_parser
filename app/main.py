@@ -678,6 +678,71 @@ BASE_CSS = """
   table.filetable a.dl { background: #1f3a5f; color: #fff; text-decoration: none; padding: 5px 10px;
                          border-radius: 6px; font-size: 12px; white-space: nowrap; }
   table.filetable a.dl:hover { background: #16294a; }
+  /* 분석 버튼 (Phase 6.3) */
+  button.btn-analyze { border: 1px solid #7e5cb0; background: #f3eeff; color: #5a3e8a; padding: 4px 10px;
+                       border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  button.btn-analyze:hover { background: #e8dcff; }
+  button.btn-analyze:disabled { opacity: .6; cursor: default; }
+  button.btn-analyze.open { background: #5a3e8a; color: #fff; border-color: #5a3e8a; }
+  /* 분석 결과 패널 */
+  .analysis-result-row td { padding: 0; background: #f8f6ff; }
+  .analysis-panel { padding: 20px 24px; border-top: 2px solid #c9b8ef; }
+  .analysis-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .analysis-header h3 { margin: 0; font-size: 15px; color: #3d2870; }
+  .analysis-close { background: transparent; border: 1px solid #b9b0cc; color: #5a3e8a;
+                    padding: 4px 10px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  .analysis-close:hover { background: #ede5ff; }
+  .analysis-section { margin-bottom: 20px; border-top: 1px solid #e0d8f5; padding-top: 14px; }
+  .analysis-section:first-of-type { border-top: none; padding-top: 0; }
+  .analysis-section h4 { margin: 0 0 10px; font-size: 13px; color: #5a3e8a; font-weight: 600; }
+  .info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .info-grid > div { font-size: 13px; }
+  .info-grid .label { font-weight: 600; color: #6b7280; margin-right: 6px; }
+  .analysis-section p { margin: 0; font-size: 13px; line-height: 1.6; }
+  .analysis-section ol, .analysis-section ul { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.8; }
+  .analysis-section table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  .analysis-section table th, .analysis-section table td { border: 1px solid #d8d0ee; padding: 5px 8px; text-align: left; }
+  .analysis-section table th { background: #ede5ff; }
+  /* Win Theme 카드 */
+  .win-theme-cards { display: flex; gap: 12px; flex-wrap: wrap; }
+  .win-theme-card { background: #fff; border: 1px solid #c9b8ef; border-radius: 8px;
+                    padding: 12px 14px; min-width: 160px; max-width: 280px; flex: 1; }
+  .win-theme-card .theme-title { font-weight: 600; font-size: 13px; color: #3d2870; margin-bottom: 6px; }
+  .win-theme-card .theme-desc { font-size: 12px; color: #4a5568; line-height: 1.5; }
+  /* 업로드 모달 */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; z-index: 60;
+                   align-items: center; justify-content: center; }
+  .modal-overlay.open { display: flex; }
+  .modal-content { background: #fff; border-radius: 12px; padding: 0; width: 480px; max-width: 95vw;
+                   box-shadow: 0 4px 24px rgba(0,0,0,.18); }
+  .modal-header { background: #3d2870; color: #fff; padding: 16px 20px; border-radius: 12px 12px 0 0;
+                  display: flex; align-items: center; justify-content: space-between; }
+  .modal-header h3 { margin: 0; font-size: 15px; }
+  .modal-header .modal-close-btn { background: transparent; border: 0; color: #fff; font-size: 22px;
+                                   line-height: 1; cursor: pointer; padding: 0 4px; }
+  .modal-body { padding: 20px; }
+  .modal-message { font-size: 13px; color: #6b7280; margin: 0 0 14px; }
+  .upload-area { border: 2px dashed #c9b8ef; border-radius: 8px; padding: 28px 20px;
+                 text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+  .upload-area:hover, .upload-area.dragover { border-color: #7e5cb0; background: #f8f4ff; }
+  .upload-area p { margin: 0; font-size: 13px; color: #6b7280; }
+  .upload-area .upload-hint { font-size: 11px; color: #9ca3af; margin-top: 6px; }
+  .upload-filename { font-size: 13px; color: #3d2870; font-weight: 600; margin-top: 8px; }
+  .modal-footer { display: flex; gap: 10px; justify-content: flex-end; padding: 14px 20px;
+                  border-top: 1px solid #e5e7eb; }
+  button.modal-submit { background: #5a3e8a; color: #fff; border: 0; padding: 8px 20px;
+                        border-radius: 7px; font-size: 13px; cursor: pointer; }
+  button.modal-submit:hover { background: #3d2870; }
+  button.modal-submit:disabled { background: #b9b0cc; cursor: default; }
+  button.modal-cancel { background: #f4f5f7; border: 1px solid #cbd2dc; color: #4a5568;
+                        padding: 8px 16px; border-radius: 7px; font-size: 13px; cursor: pointer; }
+  button.modal-cancel:hover { background: #e7ebf2; }
+  /* 분석 로딩 오버레이 */
+  .analysis-loading { text-align: center; padding: 24px; font-size: 13px; color: #5a3e8a; }
+  /* 토스트(분석 에러) */
+  #analyzeToast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+                  background: #b02a25; color: #fff; padding: 10px 20px; border-radius: 8px;
+                  font-size: 13px; display: none; z-index: 70; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
 """
 
 
@@ -927,9 +992,12 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
-    head += "<th>파일</th>"
+    head += "<th>파일</th><th>분석</th>"
+    # 전체 컬럼 수 = # + _LIST_COLUMNS + 파일 + 분석
+    total_cols = 1 + len(_LIST_COLUMNS) + 2
     body_rows = []
     for i, r in enumerate(rows, start=1):
+        row_id = _e(r.get("bid_ntce_no") or "")
         cells = [f"<td>{i}</td>"]
         for col, kind, _header in _LIST_COLUMNS:
             val = r.get(col)
@@ -957,11 +1025,18 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
         if cnt:
             cells.append(
                 f'<td><button type="button" class="filebtn" '
-                f'data-no="{_e(r.get("bid_ntce_no"))}">파일 {cnt}</button></td>'
+                f'data-no="{row_id}">파일 {cnt}</button></td>'
             )
         else:
             cells.append('<td>-</td>')
-        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+        # 분석 버튼 컬럼 (Phase 6.3)
+        cells.append(
+            f'<td><button type="button" class="btn-analyze" '
+            f'data-type="bid" data-id="{row_id}" '
+            f'data-colspan="{total_cols}" '
+            f'aria-label="제안요청서 분석">분석</button></td>'
+        )
+        body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
       <table>
@@ -1201,6 +1276,343 @@ _LIST_SCRIPT = """
   })();
 """
 
+# 분석 UI 스크립트 (Phase 6.3) — 분석 버튼 동작, 결과 패널, 업로드 모달.
+# 평문 상수라 중괄호 이스케이프 불필요.
+_ANALYSIS_SCRIPT = """
+  (function () {
+    'use strict';
+
+    var _openBtnEl = null;  // 현재 열린 패널의 버튼 element
+
+    // --- 유틸 -------------------------------------------------------
+
+    function esc(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
+    function showToast(message) {
+      var t = document.getElementById('analyzeToast');
+      if (!t) return;
+      t.textContent = message;
+      t.style.display = 'block';
+      setTimeout(function () { t.style.display = 'none'; }, 4000);
+    }
+
+    // --- 결과 패널 --------------------------------------------------
+
+    function closeResultPanel() {
+      var existing = document.querySelector('.analysis-result-row');
+      if (existing) existing.remove();
+      if (_openBtnEl) {
+        _openBtnEl.textContent = '분석';
+        _openBtnEl.classList.remove('open');
+        _openBtnEl.disabled = false;
+        _openBtnEl = null;
+      }
+    }
+
+    function buildList(items, tag) {
+      if (!items || !items.length) return '<li>(없음)</li>';
+      return items.map(function (s) { return '<' + tag + '>' + esc(s) + '</' + tag + '>'; }).join('');
+    }
+
+    function buildEvalTable(criteria) {
+      if (!criteria || !criteria.length) return '<p class="muted">없음</p>';
+      var rows = criteria.map(function (c) {
+        return '<tr><td>' + esc(c.item) + '</td><td>' + esc(c.weight) + '</td><td>' + esc(c.details) + '</td></tr>';
+      }).join('');
+      return '<table><thead><tr><th>평가항목</th><th>배점</th><th>세부기준</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    function buildWinThemeCards(themes) {
+      if (!themes || !themes.length) return '<p class="muted">없음</p>';
+      return themes.slice(0, 3).map(function (t) {
+        return '<div class="win-theme-card"><div class="theme-title">' + esc(t.theme) + '</div>'
+             + '<div class="theme-desc">' + esc(t.rationale) + '</div></div>';
+      }).join('');
+    }
+
+    function buildPainPoints(pts) {
+      if (!pts || !pts.length) return '<li>(없음)</li>';
+      return pts.map(function (p) {
+        var label = typeof p === 'string' ? p : (p.point || '');
+        var detail = typeof p === 'object' ? (p.description || '') : '';
+        return '<li><b>' + esc(label) + '</b>' + (detail ? ': ' + esc(detail) : '') + '</li>';
+      }).join('');
+    }
+
+    function showResultPanel(btnEl, analysis) {
+      closeResultPanel();  // 기존 패널 닫기
+
+      var a = analysis || {};
+      var colspan = btnEl.getAttribute('data-colspan') || '10';
+
+      var panelHtml = '<div class="analysis-panel">'
+        + '<div class="analysis-header"><h3>RFP 분석 결과</h3>'
+        + '<button type="button" class="analysis-close">× 닫기</button></div>'
+        // 섹션 1: 기본 정보
+        + '<section class="analysis-section"><h4>프로젝트 기본 정보</h4>'
+        + '<div class="info-grid">'
+        + (a.project_name ? '<div><span class="label">프로젝트명</span><span>' + esc(a.project_name) + '</span></div>' : '')
+        + (a.client_name  ? '<div><span class="label">발주처</span><span>' + esc(a.client_name) + '</span></div>' : '')
+        + (a.budget       ? '<div><span class="label">예산</span><span>' + esc(a.budget) + '</span></div>' : '')
+        + (a.timeline     ? '<div><span class="label">기간</span><span>' + esc(a.timeline) + '</span></div>' : '')
+        + '</div></section>'
+        // 섹션 2: 사업 개요
+        + '<section class="analysis-section"><h4>사업 개요</h4><p>' + esc(a.project_overview || '') + '</p></section>'
+        // 섹션 3: 핵심 요구사항
+        + '<section class="analysis-section"><h4>핵심 요구사항</h4><ol>' + buildList(a.key_requirements, 'li') + '</ol></section>'
+        // 섹션 4: 평가 기준
+        + '<section class="analysis-section"><h4>평가 기준</h4>' + buildEvalTable(a.evaluation_criteria) + '</section>'
+        // 섹션 5: 납품물
+        + '<section class="analysis-section"><h4>납품물</h4><ul>' + buildList(a.deliverables, 'li') + '</ul></section>'
+        // 섹션 6: Win Theme
+        + '<section class="analysis-section"><h4>Win Theme 후보</h4><div class="win-theme-cards">' + buildWinThemeCards(a.win_theme_candidates) + '</div></section>'
+        // 섹션 7: Pain Points
+        + '<section class="analysis-section"><h4>Pain Points</h4><ul>' + buildPainPoints(a.pain_points) + '</ul></section>'
+        // 섹션 8: 숨겨진 니즈
+        + '<section class="analysis-section"><h4>숨겨진 니즈</h4><ul>' + buildList(a.hidden_needs, 'li') + '</ul></section>'
+        + '</div>';
+
+      // 해당 행(data-row-id) 바로 다음에 결과 <tr> 삽입
+      var rowEl = btnEl.closest('tr');
+      var resultRow = document.createElement('tr');
+      resultRow.className = 'analysis-result-row';
+      resultRow.innerHTML = '<td colspan="' + colspan + '">' + panelHtml + '</td>';
+      rowEl.parentNode.insertBefore(resultRow, rowEl.nextSibling);
+
+      // 닫기 버튼 이벤트
+      resultRow.querySelector('.analysis-close').addEventListener('click', function () {
+        closeResultPanel();
+      });
+
+      // 버튼 상태 변경
+      btnEl.textContent = '닫기';
+      btnEl.classList.add('open');
+      _openBtnEl = btnEl;
+    }
+
+    // --- 업로드 모달 ------------------------------------------------
+
+    var _uploadType = '';
+    var _uploadId = '';
+    var _uploadFile = null;
+    var _uploadBtnEl = null;
+
+    function openUploadModal(message, type, id, btnEl) {
+      _uploadType = type;
+      _uploadId = id;
+      _uploadFile = null;
+      _uploadBtnEl = btnEl;
+
+      var modal = document.getElementById('analysisUploadModal');
+      var msgEl = document.getElementById('uploadModalMessage');
+      var filenameEl = document.getElementById('uploadFilename');
+      var submitBtn = document.getElementById('uploadSubmitBtn');
+      var input = document.getElementById('uploadFileInput');
+
+      if (msgEl) msgEl.textContent = message || '파일을 직접 업로드해 분석하세요.';
+      if (filenameEl) filenameEl.textContent = '';
+      if (submitBtn) submitBtn.disabled = true;
+      if (input) input.value = '';
+      _uploadFile = null;
+
+      if (modal) modal.classList.add('open');
+    }
+
+    function closeUploadModal() {
+      var modal = document.getElementById('analysisUploadModal');
+      if (modal) modal.classList.remove('open');
+      _uploadFile = null;
+      if (_uploadBtnEl) {
+        _uploadBtnEl.textContent = '분석';
+        _uploadBtnEl.classList.remove('open');
+        _uploadBtnEl.disabled = false;
+      }
+      _uploadBtnEl = null;
+    }
+
+    // --- 핵심 분석 함수 ---------------------------------------------
+
+    async function runAnalysis(type, id, btnEl) {
+      // 이미 결과 패널이 열려 있으면 토글(닫기)
+      if (btnEl.classList.contains('open')) {
+        closeResultPanel();
+        return;
+      }
+
+      btnEl.disabled = true;
+      btnEl.textContent = '분석 중...';
+
+      try {
+        var resp = await fetch('/api/analysis/' + type + '/' + encodeURIComponent(id), { method: 'POST' });
+        var data = await resp.json();
+
+        if (data.status === 'ok') {
+          showResultPanel(btnEl, data.analysis);
+        } else if (data.status === 'no_file' || data.status === 'unsupported') {
+          openUploadModal(data.message, type, id, btnEl);
+        } else {
+          showToast(data.message || '분석 중 오류가 발생했습니다.');
+          btnEl.disabled = false;
+          btnEl.textContent = '분석';
+        }
+      } catch (e) {
+        showToast('서버 요청 중 오류가 발생했습니다.');
+        btnEl.disabled = false;
+        btnEl.textContent = '분석';
+      }
+    }
+
+    // --- 이벤트 바인딩 (이벤트 위임) --------------------------------
+
+    document.addEventListener('click', function (e) {
+      var btn = e.target.closest('.btn-analyze');
+      if (btn) {
+        var type = btn.getAttribute('data-type');
+        var id = btn.getAttribute('data-id');
+        runAnalysis(type, id, btn);
+      }
+    });
+
+    // 업로드 모달 파일 입력
+    var uploadInput = document.getElementById('uploadFileInput');
+    var dropZone = document.getElementById('uploadDropZone');
+    var submitBtn = document.getElementById('uploadSubmitBtn');
+    var filenameEl = document.getElementById('uploadFilename');
+
+    function handleFile(file) {
+      _uploadFile = file;
+      if (filenameEl) filenameEl.textContent = file.name;
+      if (submitBtn) submitBtn.disabled = false;
+    }
+
+    if (uploadInput) {
+      uploadInput.addEventListener('change', function () {
+        if (uploadInput.files[0]) handleFile(uploadInput.files[0]);
+      });
+    }
+
+    if (dropZone) {
+      dropZone.addEventListener('click', function () {
+        if (uploadInput) uploadInput.click();
+      });
+      dropZone.addEventListener('dragover', function (e) {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+      });
+      dropZone.addEventListener('dragleave', function () {
+        dropZone.classList.remove('dragover');
+      });
+      dropZone.addEventListener('drop', function (e) {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+        var file = e.dataTransfer.files[0];
+        if (file) handleFile(file);
+      });
+    }
+
+    if (submitBtn) {
+      submitBtn.addEventListener('click', async function () {
+        if (!_uploadFile) return;
+        submitBtn.disabled = true;
+        submitBtn.textContent = '업로드 중...';
+
+        var form = new FormData();
+        form.append('file', _uploadFile);
+
+        try {
+          var resp = await fetch('/api/analysis/upload', { method: 'POST', body: form });
+          var data = await resp.json();
+
+          if (data.status === 'ok') {
+            var modal = document.getElementById('analysisUploadModal');
+            if (modal) modal.classList.remove('open');
+            // 업로드 후 결과 패널 표시: _uploadBtnEl 이 없으면 임시 처리
+            var targetBtn = _uploadBtnEl;
+            _uploadBtnEl = null;
+            if (targetBtn) {
+              targetBtn.disabled = false;
+              showResultPanel(targetBtn, data.analysis);
+            } else {
+              showToast('분석 완료!');
+            }
+          } else if (data.status === 'unsupported' || data.status === 'no_file') {
+            var msgEl = document.getElementById('uploadModalMessage');
+            if (msgEl) msgEl.textContent = data.message || '지원하지 않는 파일 형식입니다.';
+            submitBtn.disabled = false;
+            submitBtn.textContent = '분석 시작';
+          } else {
+            var msgEl = document.getElementById('uploadModalMessage');
+            if (msgEl) msgEl.textContent = data.message || '분석 중 오류가 발생했습니다.';
+            submitBtn.disabled = false;
+            submitBtn.textContent = '분석 시작';
+          }
+        } catch (e) {
+          var msgEl = document.getElementById('uploadModalMessage');
+          if (msgEl) msgEl.textContent = '서버 요청 중 오류가 발생했습니다.';
+          submitBtn.disabled = false;
+          submitBtn.textContent = '분석 시작';
+        }
+      });
+    }
+
+    // 모달 닫기 버튼들
+    document.querySelectorAll('.modal-close-btn, .modal-cancel').forEach(function (btn) {
+      btn.addEventListener('click', closeUploadModal);
+    });
+
+    // 모달 오버레이 클릭 시 닫기
+    var modalOverlay = document.getElementById('analysisUploadModal');
+    if (modalOverlay) {
+      modalOverlay.addEventListener('click', function (e) {
+        if (e.target === modalOverlay) closeUploadModal();
+      });
+    }
+
+    // ESC 키로 모달 닫기
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        var modal = document.getElementById('analysisUploadModal');
+        if (modal && modal.classList.contains('open')) closeUploadModal();
+      }
+    });
+
+  })();
+"""
+
+# 업로드 모달 + 토스트 HTML (list·pre-spec 공용, 스크립트 앞에 한 번만 삽입)
+_ANALYSIS_MODAL_HTML = """
+    <!-- 분석 업로드 모달 (Phase 6.3) -->
+    <div id="analysisUploadModal" class="modal-overlay" aria-label="제안요청서 업로드" role="dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>제안요청서 직접 업로드</h3>
+          <button type="button" class="modal-close-btn" aria-label="닫기">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-message" id="uploadModalMessage">파일을 직접 업로드해 분석하세요.</p>
+          <div class="upload-area" id="uploadDropZone" role="button" tabindex="0"
+               aria-label="파일 선택 영역">
+            <p>PDF, HWP, HWPX, DOC, DOCX 파일을 끌어다 놓거나 클릭해 선택</p>
+            <p class="upload-hint">최대 50MB</p>
+            <input type="file" id="uploadFileInput"
+                   accept=".pdf,.hwp,.hwpx,.doc,.docx" hidden>
+          </div>
+          <p class="upload-filename" id="uploadFilename"></p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="uploadSubmitBtn" class="modal-submit" disabled>분석 시작</button>
+          <button type="button" class="modal-cancel">취소</button>
+        </div>
+      </div>
+    </div>
+    <!-- 에러 토스트 (Phase 6.3) -->
+    <div id="analyzeToast" role="alert"></div>
+"""
+
 
 def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     """사전규격 목록 테이블 렌더(_render_list_rows 패턴). 파일 컬럼 포함(4.9-B2)."""
@@ -1222,9 +1634,12 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
-    head += "<th>파일</th>"
+    head += "<th>파일</th><th>분석</th>"
+    # 전체 컬럼 수 = # + _PRE_SPEC_COLUMNS + 파일 + 분석
+    total_cols = 1 + len(_PRE_SPEC_COLUMNS) + 2
     body_rows = []
     for i, r in enumerate(rows, start=1):
+        row_id = _e(r.get("bf_spec_rgst_no") or "")
         cells = [f"<td>{i}</td>"]
         for col, kind, _header in _PRE_SPEC_COLUMNS:
             val = r.get(col)
@@ -1244,11 +1659,18 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
         if cnt:
             cells.append(
                 f'<td><button type="button" class="filebtn" '
-                f'data-no="{_e(r.get("bf_spec_rgst_no"))}">파일 {cnt}</button></td>'
+                f'data-no="{row_id}">파일 {cnt}</button></td>'
             )
         else:
             cells.append('<td>-</td>')
-        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+        # 분석 버튼 컬럼 (Phase 6.3)
+        cells.append(
+            f'<td><button type="button" class="btn-analyze" '
+            f'data-type="pre-spec" data-id="{row_id}" '
+            f'data-colspan="{total_cols}" '
+            f'aria-label="제안요청서 분석">분석</button></td>'
+        )
+        body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
       <table>
@@ -1539,7 +1961,9 @@ def pre_spec_page(
       </div>
     </aside>
 
-    <script>{_PRE_SPEC_SCRIPT}</script>"""
+    {_ANALYSIS_MODAL_HTML}
+    <script>{_PRE_SPEC_SCRIPT}</script>
+    <script>{_ANALYSIS_SCRIPT}</script>"""
 
     return HTMLResponse(
         _shell("나라장터 사전규격 목록", "수집·저장된 사전규격을 조회합니다.", "pre-spec", body)
@@ -1748,7 +2172,9 @@ def list_page(
       </div>
     </aside>
 
-    <script>{_LIST_SCRIPT}</script>"""
+    {_ANALYSIS_MODAL_HTML}
+    <script>{_LIST_SCRIPT}</script>
+    <script>{_ANALYSIS_SCRIPT}</script>"""
 
     return HTMLResponse(
         _shell("나라장터 입찰공고 목록", "수집·저장된 공고를 조회합니다.", "list", body)
