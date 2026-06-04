@@ -16,6 +16,7 @@ from app.analysis.docx_parser import DOCXParser
 from app.analysis.hwp_parser import HWPParseError
 from app.analysis.hwp_parser import extract_hwpx_text, extract_text as hwp_extract_text
 from app.analysis.pdf_parser import PDFParser
+from app.analysis.provider import active_provider_name
 from app.analysis.rfp_analyzer import RFPAnalyzer
 from app.analysis.rfp_schema import RFPAnalysis
 
@@ -111,9 +112,10 @@ async def analyze_file(file_bytes: bytes, filename: str) -> AnalysisResult:
                 logger.info("[분석] LibreOffice 변환 완료")
                 text = PDFParser().extract_text(pdf_path)
 
-        logger.info("[분석] Claude API 호출 시작 (텍스트 %d자)", len(text))
+        provider_name = active_provider_name()
+        logger.info("[분석] LLM(%s) 호출 시작 (텍스트 %d자)", provider_name, len(text))
         analysis = await RFPAnalyzer().execute({"text": text})
-        logger.info("[분석] Claude API 완료: project_name=%s", getattr(analysis, "project_name", "?"))
+        logger.info("[분석] LLM(%s) 완료: project_name=%s", provider_name, getattr(analysis, "project_name", "?"))
         return AnalysisResult(status="ok", analysis=analysis)
 
     except (UnsupportedFormatError, DocConversionError):

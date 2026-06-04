@@ -101,9 +101,14 @@ def analysis_enabled() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def active_provider_name() -> str:
+    """현재 활성 분석 프로바이더 이름."""
+    return os.environ.get("ANALYSIS_PROVIDER", "claude").lower()
+
+
 def create_provider() -> AnalysisProvider:
     """ANALYSIS_PROVIDER env에 따라 프로바이더 인스턴스 생성."""
-    name = os.environ.get("ANALYSIS_PROVIDER", "claude").lower()
+    name = active_provider_name()
     model = os.environ.get("ANALYSIS_MODEL") or DEFAULT_MODELS.get(name)
 
     if name == "claude":
