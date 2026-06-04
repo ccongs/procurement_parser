@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 DEFAULT_MODELS: dict[str, str] = {
     "claude": "claude-sonnet-4-6",
     "openai": "gpt-4o",
-    "gemini": "gemini-1.5-pro",
+    "gemini": "gemini-2.0-flash",
 }
 
 

@@ -141,10 +141,10 @@ def test_openai_default_model(monkeypatch):
 
 
 def test_gemini_default_model(monkeypatch):
-    """ANALYSIS_MODEL 미설정 시 Gemini 기본 모델 gemini-1.5-pro."""
+    """ANALYSIS_MODEL 미설정 시 Gemini 기본 모델 gemini-2.0-flash."""
     monkeypatch.setenv("ANALYSIS_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-test")
     monkeypatch.delenv("ANALYSIS_MODEL", raising=False)
     with patch.object(sys.modules["google.generativeai"], "configure", MagicMock()):
         p = create_provider()
-    assert p.model_name == "gemini-1.5-pro"
+    assert p.model_name == "gemini-2.0-flash"

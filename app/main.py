@@ -2187,6 +2187,25 @@ _FILE_HTTP_TIMEOUT = 30.0
 _ZIP_TOTAL_LIMIT_BYTES = 300 * 1024 * 1024  # 300MB 누적 상한
 
 
+def _filename_from_cd(resp: httpx.Response, fallback: str) -> str:
+    """Content-Disposition 헤더에서 파일명 추출. 없거나 실패하면 fallback 반환."""
+    from urllib.parse import unquote as _unquote
+    cd = resp.headers.get("content-disposition", "")
+    for part in cd.split(";"):
+        part = part.strip()
+        if part.startswith("filename*="):
+            name = part.split("=", 1)[1].strip()
+            if "UTF-8''" in name.upper():
+                return _unquote(name.split("''", 1)[1])
+            return name
+        if part.startswith("filename="):
+            name = part.split("=", 1)[1].strip().strip('"')
+            if "%" in name:
+                return _unquote(name)
+            return name or fallback
+    return fallback
+
+
 @app.get("/list/{bid_ntce_no}/files")
 def list_files(bid_ntce_no: str):
     """공고의 첨부 목록 JSON. drawer 가 fetch 한다. URL 은 DB 저장값만 노출(SSRF 방지)."""
@@ -2218,6 +2237,7 @@ async def list_files_zip(bid_ntce_no: str):
         if notice is None:
             return Response("공고를 찾을 수 없습니다.", status_code=404)
         files = repository.get_notice_files(session, bid_ntce_no)
+        zip_label = notice.bid_ntce_nm or bid_ntce_no
     if not files:
         return Response("첨부가 없습니다.", status_code=404)
 
@@ -2255,7 +2275,7 @@ async def list_files_zip(bid_ntce_no: str):
     if ok == 0:
         return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
 
-    filename = quote(f"{bid_ntce_no}.zip")
+    filename = quote(f"{zip_label}.zip")
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
@@ -2292,6 +2312,7 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
         if spec is None:
             return Response("사전규격을 찾을 수 없습니다.", status_code=404)
         files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
+        zip_label = spec.prdct_clsfc_no_nm or bf_spec_rgst_no
     if not files:
         return Response("첨부가 없습니다.", status_code=404)
 
@@ -2316,8 +2337,8 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
                         "첨부 다운로드 실패 skip: no=%s idx=%s", bf_spec_rgst_no, f["idx"]
                     )
                     continue
-                # 파일명 충돌·빈값 방지: 인덱스 접두.
-                base = f["name"] or f"첨부{f['idx']}"
+                # 실제 파일명은 Content-Disposition 헤더에서 추출 (URL에는 확장자 없음)
+                base = _filename_from_cd(resp, f["name"] or f"첨부{f['idx']}")
                 arc = f"{f['idx']}_{base}"
                 if arc in used_names:
                     arc = f"{f['idx']}_{ok}_{base}"
@@ -2329,7 +2350,7 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     if ok == 0:
         return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
 
-    filename = quote(f"{bf_spec_rgst_no}.zip")
+    filename = quote(f"{zip_label}.zip")
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
