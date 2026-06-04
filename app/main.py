@@ -739,20 +739,68 @@ BASE_CSS = """
   button.modal-cancel:hover { background: #e7ebf2; }
   /* 분석 로딩 오버레이 */
   .analysis-loading { text-align: center; padding: 24px; font-size: 13px; color: #5a3e8a; }
-  /* 토스트(분석 에러) */
+  /* 토스트(분석 에러 + 장바구니) */
   #analyzeToast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
                   background: #b02a25; color: #fff; padding: 10px 20px; border-radius: 8px;
                   font-size: 13px; display: none; z-index: 70; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+  #cartToast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+               background: #2E7D32; color: #fff; padding: 10px 20px; border-radius: 8px;
+               font-size: 13px; display: none; z-index: 70; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+  /* 장바구니 체크박스 컬럼 */
+  .col-chk { width: 36px; text-align: center; }
+  .col-chk input[type=checkbox] { cursor: pointer; width: 16px; height: 16px; }
+  /* 담기 float 버튼 */
+  .btn-cart-add {
+    background: #2E7D32; color: #fff; border: none;
+    padding: 8px 16px; border-radius: 6px; cursor: pointer;
+    font-weight: bold; white-space: nowrap; font-size: 13px;
+  }
+  .btn-cart-add:hover { background: #1B5E20; }
+  /* 선택항목 헤더 버튼 */
+  .btn-cart-menu {
+    position: relative; background: #1565C0; color: #fff;
+    border: none; padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; font-size: 13px;
+  }
+  .btn-cart-menu:hover { background: #0D47A1; }
+  .btn-cart-menu.has-items { background: #E65100; }
+  .cart-badge {
+    display: inline-block; background: #fff; color: #E65100;
+    border-radius: 10px; padding: 0 6px; font-size: 11px;
+    font-weight: bold; margin-left: 4px;
+  }
+  /* 장바구니 모달 */
+  .cart-modal-content { width: min(600px, 92vw); max-height: 70vh; display: flex; flex-direction: column; }
+  .cart-modal-body { flex: 1; overflow-y: auto; padding: 8px 0; }
+  .cart-item-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-bottom: 1px solid #eee;
+  }
+  .cart-item-type { font-size: 11px; padding: 2px 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
+  .type-bid { background: #E3F2FD; color: #1565C0; }
+  .type-pre { background: #F3E5F5; color: #6A1B9A; }
+  .cart-item-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .btn-cart-del { flex-shrink: 0; background: #EF5350; color: #fff; border: none; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .btn-cart-del:hover { background: #C62828; }
+  .cart-empty { text-align: center; color: #9E9E9E; padding: 24px; }
+  .modal-footer { display: flex; gap: 8px; justify-content: flex-end; padding-top: 8px; border-top: 1px solid #eee; }
+  .btn-primary { background: #1565C0; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
+  .btn-secondary { background: #757575; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
 """
 
 
 def _nav(active: str) -> str:
     """헤더 우측 설정 버튼. active in {'list','pre-spec','config','api-test'}.
 
-    헤더 우측에는 '설정' 링크 하나만 노출. 탭바는 _shell 에서 <main> 최상단에 렌더한다.
+    헤더 우측에는 '선택항목(장바구니)' 버튼 + '설정' 링크 노출. 탭바는 _shell 에서 <main> 최상단에 렌더한다.
     """
     cfg_cls = ' class="hdr-btn active"' if active == "config" else ' class="hdr-btn"'
-    return f'<a href="/config"{cfg_cls}>설정</a>'
+    cart_btn = (
+        '<button id="btn-cart-menu" class="btn-cart-menu" onclick="toggleCartModal()" style="margin-right:8px;">'
+        '선택항목 <span id="cart-badge" class="cart-badge" style="display:none">0</span>'
+        '</button>'
+    )
+    return f'{cart_btn}<a href="/config"{cfg_cls}>설정</a>'
 
 
 def _tab_bar(active: str) -> str:
@@ -985,6 +1033,8 @@ def _sort_header(
 def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
+    # 전체선택 체크박스 헤더
+    chk_head = '<th class="col-chk"><input type="checkbox" id="chk-all" title="전체선택"></th>'
     head_cells = []
     for col, _kind, header in _LIST_COLUMNS:
         if col in _SORTABLE_COLUMNS:
@@ -993,12 +1043,18 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
     head += "<th>파일</th><th>분석</th>"
-    # 전체 컬럼 수 = # + _LIST_COLUMNS + 파일 + 분석
-    total_cols = 1 + len(_LIST_COLUMNS) + 2
+    # 전체 컬럼 수 = 체크박스 + # + _LIST_COLUMNS + 파일 + 분석
+    total_cols = 1 + 1 + len(_LIST_COLUMNS) + 2
     body_rows = []
     for i, r in enumerate(rows, start=1):
         row_id = _e(r.get("bid_ntce_no") or "")
-        cells = [f"<td>{i}</td>"]
+        chk_cell = (
+            f'<td class="col-chk">'
+            f'<input type="checkbox" class="row-select-chk" '
+            f'data-item-type="bid" data-item-id="{row_id}">'
+            f'</td>'
+        )
+        cells = [chk_cell, f"<td>{i}</td>"]
         for col, kind, _header in _LIST_COLUMNS:
             val = r.get(col)
             if kind == "amt":
@@ -1040,7 +1096,7 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     return f"""
     <div class="table-wrap">
       <table>
-        <thead><tr><th>#</th>{head}</tr></thead>
+        <thead><tr>{chk_head}<th>#</th>{head}</tr></thead>
         <tbody>{''.join(body_rows)}</tbody>
       </table>
     </div>"""
@@ -1611,6 +1667,160 @@ _ANALYSIS_MODAL_HTML = """
     </div>
     <!-- 에러 토스트 (Phase 6.3) -->
     <div id="analyzeToast" role="alert"></div>
+    <!-- 장바구니 토스트 (Phase 7.2) -->
+    <div id="cartToast" role="alert"></div>
+"""
+
+# 장바구니 모달 HTML (list·pre-spec 공용, Phase 7.2)
+_CART_MODAL_HTML = """
+    <!-- 장바구니 모달 (Phase 7.2) -->
+    <div id="cart-modal" class="modal-overlay" style="display:none" role="dialog" aria-label="선택 항목 목록">
+      <div class="modal-content cart-modal-content">
+        <div class="modal-header" style="background:#1565C0;">
+          <h3>선택 항목 목록</h3>
+          <button class="modal-close-btn" onclick="toggleCartModal()" aria-label="닫기">&times;</button>
+        </div>
+        <div class="cart-modal-body">
+          <div id="cart-items-list"></div>
+        </div>
+        <div class="modal-footer">
+          <button onclick="clearCart()" class="btn-secondary">전체 삭제</button>
+          <button onclick="downloadCart()" class="btn-primary">엑셀 다운로드</button>
+        </div>
+      </div>
+    </div>
+"""
+
+# 장바구니 공통 JS (list·pre-spec 페이지 양쪽에 삽입, Phase 7.2)
+_CART_SCRIPT = """
+  function escapeHtml(str) {
+    return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function showCartToast(msg) {
+    var t = document.getElementById('cartToast');
+    if (!t) return;
+    t.textContent = msg;
+    t.style.display = 'block';
+    setTimeout(function () { t.style.display = 'none'; }, 3000);
+  }
+
+  function updateCartBadge(count) {
+    var badge = document.getElementById('cart-badge');
+    var menuBtn = document.getElementById('btn-cart-menu');
+    if (!badge) return;
+    badge.textContent = count || 0;
+    badge.style.display = (count > 0) ? '' : 'none';
+    if (menuBtn) menuBtn.classList.toggle('has-items', count > 0);
+  }
+
+  function updateCartAddButton() {
+    var checked = document.querySelectorAll('.row-select-chk:checked');
+    var btn = document.getElementById('btn-add-to-cart');
+    var countEl = document.getElementById('cart-add-count');
+    if (btn) {
+      btn.style.display = checked.length > 0 ? '' : 'none';
+      if (countEl) countEl.textContent = checked.length;
+    }
+  }
+
+  function renderCartItems(items) {
+    var el = document.getElementById('cart-items-list');
+    if (!el) return;
+    if (!items.length) {
+      el.innerHTML = '<p class="cart-empty">담긴 항목이 없습니다.</p>';
+      return;
+    }
+    el.innerHTML = items.map(function (item) {
+      var typeLabel = item.item_type === 'bid' ? '입찰' : '사전규격';
+      var typeCls = item.item_type === 'bid' ? 'type-bid' : 'type-pre';
+      return '<div class="cart-item-row" data-cart-id="' + item.cart_id + '">'
+        + '<span class="cart-item-type ' + typeCls + '">' + typeLabel + '</span>'
+        + '<span class="cart-item-title" title="' + escapeHtml(item.title) + '">' + escapeHtml(item.title) + '</span>'
+        + '<button class="btn-cart-del" onclick="deleteCartItem(' + item.cart_id + ')">삭제</button>'
+        + '</div>';
+    }).join('');
+  }
+
+  async function loadCartItems() {
+    var resp = await fetch('/api/export-cart');
+    var data = await resp.json();
+    renderCartItems(data.items);
+    updateCartBadge(data.count);
+  }
+
+  async function toggleCartModal() {
+    var modal = document.getElementById('cart-modal');
+    if (!modal) return;
+    var opening = modal.style.display === 'none';
+    modal.style.display = opening ? 'flex' : 'none';
+    if (opening) await loadCartItems();
+  }
+
+  async function deleteCartItem(cartId) {
+    await fetch('/api/export-cart/' + cartId, { method: 'DELETE' });
+    await loadCartItems();
+  }
+
+  async function clearCart() {
+    if (!confirm('선택 항목을 모두 삭제할까요?')) return;
+    await fetch('/api/export-cart/all', { method: 'DELETE' });
+    await loadCartItems();
+  }
+
+  function downloadCart() {
+    window.location.href = '/api/export-cart/download';
+  }
+
+  async function addToCart() {
+    var items = Array.from(document.querySelectorAll('.row-select-chk:checked')).map(function (c) {
+      return { item_type: c.dataset.itemType, item_id: c.dataset.itemId };
+    });
+    if (!items.length) return;
+    var resp = await fetch('/api/export-cart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: items }),
+    });
+    var data = await resp.json();
+    // 체크 해제
+    document.querySelectorAll('.row-select-chk:checked').forEach(function (c) { c.checked = false; });
+    var chkAll = document.getElementById('chk-all');
+    if (chkAll) chkAll.checked = false;
+    updateCartAddButton();
+    // 배지 갱신
+    fetch('/api/export-cart').then(function (r) { return r.json(); }).then(function (d) { updateCartBadge(d.count); });
+    showCartToast('담기 완료: ' + (data.added || 0) + '건 추가');
+  }
+
+  // 체크박스 변경 이벤트 위임
+  document.addEventListener('change', function (e) {
+    if (e.target.id === 'chk-all') {
+      document.querySelectorAll('.row-select-chk').forEach(function (c) { c.checked = e.target.checked; });
+      updateCartAddButton();
+    } else if (e.target.classList.contains('row-select-chk')) {
+      updateCartAddButton();
+    }
+  });
+
+  // 장바구니 모달 바깥 클릭 시 닫기
+  document.addEventListener('click', function (e) {
+    var modal = document.getElementById('cart-modal');
+    if (modal && e.target === modal) modal.style.display = 'none';
+  });
+
+  // ESC 키로 장바구니 모달 닫기
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      var modal = document.getElementById('cart-modal');
+      if (modal && modal.style.display !== 'none') modal.style.display = 'none';
+    }
+  });
+
+  // 페이지 로드 시 배지 초기화
+  document.addEventListener('DOMContentLoaded', function () {
+    fetch('/api/export-cart').then(function (r) { return r.json(); }).then(function (d) { updateCartBadge(d.count); });
+  });
 """
 
 
@@ -1618,6 +1828,8 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
     """사전규격 목록 테이블 렌더(_render_list_rows 패턴). 파일 컬럼 포함(4.9-B2)."""
     if not rows:
         return '<p class="muted">조건에 맞는 사전규격이 없습니다.</p>'
+    # 전체선택 체크박스 헤더
+    chk_head = '<th class="col-chk"><input type="checkbox" id="chk-all" title="전체선택"></th>'
     head_cells = []
     for col, _kind, header in _PRE_SPEC_COLUMNS:
         if col in _PRE_SPEC_SORTABLE_COLUMNS:
@@ -1635,12 +1847,18 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
     head += "<th>파일</th><th>분석</th>"
-    # 전체 컬럼 수 = # + _PRE_SPEC_COLUMNS + 파일 + 분석
-    total_cols = 1 + len(_PRE_SPEC_COLUMNS) + 2
+    # 전체 컬럼 수 = 체크박스 + # + _PRE_SPEC_COLUMNS + 파일 + 분석
+    total_cols = 1 + 1 + len(_PRE_SPEC_COLUMNS) + 2
     body_rows = []
     for i, r in enumerate(rows, start=1):
         row_id = _e(r.get("bf_spec_rgst_no") or "")
-        cells = [f"<td>{i}</td>"]
+        chk_cell = (
+            f'<td class="col-chk">'
+            f'<input type="checkbox" class="row-select-chk" '
+            f'data-item-type="pre_spec" data-item-id="{row_id}">'
+            f'</td>'
+        )
+        cells = [chk_cell, f"<td>{i}</td>"]
         for col, kind, _header in _PRE_SPEC_COLUMNS:
             val = r.get(col)
             if kind == "amt":
@@ -1674,7 +1892,7 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
     return f"""
     <div class="table-wrap">
       <table>
-        <thead><tr><th>#</th>{head}</tr></thead>
+        <thead><tr>{chk_head}<th>#</th>{head}</tr></thead>
         <tbody>{''.join(body_rows)}</tbody>
       </table>
     </div>"""
@@ -1939,6 +2157,11 @@ def pre_spec_page(
 
     body = f"""
     {filter_card}
+    <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
+      <button id="btn-add-to-cart" class="btn-cart-add" style="display:none" onclick="addToCart()">
+        담기 <span id="cart-add-count">0</span>건
+      </button>
+    </div>
 
     <div class="card">
       <h2>수집된 사전규격</h2>
@@ -1962,8 +2185,10 @@ def pre_spec_page(
     </aside>
 
     {_ANALYSIS_MODAL_HTML}
+    {_CART_MODAL_HTML}
     <script>{_PRE_SPEC_SCRIPT}</script>
-    <script>{_ANALYSIS_SCRIPT}</script>"""
+    <script>{_ANALYSIS_SCRIPT}</script>
+    <script>{_CART_SCRIPT}</script>"""
 
     return HTMLResponse(
         _shell("나라장터 사전규격 목록", "수집·저장된 사전규격을 조회합니다.", "pre-spec", body)
@@ -2150,6 +2375,11 @@ def list_page(
 
     body = f"""
     {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard")}
+    <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
+      <button id="btn-add-to-cart" class="btn-cart-add" style="display:none" onclick="addToCart()">
+        담기 <span id="cart-add-count">0</span>건
+      </button>
+    </div>
 
     <div class="card">
       <h2>수집된 공고</h2>
@@ -2173,8 +2403,10 @@ def list_page(
     </aside>
 
     {_ANALYSIS_MODAL_HTML}
+    {_CART_MODAL_HTML}
     <script>{_LIST_SCRIPT}</script>
-    <script>{_ANALYSIS_SCRIPT}</script>"""
+    <script>{_ANALYSIS_SCRIPT}</script>
+    <script>{_CART_SCRIPT}</script>"""
 
     return HTMLResponse(
         _shell("나라장터 입찰공고 목록", "수집·저장된 공고를 조회합니다.", "list", body)
