@@ -488,3 +488,45 @@ def test_prompt_file_nonempty():
     prompt_path = Path(__file__).parent.parent / "app" / "analysis" / "prompts" / "rfp_analysis.txt"
     content = prompt_path.read_text(encoding="utf-8")
     assert len(content) > 100, "프롬프트 파일이 너무 짧음"
+
+
+# ---------------------------------------------------------------------------
+# rfp_analyzer — provider 주입 패턴 (Phase 6.4)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_rfp_analyzer_with_provider_mock():
+    """RFPAnalyzer — AnalysisProvider.complete mock 으로 실제 API 없이 동작 확인."""
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+    from app.analysis.rfp_schema import RFPAnalysis
+
+    mock_provider = AsyncMock()
+    mock_provider.complete = AsyncMock(
+        return_value='{"project_name": "테스트 프로젝트", "client_name": "서울시", "project_overview": "개요"}'
+    )
+
+    analyzer = RFPAnalyzer(provider=mock_provider)
+    result = await analyzer.execute({"text": "RFP 내용입니다."})
+
+    assert isinstance(result, RFPAnalysis)
+    assert result.project_name == "테스트 프로젝트"
+    assert result.client_name == "서울시"
+    mock_provider.complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rfp_analyzer_create_provider_called_when_no_provider(monkeypatch):
+    """provider 인자 없을 때 create_provider() 가 호출된다."""
+    from app.analysis.rfp_schema import RFPAnalysis
+
+    mock_provider = AsyncMock()
+    mock_provider.complete = AsyncMock(
+        return_value='{"project_name": "자동 프로바이더", "client_name": "기관", "project_overview": "개요"}'
+    )
+
+    with patch("app.analysis.rfp_analyzer.create_provider", return_value=mock_provider) as mock_factory:
+        from app.analysis.rfp_analyzer import RFPAnalyzer
+        analyzer = RFPAnalyzer()
+        result = await analyzer.execute({"text": "내용"})
+
+    mock_factory.assert_called_once()
+    assert result.project_name == "자동 프로바이더"

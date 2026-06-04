@@ -23,7 +23,7 @@ class BaseAgent(ABC):
         api_key: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        self.api_key = api_key or os.environ["ANTHROPIC_API_KEY"]
+        self.api_key = api_key or os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
         self.model = model or DEFAULT_CLAUDE_MODEL
         self.client = anthropic.Anthropic(api_key=self.api_key)
 

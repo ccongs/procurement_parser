@@ -2,10 +2,11 @@
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from app.analysis.base_agent import BaseAgent
+from app.analysis.provider import AnalysisProvider, create_provider
 from app.analysis.rfp_schema import RFPAnalysis
 
 logger = logging.getLogger("rfp_analyzer")
@@ -13,8 +14,11 @@ logger = logging.getLogger("rfp_analyzer")
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "rfp_analysis.txt"
 
 
-class RFPAnalyzer(BaseAgent):
-    """RFP 문서 분석 에이전트"""
+class RFPAnalyzer:
+    """RFP 문서 분석 — 프로바이더 주입 방식."""
+
+    def __init__(self, provider: Optional[AnalysisProvider] = None) -> None:
+        self._provider = provider or create_provider()
 
     async def execute(
         self,
@@ -134,11 +138,11 @@ class RFPAnalyzer(BaseAgent):
 
         if progress_callback:
             progress_callback(
-                {"step": 2, "total": 3, "message": "Claude 분석 수행 중..."}
+                {"step": 2, "total": 3, "message": "AI 분석 수행 중..."}
             )
 
-        # Claude API 호출
-        response = self._call_claude(system_prompt, user_message, max_tokens=8192)
+        # 프로바이더 호출
+        response = await self._provider.complete(system_prompt, user_message)
 
         if progress_callback:
             progress_callback(
@@ -191,3 +195,29 @@ class RFPAnalyzer(BaseAgent):
 - 모든 분석에 근거 제시
 
 응답은 반드시 유효한 JSON 형식으로 제공해주세요."""
+
+    def _extract_json(self, text: str) -> Dict[str, Any]:
+        """텍스트에서 JSON 추출"""
+        patterns = [
+            r"```json\s*([\s\S]*?)\s*```",
+            r"```\s*([\s\S]*?)\s*```",
+            r"(\{[\s\S]*\})",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                json_str = match.group(1)
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
+
+        logger.error("JSON 추출 실패")
+        return {}
+
+    def _truncate_text(self, text: str, max_chars: int = 30000) -> str:
+        """텍스트 길이 제한"""
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n\n... (텍스트가 잘렸습니다)"

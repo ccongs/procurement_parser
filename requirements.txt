@@ -20,3 +20,7 @@ anthropic>=0.40.0
 pypdf>=3.17.0
 pdfplumber>=0.10.0
 python-docx>=1.1.1
+
+# Phase 6.4 - 멀티 프로바이더
+openai>=1.0.0
+google-generativeai>=0.8.0
