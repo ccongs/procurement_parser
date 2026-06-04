@@ -91,6 +91,7 @@ def client(tmp_path, monkeypatch):
         s.commit()
 
     monkeypatch.setattr(main, "SessionLocal", Local)
+    monkeypatch.setenv("USE_ANALYSIS_PROVIDER", "true")  # 분석 UI 테스트: 명시적 true 설정
     return TestClient(main.app)
 
 

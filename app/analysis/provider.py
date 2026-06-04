@@ -96,8 +96,8 @@ class GeminiProvider(AnalysisProvider):
 
 
 def analysis_enabled() -> bool:
-    """USE_ANALYSIS_PROVIDER env (기본 true). false면 분석 UI(컬럼·버튼) 숨김."""
-    val = os.environ.get("USE_ANALYSIS_PROVIDER", "true").strip().lower()
+    """USE_ANALYSIS_PROVIDER env (기본 false). true일 때만 분석 UI(컬럼·버튼) 표시."""
+    val = os.environ.get("USE_ANALYSIS_PROVIDER", "false").strip().lower()
     return val in ("1", "true", "yes", "on")
 
 

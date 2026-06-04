@@ -146,11 +146,11 @@ class TestAnalysisToggleFalse:
 
 
 # ---------------------------------------------------------------------------
-# USE_ANALYSIS_PROVIDER=true (또는 기본) — 분석 컬럼·버튼 표시
+# USE_ANALYSIS_PROVIDER=true (명시) — 분석 컬럼·버튼 표시
 # ---------------------------------------------------------------------------
 
 class TestAnalysisToggleTrue:
-    """env=true(또는 미설정 기본값) → 분석 표시."""
+    """env=true(명시) → 분석 표시."""
 
     def test_list_analyze_button_present(self, client_with_seed):
         client, mp = client_with_seed
@@ -178,17 +178,17 @@ class TestAnalysisToggleTrue:
         r = client.get("/pre-spec")
         assert "<th>분석</th>" in r.text, "true일 때 분석 th가 없음"
 
-    def test_list_default_shows_analysis(self, client_with_seed):
-        """USE_ANALYSIS_PROVIDER 미설정 시 기본값 true → 분석 표시."""
+    def test_list_default_hides_analysis(self, client_with_seed):
+        """USE_ANALYSIS_PROVIDER 미설정 시 기본값 false → 분석 숨김."""
         client, mp = client_with_seed
-        # 환경변수를 명시적으로 제거해 기본값 동작 확인
+        # 환경변수를 명시적으로 제거해 기본값(false) 동작 확인
         mp.delenv("USE_ANALYSIS_PROVIDER", raising=False)
         r = client.get("/list")
-        assert 'class="btn-analyze"' in r.text, "기본값(true)일 때 btn-analyze가 없음"
+        assert 'class="btn-analyze"' not in r.text, "기본값(false)일 때 btn-analyze가 존재하면 안 됨"
 
-    def test_pre_spec_default_shows_analysis(self, client_with_seed):
-        """USE_ANALYSIS_PROVIDER 미설정 시 기본값 true → 분석 표시."""
+    def test_pre_spec_default_hides_analysis(self, client_with_seed):
+        """USE_ANALYSIS_PROVIDER 미설정 시 기본값 false → 분석 숨김."""
         client, mp = client_with_seed
         mp.delenv("USE_ANALYSIS_PROVIDER", raising=False)
         r = client.get("/pre-spec")
-        assert 'class="btn-analyze"' in r.text, "기본값(true)일 때 btn-analyze가 없음"
+        assert 'class="btn-analyze"' not in r.text, "기본값(false)일 때 btn-analyze가 존재하면 안 됨"

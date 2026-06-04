@@ -93,6 +93,7 @@ def client(tmp_path, monkeypatch):
         return Local()
 
     monkeypatch.setattr(main, "SessionLocal", Local)
+    monkeypatch.setenv("USE_ANALYSIS_PROVIDER", "true")  # btn-analyze 존재 전제 테스트: 명시적 true 설정
 
     with TestClient(main.app, raise_server_exceptions=True) as c:
         yield c
