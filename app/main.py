@@ -3236,10 +3236,10 @@ def api_export_cart_download():
     for row_idx, item in enumerate(items, 2):
         is_bid = item["item_type"] == "bid"
         label = "입찰공고" if is_bid else "사전규격"
-        if is_bid:
-            url = f"https://www.g2b.go.kr/link/PNPE027_01/single/?bidPbancNo={item['item_id']}&bidPbancOrd=000"
-        else:
-            url = f"https://www.g2b.go.kr/link/PNZO028_01/single/?bfSpecRgstNo={item['item_id']}"
+        bid_url = (
+            f"https://www.g2b.go.kr/link/PNPE027_01/single/?bidPbancNo={item['item_id']}&bidPbancOrd=000"
+            if is_bid else None
+        )
 
         values = [
             label,
@@ -3259,10 +3259,11 @@ def api_export_cart_download():
             if row_idx % 2 == 0:
                 cell.fill = PatternFill(fill_type="solid", fgColor="F5F5F5")
 
-        # 제목 셀 하이퍼링크
+        # 제목 셀 하이퍼링크 (입찰공고만)
         title_cell = ws.cell(row=row_idx, column=3)
-        title_cell.hyperlink = url
-        title_cell.font = link_font
+        if bid_url:
+            title_cell.hyperlink = bid_url
+            title_cell.font = link_font
 
     # 헤더 행 고정
     ws.freeze_panes = "A2"
