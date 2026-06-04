@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import AppConfig, BidNotice, CollectionRun, PreSpec
+from app.models import AppConfig, BidNotice, CollectionRun, ExportCartItem, PreSpec
 
 # bid_notice 에 실제 존재하는 컬럼명 집합 — values dict 중 컬럼이 아닌 키는 무시한다.
 _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
@@ -566,6 +566,76 @@ def get_pre_spec_files(session: Session, bf_spec_rgst_no: str) -> list[dict[str,
             continue
         files.append({"idx": i, "name": f"첨부{i}", "url": url})
     return files
+
+
+# --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------
+
+def get_export_cart(session: Session) -> list[dict[str, Any]]:
+    """장바구니 전체 조회. item_type+item_id로 BidNotice/PreSpec 메타 조인."""
+    items = session.query(ExportCartItem).order_by(ExportCartItem.added_at).all()
+    result = []
+    for item in items:
+        if item.item_type == "bid":
+            notice = session.get(BidNotice, item.item_id)
+            if notice:
+                result.append({
+                    "cart_id": item.id,
+                    "item_type": "bid",
+                    "item_id": item.item_id,
+                    "title": notice.bid_ntce_nm or item.item_id,
+                    "ntce_instt_nm": notice.ntce_instt_nm,
+                    "dminstt_nm": notice.dminstt_nm,
+                    "asign_bdgt_amt": notice.asign_bdgt_amt,
+                    "presmpt_prce": notice.presmpt_prce,
+                    "start_dt": notice.bid_ntce_dt,
+                    "close_dt": notice.openg_dt,
+                })
+        else:
+            spec = session.get(PreSpec, item.item_id)
+            if spec:
+                result.append({
+                    "cart_id": item.id,
+                    "item_type": "pre_spec",
+                    "item_id": item.item_id,
+                    "title": spec.prdct_clsfc_no_nm or item.item_id,
+                    "ntce_instt_nm": spec.order_instt_nm,
+                    "dminstt_nm": spec.rl_dminstt_nm,
+                    "asign_bdgt_amt": spec.asign_bdgt_amt,
+                    "presmpt_prce": None,
+                    "start_dt": spec.rcpt_dt,
+                    "close_dt": spec.opnin_rgst_clse_dt,
+                })
+    return result
+
+
+def add_export_cart_items(session: Session, items: list[dict[str, Any]]) -> int:
+    """items: [{"item_type": "bid"|"pre_spec", "item_id": "..."}]. 중복 무시. 추가 건수 반환."""
+    added = 0
+    for it in items:
+        exists = session.query(ExportCartItem).filter_by(
+            item_type=it["item_type"], item_id=it["item_id"]
+        ).first()
+        if not exists:
+            session.add(ExportCartItem(item_type=it["item_type"], item_id=it["item_id"]))
+            added += 1
+    session.commit()
+    return added
+
+
+def delete_export_cart_item(session: Session, cart_id: int) -> bool:
+    """cart_id로 개별 삭제. 성공 True."""
+    item = session.get(ExportCartItem, cart_id)
+    if item:
+        session.delete(item)
+        session.commit()
+        return True
+    return False
+
+
+def clear_export_cart(session: Session) -> None:
+    """전체 비우기."""
+    session.query(ExportCartItem).delete()
+    session.commit()
 
 
 def get_notice_files(session: Session, bid_ntce_no: str) -> list[dict[str, Any]]:

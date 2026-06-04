@@ -2936,3 +2936,113 @@ async def analyze_bid(bid_ntce_no: str) -> AnalysisResponse:
 
     analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
     return AnalysisResponse(status="ok", analysis=analysis_dict)
+
+
+# --- Phase 7.1: 검토 목록 장바구니 ---
+
+@app.get("/api/export-cart")
+def api_export_cart_list():
+    with SessionLocal() as session:
+        items = repository.get_export_cart(session)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/export-cart")
+def api_export_cart_add(body: dict):
+    items = body.get("items", [])
+    with SessionLocal() as session:
+        added = repository.add_export_cart_items(session, items)
+    return {"added": added}
+
+
+@app.delete("/api/export-cart/all")
+def api_export_cart_clear():
+    with SessionLocal() as session:
+        repository.clear_export_cart(session)
+    return {"cleared": True}
+
+
+@app.delete("/api/export-cart/{cart_id}")
+def api_export_cart_delete(cart_id: int):
+    with SessionLocal() as session:
+        ok = repository.delete_export_cart_item(session, cart_id)
+    return {"deleted": ok}
+
+
+@app.get("/api/export-cart/download")
+def api_export_cart_download():
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from urllib.parse import quote as _quote
+
+    with SessionLocal() as session:
+        items = repository.get_export_cart(session)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "검토목록"
+
+    HEADERS = ["구분", "공고번호", "제목", "발주기관", "수요기관",
+               "배정예산", "추정가격", "개시일시", "개찰/의견마감일시"]
+    COL_WIDTHS = [10, 20, 50, 20, 20, 15, 15, 18, 18]
+
+    # 헤더 행 스타일
+    header_fill = PatternFill(fill_type="solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    for col, (h, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.row_dimensions[1].height = 20
+
+    # 데이터 행
+    link_font = Font(color="0563C1", underline="single")
+    for row_idx, item in enumerate(items, 2):
+        is_bid = item["item_type"] == "bid"
+        label = "입찰공고" if is_bid else "사전규격"
+        if is_bid:
+            url = f"https://www.g2b.go.kr/pt/menu/selectSubFrame.do?frm=bidPblancListDtl&bidPblancId={item['item_id']}&bidPblancOrd=000"
+        else:
+            url = f"https://www.g2b.go.kr/pt/menu/selectSubFrame.do?frm=bfSpecRgstListDtl&bfSpecRgstNo={item['item_id']}"
+
+        values = [
+            label,
+            item["item_id"],
+            item["title"],
+            item.get("ntce_instt_nm") or "",
+            item.get("dminstt_nm") or "",
+            item.get("asign_bdgt_amt") or "",
+            item.get("presmpt_prce") or "-",
+            item.get("start_dt") or "",
+            item.get("close_dt") or "",
+        ]
+        for col, val in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col, value=val)
+            cell.alignment = Alignment(vertical="center", wrap_text=(col == 3))
+            # 짝수행 연회색
+            if row_idx % 2 == 0:
+                cell.fill = PatternFill(fill_type="solid", fgColor="F5F5F5")
+
+        # 제목 셀 하이퍼링크
+        title_cell = ws.cell(row=row_idx, column=3)
+        title_cell.hyperlink = url
+        title_cell.font = link_font
+
+    # 헤더 행 고정
+    ws.freeze_panes = "A2"
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    fname = _quote("검토목록.xlsx")
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{fname}"}
+    return Response(
+        content=buf.read(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
