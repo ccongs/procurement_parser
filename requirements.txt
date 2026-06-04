@@ -25,3 +25,6 @@ olefile>=0.47
 # Phase 6.4 - 멀티 프로바이더
 openai>=1.0.0
 google-generativeai>=0.8.0
+
+# Phase 7.1 - 검토 목록 장바구니 Excel 내보내기
+openpyxl>=3.1.0

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import (
     Boolean,
     Column,
@@ -21,6 +23,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 
 from app.db import Base
@@ -237,3 +240,22 @@ class PreSpec(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<PreSpec {self.bf_spec_rgst_no!r} sw={self.sw_biz_obj_yn!r}>"
+
+
+# --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------
+class ExportCartItem(Base):
+    """검토 목록 장바구니 — 입찰공고·사전규격 혼합 저장."""
+
+    __tablename__ = "export_cart"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_type = Column(String(10), nullable=False)   # "bid" | "pre_spec"
+    item_id = Column(String(100), nullable=False)    # bid_ntce_no 또는 bf_spec_rgst_no
+    added_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("item_type", "item_id", name="uq_export_cart_item"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 디버그용
+        return f"<ExportCartItem id={self.id} type={self.item_type!r} item={self.item_id!r}>"
