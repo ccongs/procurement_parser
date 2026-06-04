@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Optional
 from app.analysis.provider import AnalysisProvider, create_provider
 from app.analysis.rfp_schema import RFPAnalysis
 
-logger = logging.getLogger("rfp_analyzer")
+logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "rfp_analysis.txt"
 
@@ -38,6 +38,7 @@ class RFPAnalyzer:
         Returns:
             RFPAnalysis: 분석된 RFP 정보
         """
+        logger.info("[RFP] 분석 시작: 텍스트 %d자", len(input_data.get("text", "")))
         if progress_callback:
             progress_callback(
                 {"step": 1, "total": 3, "message": "RFP 텍스트 준비 중..."}
@@ -157,7 +158,7 @@ class RFPAnalyzer:
         analysis_data.setdefault("client_name", "발주처 미확인")
         analysis_data.setdefault("project_overview", "")
 
-        logger.info(f"RFP 분석 완료: {analysis_data.get('project_name')}")
+        logger.info("[RFP] 분석 완료: project_name=%s", analysis_data.get("project_name", "?"))
 
         return RFPAnalysis(**analysis_data)
 

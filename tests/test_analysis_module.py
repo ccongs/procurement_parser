@@ -67,7 +67,7 @@ from app.analysis.doc_converter import convert_to_pdf, DocConversionError
 @patch("app.analysis.doc_converter.subprocess.run")
 def test_convert_to_pdf_success(mock_run, tmp_path):
     """LibreOffice 정상 실행 시 PDF 경로 반환."""
-    mock_run.return_value = MagicMock(returncode=0)
+    mock_run.return_value = MagicMock(returncode=0, stderr=b"")
     src = tmp_path / "test.hwp"
     src.write_bytes(b"fake hwp")
     # 변환 결과 파일 생성 시뮬레이션
@@ -93,12 +93,26 @@ def test_convert_to_pdf_nonzero_returncode(mock_run, tmp_path):
 @patch("app.analysis.doc_converter.subprocess.run")
 def test_convert_to_pdf_no_output_file(mock_run, tmp_path):
     """returncode=0 이지만 PDF 파일이 없을 때 DocConversionError."""
-    mock_run.return_value = MagicMock(returncode=0)
+    mock_run.return_value = MagicMock(returncode=0, stderr=b"")
     src = tmp_path / "test.hwp"
     src.write_bytes(b"fake hwp")
     # PDF 파일을 생성하지 않음
 
     with pytest.raises(DocConversionError, match="생성되지 않음"):
+        convert_to_pdf(src, tmp_path)
+
+
+@patch("app.analysis.doc_converter.subprocess.run")
+def test_convert_to_pdf_stderr_error(mock_run, tmp_path):
+    """returncode=0 이지만 stderr에 'could not be loaded' 에러 → DocConversionError."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stderr=b"could not be loaded: /tmp/test.doc",
+    )
+    src = tmp_path / "test.doc"
+    src.write_bytes(b"fake doc")
+
+    with pytest.raises(DocConversionError, match="변환 오류"):
         convert_to_pdf(src, tmp_path)
 
 
@@ -304,26 +318,23 @@ async def test_analyze_file_docx_ok():
 
 @pytest.mark.asyncio
 async def test_analyze_file_hwp_ok():
-    """HWP 파일 → LibreOffice 변환 + PDFParser + RFPAnalyzer (모두 mock)."""
+    """HWP 파일 → hwp_parser 직접 파싱 + RFPAnalyzer (모두 mock)."""
     mock_rfp = RFPAnalysis(
         project_name="HWP 프로젝트",
         client_name="발주처",
         project_overview="HWP 개요",
     )
 
-    with patch("app.analysis.analyzer_service.convert_to_pdf") as mock_convert, \
-         patch("app.analysis.analyzer_service.PDFParser") as mock_parser_cls, \
+    with patch("app.analysis.analyzer_service.hwp_extract_text", return_value="HWP 본문 내용...") as mock_hwp, \
          patch("app.analysis.analyzer_service.RFPAnalyzer") as mock_analyzer_cls:
 
-        # convert_to_pdf는 Path 객체를 반환
-        mock_convert.return_value = Path("/tmp/test.pdf")
-        mock_parser_cls.return_value.extract_text.return_value = "HWP 변환 텍스트"
         mock_analyzer_cls.return_value.execute = AsyncMock(return_value=mock_rfp)
 
         result = await analyze_file(b"HWP data", "test.hwp")
 
     assert result.status == "ok"
     assert result.analysis.project_name == "HWP 프로젝트"
+    mock_hwp.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -350,35 +361,45 @@ async def test_analyze_file_doc_ok():
 
 @pytest.mark.asyncio
 async def test_analyze_file_hwpx_ok():
-    """.hwpx 파일 → LibreOffice 변환 경로 (mock)."""
+    """.hwpx 파일 → hwp_parser 직접 파싱 + RFPAnalyzer (모두 mock)."""
     mock_rfp = RFPAnalysis(
         project_name="HWPX 프로젝트",
         client_name="발주처",
         project_overview="개요",
     )
 
-    with patch("app.analysis.analyzer_service.convert_to_pdf") as mock_convert, \
-         patch("app.analysis.analyzer_service.PDFParser") as mock_parser_cls, \
+    with patch("app.analysis.analyzer_service.hwp_extract_text", return_value="HWPX 텍스트") as mock_hwp, \
          patch("app.analysis.analyzer_service.RFPAnalyzer") as mock_analyzer_cls:
 
-        mock_convert.return_value = Path("/tmp/test.pdf")
-        mock_parser_cls.return_value.extract_text.return_value = "HWPX 텍스트"
         mock_analyzer_cls.return_value.execute = AsyncMock(return_value=mock_rfp)
 
         result = await analyze_file(b"HWPX data", "test.hwpx")
 
     assert result.status == "ok"
+    mock_hwp.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_analyze_file_conversion_error():
-    """LibreOffice 변환 실패 시 DocConversionError가 re-raise 됨."""
+async def test_analyze_file_hwp_parse_error():
+    """HWP 파싱 실패(HWPParseError) 시 DocConversionError로 래핑되어 re-raise."""
+    from app.analysis.doc_converter import DocConversionError
+    from app.analysis.hwp_parser import HWPParseError
+
+    with patch("app.analysis.analyzer_service.hwp_extract_text") as mock_hwp:
+        mock_hwp.side_effect = HWPParseError("OLE 파일 열기 실패")
+        with pytest.raises(DocConversionError):
+            await analyze_file(b"data", "test.hwp")
+
+
+@pytest.mark.asyncio
+async def test_analyze_file_doc_conversion_error():
+    """.doc LibreOffice 변환 실패 시 DocConversionError가 re-raise 됨."""
     from app.analysis.doc_converter import DocConversionError
 
     with patch("app.analysis.analyzer_service.convert_to_pdf") as mock_convert:
         mock_convert.side_effect = DocConversionError("변환 실패")
         with pytest.raises(DocConversionError):
-            await analyze_file(b"data", "test.hwp")
+            await analyze_file(b"data", "test.doc")
 
 
 @pytest.mark.asyncio
