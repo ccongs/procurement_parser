@@ -264,3 +264,51 @@ class TestCartApiIntegration:
         assert r.status_code == 200
         ct = r.headers.get("content-type", "")
         assert "spreadsheet" in ct or "octet-stream" in ct
+
+
+# ---------------------------------------------------------------------------
+# Phase 7.3 — "검토항목 장바구니" 명칭 변경 확인
+# ---------------------------------------------------------------------------
+
+class TestCartRenamePhase73:
+    """헤더 버튼·모달 제목이 "검토항목 장바구니"로 변경되었는지 확인."""
+
+    def test_list_header_btn_text_renamed(self, client):
+        """헤더 버튼에 '검토항목 장바구니' 텍스트 포함."""
+        r = client.get("/list")
+        assert "검토항목 장바구니" in r.text, "헤더 버튼 텍스트 '검토항목 장바구니' 누락"
+
+    def test_list_modal_title_renamed(self, client):
+        """장바구니 모달 제목이 '검토항목 장바구니'로 변경됨."""
+        r = client.get("/list")
+        assert "<h3>검토항목 장바구니</h3>" in r.text, "모달 h3 제목 누락"
+
+    def test_list_modal_aria_label_renamed(self, client):
+        """모달 aria-label이 '검토항목 장바구니'로 변경됨."""
+        r = client.get("/list")
+        assert 'aria-label="검토항목 장바구니"' in r.text, "모달 aria-label 누락"
+
+    def test_config_header_btn_text_renamed(self, client):
+        """/config 페이지 헤더에도 '검토항목 장바구니' 텍스트 포함."""
+        r = client.get("/config")
+        assert "검토항목 장바구니" in r.text, "/config 헤더 버튼 텍스트 '검토항목 장바구니' 누락"
+
+    def test_pre_spec_header_btn_text_renamed(self, client):
+        """/pre-spec 페이지 헤더에도 '검토항목 장바구니' 텍스트 포함."""
+        r = client.get("/pre-spec")
+        assert "검토항목 장바구니" in r.text, "/pre-spec 헤더 버튼 텍스트 '검토항목 장바구니' 누락"
+
+    def test_pre_spec_modal_title_renamed(self, client):
+        """/pre-spec 장바구니 모달 제목이 '검토항목 장바구니'로 변경됨."""
+        r = client.get("/pre-spec")
+        assert "<h3>검토항목 장바구니</h3>" in r.text, "/pre-spec 모달 h3 제목 누락"
+
+    def test_btn_cart_menu_id_unchanged(self, client):
+        """id 'btn-cart-menu'는 변경 없이 유지됨."""
+        r = client.get("/list")
+        assert 'id="btn-cart-menu"' in r.text, "btn-cart-menu id 유지 실패"
+
+    def test_cart_modal_id_unchanged(self, client):
+        """id 'cart-modal'은 변경 없이 유지됨."""
+        r = client.get("/list")
+        assert 'id="cart-modal"' in r.text, "cart-modal id 유지 실패"

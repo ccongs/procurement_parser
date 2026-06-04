@@ -50,6 +50,7 @@ from app.analysis.analyzer_service import (
     analyze_from_url,
     SUPPORTED_EXTENSIONS,
 )
+from app.analysis.provider import analysis_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -792,12 +793,12 @@ BASE_CSS = """
 def _nav(active: str) -> str:
     """헤더 우측 설정 버튼. active in {'list','pre-spec','config','api-test'}.
 
-    헤더 우측에는 '선택항목(장바구니)' 버튼 + '설정' 링크 노출. 탭바는 _shell 에서 <main> 최상단에 렌더한다.
+    헤더 우측에는 '검토항목 장바구니' 버튼 + '설정' 링크 노출. 탭바는 _shell 에서 <main> 최상단에 렌더한다.
     """
     cfg_cls = ' class="hdr-btn active"' if active == "config" else ' class="hdr-btn"'
     cart_btn = (
         '<button id="btn-cart-menu" class="btn-cart-menu" onclick="toggleCartModal()">'
-        '선택항목 <span id="cart-badge" class="cart-badge" style="display:none">0</span>'
+        '검토항목 장바구니 <span id="cart-badge" class="cart-badge" style="display:none">0</span>'
         '</button>'
     )
     return f'<div style="display:flex;align-items:center;gap:8px;">{cart_btn}<a href="/config"{cfg_cls}>설정</a></div>'
@@ -1033,6 +1034,7 @@ def _sort_header(
 def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
+    analysis_on = analysis_enabled()
     # 전체선택 체크박스 헤더
     chk_head = '<th class="col-chk"><input type="checkbox" id="chk-all" title="전체선택"></th>'
     head_cells = []
@@ -1042,9 +1044,11 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
-    head += "<th>파일</th><th>분석</th>"
-    # 전체 컬럼 수 = 체크박스 + # + _LIST_COLUMNS + 파일 + 분석
-    total_cols = 1 + 1 + len(_LIST_COLUMNS) + 2
+    head += "<th>파일</th>"
+    if analysis_on:
+        head += "<th>분석</th>"
+    # 전체 컬럼 수 = 체크박스 + # + _LIST_COLUMNS + 파일 + 분석(토글)
+    total_cols = 1 + 1 + len(_LIST_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
     for i, r in enumerate(rows, start=1):
         row_id = _e(r.get("bid_ntce_no") or "")
@@ -1085,13 +1089,14 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
             )
         else:
             cells.append('<td>-</td>')
-        # 분석 버튼 컬럼 (Phase 6.3)
-        cells.append(
-            f'<td><button type="button" class="btn-analyze" '
-            f'data-type="bid" data-id="{row_id}" '
-            f'data-colspan="{total_cols}" '
-            f'aria-label="제안요청서 분석">분석</button></td>'
-        )
+        # 분석 버튼 컬럼 (Phase 6.3, USE_ANALYSIS_PROVIDER 토글)
+        if analysis_on:
+            cells.append(
+                f'<td><button type="button" class="btn-analyze" '
+                f'data-type="bid" data-id="{row_id}" '
+                f'data-colspan="{total_cols}" '
+                f'aria-label="제안요청서 분석">분석</button></td>'
+            )
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
@@ -1676,10 +1681,10 @@ _ANALYSIS_MODAL_HTML = """
 # 장바구니 모달 HTML (list·pre-spec 공용, Phase 7.2)
 _CART_MODAL_HTML = """
     <!-- 장바구니 모달 (Phase 7.2) -->
-    <div id="cart-modal" class="modal-overlay" style="display:none" role="dialog" aria-label="선택 항목 목록">
+    <div id="cart-modal" class="modal-overlay" style="display:none" role="dialog" aria-label="검토항목 장바구니">
       <div class="modal-content cart-modal-content">
         <div class="modal-header" style="background:#1565C0;">
-          <h3>선택 항목 목록</h3>
+          <h3>검토항목 장바구니</h3>
           <button class="modal-close-btn" onclick="toggleCartModal()" aria-label="닫기">&times;</button>
         </div>
         <div class="cart-modal-body">
@@ -1830,6 +1835,7 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
     """사전규격 목록 테이블 렌더(_render_list_rows 패턴). 파일 컬럼 포함(4.9-B2)."""
     if not rows:
         return '<p class="muted">조건에 맞는 사전규격이 없습니다.</p>'
+    analysis_on = analysis_enabled()
     # 전체선택 체크박스 헤더
     chk_head = '<th class="col-chk"><input type="checkbox" id="chk-all" title="전체선택"></th>'
     head_cells = []
@@ -1848,9 +1854,11 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
-    head += "<th>파일</th><th>분석</th>"
-    # 전체 컬럼 수 = 체크박스 + # + _PRE_SPEC_COLUMNS + 파일 + 분석
-    total_cols = 1 + 1 + len(_PRE_SPEC_COLUMNS) + 2
+    head += "<th>파일</th>"
+    if analysis_on:
+        head += "<th>분석</th>"
+    # 전체 컬럼 수 = 체크박스 + # + _PRE_SPEC_COLUMNS + 파일 + 분석(토글)
+    total_cols = 1 + 1 + len(_PRE_SPEC_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
     for i, r in enumerate(rows, start=1):
         row_id = _e(r.get("bf_spec_rgst_no") or "")
@@ -1883,13 +1891,14 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
             )
         else:
             cells.append('<td>-</td>')
-        # 분석 버튼 컬럼 (Phase 6.3)
-        cells.append(
-            f'<td><button type="button" class="btn-analyze" '
-            f'data-type="pre-spec" data-id="{row_id}" '
-            f'data-colspan="{total_cols}" '
-            f'aria-label="제안요청서 분석">분석</button></td>'
-        )
+        # 분석 버튼 컬럼 (Phase 6.3, USE_ANALYSIS_PROVIDER 토글)
+        if analysis_on:
+            cells.append(
+                f'<td><button type="button" class="btn-analyze" '
+                f'data-type="pre-spec" data-id="{row_id}" '
+                f'data-colspan="{total_cols}" '
+                f'aria-label="제안요청서 분석">분석</button></td>'
+            )
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">

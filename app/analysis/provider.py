@@ -95,6 +95,12 @@ class GeminiProvider(AnalysisProvider):
         return response.text
 
 
+def analysis_enabled() -> bool:
+    """USE_ANALYSIS_PROVIDER env (기본 true). false면 분석 UI(컬럼·버튼) 숨김."""
+    val = os.environ.get("USE_ANALYSIS_PROVIDER", "true").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 def create_provider() -> AnalysisProvider:
     """ANALYSIS_PROVIDER env에 따라 프로바이더 인스턴스 생성."""
     name = os.environ.get("ANALYSIS_PROVIDER", "claude").lower()
