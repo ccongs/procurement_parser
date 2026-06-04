@@ -749,7 +749,7 @@ BASE_CSS = """
   /* 장바구니 체크박스 컬럼 */
   .col-chk { width: 36px; text-align: center; }
   .col-chk input[type=checkbox] { cursor: pointer; width: 16px; height: 16px; }
-  /* 담기 float 버튼 */
+  /* 담기 버튼 (필터 summary 우측) */
   .btn-cart-add {
     background: #2E7D32; color: #fff; border: none;
     padding: 8px 16px; border-radius: 6px; cursor: pointer;
@@ -796,11 +796,11 @@ def _nav(active: str) -> str:
     """
     cfg_cls = ' class="hdr-btn active"' if active == "config" else ' class="hdr-btn"'
     cart_btn = (
-        '<button id="btn-cart-menu" class="btn-cart-menu" onclick="toggleCartModal()" style="margin-right:8px;">'
+        '<button id="btn-cart-menu" class="btn-cart-menu" onclick="toggleCartModal()">'
         '선택항목 <span id="cart-badge" class="cart-badge" style="display:none">0</span>'
         '</button>'
     )
-    return f'{cart_btn}<a href="/config"{cfg_cls}>설정</a>'
+    return f'<div style="display:flex;align-items:center;gap:8px;">{cart_btn}<a href="/config"{cfg_cls}>설정</a></div>'
 
 
 def _tab_bar(active: str) -> str:
@@ -1177,6 +1177,7 @@ def _filter_card(
     detail_html: str,
     title: str = "검색",
     card_id: str = "filterCard",
+    right_html: str = "",
 ) -> str:
     """플로팅 필터 카드 헬퍼 (Wave A 신설 — B-1/B-2 에서 list_page/pre_spec_page 에 적용).
 
@@ -1207,6 +1208,7 @@ def _filter_card(
         f'<div class="filter-summary">'
         f'{summary_html}'
         f'<button type="button" class="filter-toggle" onclick="{_e(toggle_js)}">▾ 필터 펼침</button>'
+        f'{right_html}'
         f'</div>'
         f'<div class="filter-detail">{detail_html}</div>'
         f'</form>'
@@ -2153,15 +2155,11 @@ def pre_spec_page(
         detail_html=detail_html,
         title="사전규격 검색",
         card_id="filterCard",
+        right_html='<button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>',
     )
 
     body = f"""
     {filter_card}
-    <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
-      <button id="btn-add-to-cart" class="btn-cart-add" style="display:none" onclick="addToCart()">
-        담기 <span id="cart-add-count">0</span>건
-      </button>
-    </div>
 
     <div class="card">
       <h2>수집된 사전규격</h2>
@@ -2374,12 +2372,8 @@ def list_page(
       </div>"""
 
     body = f"""
-    {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard")}
-    <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
-      <button id="btn-add-to-cart" class="btn-cart-add" style="display:none" onclick="addToCart()">
-        담기 <span id="cart-add-count">0</span>건
-      </button>
-    </div>
+    {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard",
+        right_html='<button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>')}
 
     <div class="card">
       <h2>수집된 공고</h2>
