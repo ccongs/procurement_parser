@@ -2883,15 +2883,16 @@ async def analyze_bid(bid_ntce_no: str) -> AnalysisResponse:
         files = repository.get_notice_files(session, bid_ntce_no)
 
     # '제안요청서' 포함 + 지원 형식 필터
+    # URL은 downloadFile.do?fileSeq=N 형태라 확장자가 없으므로 파일명에서 추출
     candidates = [
         f for f in files
         if "제안요청서" in f["name"]
-        and Path(f["url"].split("?")[0]).suffix.lower() in SUPPORTED_EXTENSIONS
+        and Path(f["name"]).suffix.lower() in SUPPORTED_EXTENSIONS
     ]
     # 우선순위 정렬(낮은 값 우선)
     candidates.sort(
         key=lambda f: _ANALYSIS_PRIORITY.get(
-            Path(f["url"].split("?")[0]).suffix.lower(), 99
+            Path(f["name"]).suffix.lower(), 99
         )
     )
 
