@@ -13,6 +13,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "openai": "gpt-4o",
     "gemini": "gemini-2.0-flash",
 }
+DEFAULT_MAX_TOKENS = 8192
 
 
 class AnalysisProvider(ABC):
@@ -24,7 +25,12 @@ class AnalysisProvider(ABC):
 
 
 class ClaudeProvider(AnalysisProvider):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> None:
         try:
             import anthropic
         except ImportError as e:
@@ -34,11 +40,12 @@ class ClaudeProvider(AnalysisProvider):
             ) from e
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self.model = model
+        self.max_tokens = max_tokens
 
     async def complete(self, system_prompt: str, user_content: str) -> str:
         response = await self._client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=self.max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],
         )
@@ -46,7 +53,12 @@ class ClaudeProvider(AnalysisProvider):
 
 
 class OpenAIProvider(AnalysisProvider):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> None:
         try:
             from openai import AsyncOpenAI
         except ImportError as e:
@@ -56,6 +68,7 @@ class OpenAIProvider(AnalysisProvider):
             ) from e
         self._client = AsyncOpenAI(api_key=api_key)
         self.model = model
+        self.max_tokens = max_tokens
 
     async def complete(self, system_prompt: str, user_content: str) -> str:
         from openai import AsyncOpenAI  # 런타임 import (선택적)
@@ -65,13 +78,18 @@ class OpenAIProvider(AnalysisProvider):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=4096,
+            max_tokens=self.max_tokens,
         )
         return response.choices[0].message.content
 
 
 class GeminiProvider(AnalysisProvider):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> None:
         try:
             import google.generativeai as genai
         except ImportError as e:
@@ -82,6 +100,7 @@ class GeminiProvider(AnalysisProvider):
         genai.configure(api_key=api_key)
         self._genai = genai
         self.model_name = model
+        self.max_tokens = max_tokens
 
     async def complete(self, system_prompt: str, user_content: str) -> str:
         model = self._genai.GenerativeModel(
@@ -90,7 +109,11 @@ class GeminiProvider(AnalysisProvider):
         )
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
-            None, lambda: model.generate_content(user_content)
+            None,
+            lambda: model.generate_content(
+                user_content,
+                generation_config={"max_output_tokens": self.max_tokens},
+            ),
         )
         return response.text
 
@@ -106,28 +129,38 @@ def active_provider_name() -> str:
     return os.environ.get("ANALYSIS_PROVIDER", "claude").lower()
 
 
+def _analysis_max_tokens() -> int:
+    """ANALYSIS_MAX_TOKENS 파싱. 비정상 값은 기본값으로 폴백."""
+    try:
+        max_tokens = int(os.environ.get("ANALYSIS_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TOKENS
+    return max_tokens if max_tokens > 0 else DEFAULT_MAX_TOKENS
+
+
 def create_provider() -> AnalysisProvider:
     """ANALYSIS_PROVIDER env에 따라 프로바이더 인스턴스 생성."""
     name = active_provider_name()
     model = os.environ.get("ANALYSIS_MODEL") or DEFAULT_MODELS.get(name)
+    max_tokens = _analysis_max_tokens()
 
     if name == "claude":
         api_key = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("CLAUDE_API_KEY 환경변수가 설정되지 않았습니다.")
-        return ClaudeProvider(api_key=api_key, model=model)
+        return ClaudeProvider(api_key=api_key, model=model, max_tokens=max_tokens)
 
     if name == "openai":
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
-        return OpenAIProvider(api_key=api_key, model=model)
+        return OpenAIProvider(api_key=api_key, model=model, max_tokens=max_tokens)
 
     if name == "gemini":
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
-        return GeminiProvider(api_key=api_key, model=model)
+        return GeminiProvider(api_key=api_key, model=model, max_tokens=max_tokens)
 
     raise ValueError(
         f"지원하지 않는 ANALYSIS_PROVIDER: '{name}'. claude | openai | gemini 중 선택."

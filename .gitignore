@@ -37,3 +37,4 @@ documents
 
 # 앱 로그 파일 (Phase 4.5)
 logs/
+rfp_analyzer_logs/

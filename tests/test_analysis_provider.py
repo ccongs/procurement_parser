@@ -148,3 +148,63 @@ def test_gemini_default_model(monkeypatch):
     with patch.object(sys.modules["google.generativeai"], "configure", MagicMock()):
         p = create_provider()
     assert p.model_name == "gemini-2.0-flash"
+
+
+def test_create_provider_default_max_tokens(monkeypatch):
+    """ANALYSIS_MAX_TOKENS 미설정 시 기본 8192."""
+    monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
+    monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
+    monkeypatch.delenv("ANALYSIS_MAX_TOKENS", raising=False)
+    with patch("anthropic.AsyncAnthropic"):
+        p = create_provider()
+    assert p.max_tokens == 8192
+
+
+def test_create_provider_override_max_tokens(monkeypatch):
+    """ANALYSIS_MAX_TOKENS override 반영."""
+    monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
+    monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
+    monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "12000")
+    with patch("anthropic.AsyncAnthropic"):
+        p = create_provider()
+    assert p.max_tokens == 12000
+
+
+def test_create_provider_invalid_max_tokens_fallback(monkeypatch):
+    """ANALYSIS_MAX_TOKENS 비정상 값은 8192로 폴백."""
+    monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
+    monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
+    monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "not-a-number")
+    with patch("anthropic.AsyncAnthropic"):
+        p = create_provider()
+    assert p.max_tokens == 8192
+
+
+def test_create_provider_empty_max_tokens_fallback(monkeypatch):
+    """ANALYSIS_MAX_TOKENS 빈 문자열은 8192로 폴백."""
+    monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
+    monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
+    monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "")
+    with patch("anthropic.AsyncAnthropic"):
+        p = create_provider()
+    assert p.max_tokens == 8192
+
+
+def test_create_provider_openai_max_tokens(monkeypatch):
+    """OpenAI provider도 max_tokens를 보관."""
+    monkeypatch.setenv("ANALYSIS_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "9000")
+    with patch.object(sys.modules["openai"], "AsyncOpenAI", MagicMock()):
+        p = create_provider()
+    assert p.max_tokens == 9000
+
+
+def test_create_provider_gemini_max_tokens(monkeypatch):
+    """Gemini provider도 max_tokens를 보관."""
+    monkeypatch.setenv("ANALYSIS_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-test")
+    monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "10000")
+    with patch.object(sys.modules["google.generativeai"], "configure", MagicMock()):
+        p = create_provider()
+    assert p.max_tokens == 10000

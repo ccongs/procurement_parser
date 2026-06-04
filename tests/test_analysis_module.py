@@ -515,11 +515,12 @@ def test_prompt_file_nonempty():
 # rfp_analyzer — provider 주입 패턴 (Phase 6.4)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_rfp_analyzer_with_provider_mock():
+async def test_rfp_analyzer_with_provider_mock(monkeypatch):
     """RFPAnalyzer — AnalysisProvider.complete mock 으로 실제 API 없이 동작 확인."""
     from app.analysis.rfp_analyzer import RFPAnalyzer
     from app.analysis.rfp_schema import RFPAnalysis
 
+    monkeypatch.delenv("USER_RFP_ANALYZER_LOG", raising=False)
     mock_provider = AsyncMock()
     mock_provider.complete = AsyncMock(
         return_value='{"project_name": "테스트 프로젝트", "client_name": "서울시", "project_overview": "개요"}'
@@ -539,6 +540,7 @@ async def test_rfp_analyzer_create_provider_called_when_no_provider(monkeypatch)
     """provider 인자 없을 때 create_provider() 가 호출된다."""
     from app.analysis.rfp_schema import RFPAnalysis
 
+    monkeypatch.delenv("USER_RFP_ANALYZER_LOG", raising=False)
     mock_provider = AsyncMock()
     mock_provider.complete = AsyncMock(
         return_value='{"project_name": "자동 프로바이더", "client_name": "기관", "project_overview": "개요"}'
@@ -551,3 +553,143 @@ async def test_rfp_analyzer_create_provider_called_when_no_provider(monkeypatch)
 
     mock_factory.assert_called_once()
     assert result.project_name == "자동 프로바이더"
+
+
+class _CannedAnalysisProvider:
+    """RFPAnalyzer 테스트용 provider."""
+
+    model = "test-analysis-model"
+
+    def __init__(self, response: str):
+        self.complete = AsyncMock(return_value=response)
+
+
+@pytest.mark.parametrize(
+    ("text", "project_name"),
+    [
+        ('{"project_name": "순수 JSON"}', "순수 JSON"),
+        ('```json\n{"project_name": "json 펜스"}\n```', "json 펜스"),
+        ('```\n{"project_name": "일반 펜스"}\n```', "일반 펜스"),
+        ('분석 결과입니다.\n{"project_name": "군더더기 JSON"}\n감사합니다.', "군더더기 JSON"),
+    ],
+)
+def test_rfp_analyzer_extract_json_success_cases(text, project_name):
+    """RFPAnalyzer JSON 추출 — 순수/펜스/군더더기 케이스."""
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    analyzer = RFPAnalyzer(provider=_CannedAnalysisProvider("{}"))
+
+    assert analyzer._extract_json(text)["project_name"] == project_name
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"project_name": "잘린 JSON"',
+        '```json\n{"project_name": "깨진 JSON"\n```',
+    ],
+)
+def test_rfp_analyzer_extract_json_invalid_returns_empty(text):
+    """RFPAnalyzer JSON 추출 실패 시 빈 dict."""
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    analyzer = RFPAnalyzer(provider=_CannedAnalysisProvider("{}"))
+
+    assert analyzer._extract_json(text) == {}
+
+
+def test_rfp_analyzer_extract_json_skips_broken_fence():
+    """앞쪽 깨진 json 펜스 이후 valid json 펜스를 파싱."""
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    analyzer = RFPAnalyzer(provider=_CannedAnalysisProvider("{}"))
+    text = """
+```json
+{"project_name": "깨진 펜스"
+```
+```json
+{"project_name": "정상 펜스"}
+```
+"""
+
+    assert analyzer._extract_json(text)["project_name"] == "정상 펜스"
+
+
+@pytest.mark.asyncio
+async def test_rfp_analyzer_writes_md_log_when_enabled(tmp_path, monkeypatch):
+    """USER_RFP_ANALYZER_LOG truthy면 request/response md 로그 저장."""
+    from app.analysis import rfp_analyzer as rfp_analyzer_module
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    response = (
+        '{"project_name": "로그 테스트 사업", '
+        '"client_name": "테스트 기관", "project_overview": "개요"}'
+    )
+    provider = _CannedAnalysisProvider(response)
+    monkeypatch.setenv("USER_RFP_ANALYZER_LOG", "true")
+    monkeypatch.setattr(rfp_analyzer_module, "_RFP_LOG_DIR", tmp_path)
+
+    analyzer = RFPAnalyzer(provider=provider)
+    result = await analyzer.execute({"text": "RFP 본문입니다.", "tables": []})
+
+    files = list(tmp_path.glob("*.md"))
+    assert result.project_name == "로그 테스트 사업"
+    assert len(files) == 1
+
+    content = files[0].read_text(encoding="utf-8")
+    assert "## Request — system prompt" in content
+    assert "## Request — user message" in content
+    assert "## Response (raw)" in content
+    assert "RFP 본문입니다." in content
+    assert response in content
+    assert "JSON 파싱 성공: True" in content
+
+
+@pytest.mark.asyncio
+async def test_rfp_analyzer_writes_md_log_when_json_parse_fails(tmp_path, monkeypatch):
+    """JSON 파싱 실패 응답이어도 md 로그 저장."""
+    from app.analysis import rfp_analyzer as rfp_analyzer_module
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    response = '{"project_name": "잘린 응답"'
+    provider = _CannedAnalysisProvider(response)
+    monkeypatch.setenv("USER_RFP_ANALYZER_LOG", "true")
+    monkeypatch.setattr(rfp_analyzer_module, "_RFP_LOG_DIR", tmp_path)
+
+    analyzer = RFPAnalyzer(provider=provider)
+    result = await analyzer.execute({"text": "실패 로그 본문입니다.", "tables": []})
+
+    files = list(tmp_path.glob("*.md"))
+    assert result.project_name == "프로젝트명 미확인"
+    assert len(files) == 1
+
+    content = files[0].read_text(encoding="utf-8")
+    assert "실패 로그 본문입니다." in content
+    assert response in content
+    assert "JSON 파싱 성공: False" in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_value", [None, "false"])
+async def test_rfp_analyzer_does_not_write_md_log_when_disabled(
+    tmp_path,
+    monkeypatch,
+    env_value,
+):
+    """USER_RFP_ANALYZER_LOG 미설정/false면 md 로그 미생성."""
+    from app.analysis import rfp_analyzer as rfp_analyzer_module
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    if env_value is None:
+        monkeypatch.delenv("USER_RFP_ANALYZER_LOG", raising=False)
+    else:
+        monkeypatch.setenv("USER_RFP_ANALYZER_LOG", env_value)
+    monkeypatch.setattr(rfp_analyzer_module, "_RFP_LOG_DIR", tmp_path)
+
+    provider = _CannedAnalysisProvider(
+        '{"project_name": "로그 꺼짐", "client_name": "기관", "project_overview": "개요"}'
+    )
+    analyzer = RFPAnalyzer(provider=provider)
+    await analyzer.execute({"text": "RFP 본문입니다.", "tables": []})
+
+    assert list(tmp_path.glob("*.md")) == []

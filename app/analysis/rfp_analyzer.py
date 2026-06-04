@@ -1,7 +1,9 @@
 """RFP 분석 에이전트"""
 
+from datetime import datetime
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -12,6 +14,7 @@ from app.analysis.rfp_schema import RFPAnalysis
 logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "rfp_analysis.txt"
+_RFP_LOG_DIR = Path("rfp_analyzer_logs")
 
 
 class RFPAnalyzer:
@@ -38,7 +41,8 @@ class RFPAnalyzer:
         Returns:
             RFPAnalysis: 분석된 RFP 정보
         """
-        logger.info("[RFP] 분석 시작: 텍스트 %d자", len(input_data.get("text", "")))
+        input_text = input_data.get("text", "")
+        logger.info("[RFP] 분석 시작: 텍스트 %d자", len(input_text))
         if progress_callback:
             progress_callback(
                 {"step": 1, "total": 3, "message": "RFP 텍스트 준비 중..."}
@@ -50,7 +54,7 @@ class RFPAnalyzer:
             system_prompt = self._get_default_system_prompt()
 
         # 입력 데이터 준비
-        raw_text = self._truncate_text(input_data.get("text", ""), 25000)
+        raw_text = self._truncate_text(input_text, 25000)
         tables_json = json.dumps(
             input_data.get("tables", [])[:10], ensure_ascii=False, indent=2
         )[:5000]
@@ -151,7 +155,15 @@ class RFPAnalyzer:
             )
 
         # JSON 파싱
-        analysis_data = self._extract_json(response)
+        analysis_data, json_parse_success = self._extract_json_with_status(response)
+        self._write_analysis_log(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            response=response,
+            analysis_data=analysis_data,
+            input_text_length=len(input_text),
+            json_parse_success=json_parse_success,
+        )
 
         # 기본값 설정
         analysis_data.setdefault("project_name", "프로젝트명 미확인")
@@ -199,26 +211,113 @@ class RFPAnalyzer:
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         """텍스트에서 JSON 추출"""
-        patterns = [
+        data, _ = self._extract_json_with_status(text)
+        return data
+
+    def _extract_json_with_status(self, text: str) -> tuple[Dict[str, Any], bool]:
+        """텍스트에서 JSON을 추출하고 성공 여부를 함께 반환."""
+        stripped = text.strip()
+
+        candidates = [stripped]
+
+        for pattern in [
             r"```json\s*([\s\S]*?)\s*```",
             r"```\s*([\s\S]*?)\s*```",
-            r"(\{[\s\S]*\})",
-        ]
+        ]:
+            for match in re.finditer(pattern, stripped):
+                candidates.append(match.group(1).strip())
 
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                json_str = match.group(1)
-                try:
-                    return json.loads(json_str)
-                except json.JSONDecodeError:
-                    continue
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and start < end:
+            candidates.append(stripped[start:end + 1])
+
+        for json_str in candidates:
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed, True
 
         logger.error("JSON 추출 실패")
-        return {}
+        return {}, False
 
     def _truncate_text(self, text: str, max_chars: int = 30000) -> str:
         """텍스트 길이 제한"""
         if len(text) <= max_chars:
             return text
         return text[:max_chars] + "\n\n... (텍스트가 잘렸습니다)"
+
+    def _write_analysis_log(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        response: str,
+        analysis_data: Dict[str, Any],
+        input_text_length: int,
+        json_parse_success: bool,
+    ) -> None:
+        """RFP 분석 request/response 진단 로그 저장."""
+        if not _rfp_log_enabled():
+            return
+
+        try:
+            _RFP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            created_at = datetime.now()
+            slug = _slugify_project_name(analysis_data.get("project_name"))
+            path = _RFP_LOG_DIR / f"{created_at:%Y%m%d-%H%M%S-%f}_{slug}.md"
+            provider = self._provider
+            model = (
+                getattr(provider, "model", None)
+                or getattr(provider, "model_name", None)
+                or ""
+            )
+
+            content = "\n".join(
+                [
+                    "# RFP Analyzer Log",
+                    "",
+                    "## Meta",
+                    f"- 생성 시각: {created_at.isoformat(timespec='seconds')}",
+                    f"- provider: {type(provider).__name__}",
+                    f"- model: {model}",
+                    f"- 입력 텍스트 길이: {input_text_length}",
+                    f"- 응답 길이: {len(response)}",
+                    f"- JSON 파싱 성공: {json_parse_success}",
+                    "",
+                    "## Request — system prompt",
+                    "````",
+                    system_prompt,
+                    "````",
+                    "",
+                    "## Request — user message",
+                    "````",
+                    user_message,
+                    "````",
+                    "",
+                    "## Response (raw)",
+                    "````",
+                    response,
+                    "````",
+                    "",
+                ]
+            )
+            path.write_text(content, encoding="utf-8")
+        except Exception as e:
+            logger.warning("RFP 분석 로그 저장 실패: %s", e)
+
+
+def _rfp_log_enabled() -> bool:
+    """USER_RFP_ANALYZER_LOG env가 truthy일 때만 진단 로그 저장."""
+    val = os.environ.get("USER_RFP_ANALYZER_LOG", "false").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _slugify_project_name(project_name: Any) -> str:
+    """project_name을 파일명에 안전한 slug로 변환."""
+    raw = str(project_name or "").strip()
+    raw = re.sub(r"\s+", "_", raw)
+    slug = re.sub(r"[^0-9A-Za-z가-힣._-]", "", raw).strip("._-")
+    return (slug[:80] or "unparsed")
