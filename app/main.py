@@ -3237,9 +3237,9 @@ def api_export_cart_download():
         is_bid = item["item_type"] == "bid"
         label = "입찰공고" if is_bid else "사전규격"
         if is_bid:
-            url = f"https://www.g2b.go.kr/pt/menu/selectSubFrame.do?frm=bidPblancListDtl&bidPblancId={item['item_id']}&bidPblancOrd=000"
+            url = f"https://www.g2b.go.kr/link/PNPE027_01/single/?bidPbancNo={item['item_id']}&bidPbancOrd=000"
         else:
-            url = f"https://www.g2b.go.kr/pt/menu/selectSubFrame.do?frm=bfSpecRgstListDtl&bfSpecRgstNo={item['item_id']}"
+            url = f"https://www.g2b.go.kr/link/PNZO028_01/single/?bfSpecRgstNo={item['item_id']}"
 
         values = [
             label,
