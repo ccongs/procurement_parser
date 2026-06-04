@@ -21,11 +21,12 @@ import logging
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
@@ -2432,3 +2433,64 @@ async def scheduler_start(request: Request):
 async def scheduler_stop():
     scheduler.shutdown_scheduler()
     return RedirectResponse(url="/config?saved=1", status_code=303)
+
+
+# --- Phase 6.2b: 입찰공고 분석 API ------------------------------------------
+
+# 파일 형식 우선순위 (낮을수록 우선).
+_ANALYSIS_PRIORITY: dict[str, int] = {
+    ".pdf": 0,
+    ".docx": 1,
+    ".doc": 2,
+    ".hwp": 3,
+    ".hwpx": 4,
+}
+
+
+@app.post("/api/analysis/bid/{bid_ntce_no}", response_model=AnalysisResponse)
+async def analyze_bid(bid_ntce_no: str) -> AnalysisResponse:
+    """입찰공고 첨부파일에서 제안요청서를 찾아 RFP 분석 결과를 반환한다.
+
+    1. DB에서 첨부파일 목록 조회
+    2. '제안요청서' 키워드 포함 파일명 필터
+    3. 지원 형식 우선순위로 정렬 후 최우선 파일 선택
+    4. analyze_from_url() 로 분석 후 결과 반환
+    """
+    with SessionLocal() as session:
+        notice = session.get(BidNotice, bid_ntce_no)
+        if notice is None:
+            raise HTTPException(status_code=404, detail=f"입찰공고 '{bid_ntce_no}'를 찾을 수 없습니다.")
+        files = repository.get_notice_files(session, bid_ntce_no)
+
+    # '제안요청서' 포함 + 지원 형식 필터
+    candidates = [
+        f for f in files
+        if "제안요청서" in f["name"]
+        and Path(f["url"].split("?")[0]).suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+    # 우선순위 정렬(낮은 값 우선)
+    candidates.sort(
+        key=lambda f: _ANALYSIS_PRIORITY.get(
+            Path(f["url"].split("?")[0]).suffix.lower(), 99
+        )
+    )
+
+    if not candidates:
+        return AnalysisResponse(
+            status="no_file",
+            message="제안요청서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요.",
+        )
+
+    target = candidates[0]
+    result: AnalysisResult = await analyze_from_url(target["url"])
+
+    if result.status == "unsupported":
+        return AnalysisResponse(
+            status="unsupported",
+            message="파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
+        )
+    if result.status == "error":
+        return AnalysisResponse(status="error", message=result.message)
+
+    analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
+    return AnalysisResponse(status="ok", analysis=analysis_dict)
