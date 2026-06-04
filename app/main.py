@@ -2355,22 +2355,16 @@ async def analysis_pre_spec(bf_spec_rgst_no: str):
             )
         files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
 
-    # 지원 형식 URL 순서대로 탐색
-    target_url: str | None = None
-    for f in files:
-        url = f.get("url", "")
-        from pathlib import Path as _Path
-        ext = _Path(url.split("?")[0]).suffix.lower()
-        if ext in SUPPORTED_EXTENSIONS:
-            target_url = url
-            break
-
-    if target_url is None:
+    # 사전규격 URL은 downloadFile.do?fileSeq=N 형태라 URL에서 확장자를 알 수 없음.
+    # 다운로드 후 Content-Disposition 헤더로 파일명·형식을 판별하므로
+    # 첫 번째 URL을 그대로 사용한다.
+    if not files:
         return AnalysisResponse(
             status="no_file",
             analysis=None,
-            message="제안요청서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요.",
+            message="첨부 파일이 없습니다. 파일을 직접 업로드해주세요.",
         )
+    target_url: str = files[0]["url"]
 
     result: AnalysisResult = await analyze_from_url(target_url)
 

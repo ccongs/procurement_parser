@@ -148,12 +148,24 @@ def test_pre_spec_no_file(client):
     assert "업로드" in body["message"]
 
 
-def test_pre_spec_unsupported_format_file(client):
-    """ZIP만 있는 사전규격 → no_file (미지원 형식은 건너뜀)."""
+def test_pre_spec_unsupported_format_file(client, monkeypatch):
+    """ZIP 첨부 사전규격 → URL을 그대로 전달 → unsupported 반환."""
+    mock_result = AnalysisResult(
+        status="unsupported",
+        message="파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
+    )
+
+    async def _mock_analyze_from_url(url: str) -> AnalysisResult:
+        return mock_result
+
+    from app import main as _main
+    monkeypatch.setattr(_main, "analyze_from_url", _mock_analyze_from_url)
+
     resp = client.post("/api/analysis/pre-spec/PS003")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "no_file"
+    # ZIP → analyze_from_url에서 UnsupportedFormatError → unsupported
+    assert body["status"] == "unsupported"
     assert body["analysis"] is None
 
 
