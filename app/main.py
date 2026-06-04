@@ -17,6 +17,7 @@ from __future__ import annotations
 import calendar
 import html
 import io
+import json
 import logging
 import zipfile
 from contextlib import asynccontextmanager
@@ -26,7 +27,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
@@ -44,7 +45,7 @@ from app.api_client import (
     ParamSpec,
 )
 from app.analysis.analyzer_service import (
-    AnalysisResult,
+    AnalysisResult as ServiceAnalysisResult,
     UnsupportedFormatError,
     analyze_file,
     analyze_from_url,
@@ -68,6 +69,8 @@ async def lifespan(app: FastAPI):
     try:
         init_db()  # 테이블+config seed 보장(멱등) 후 게이트 읽기
         with SessionLocal() as session:
+            stale_count = repository.reset_stale_analyzing(session)
+            logger.info("기동 시 중단된 분석 상태 정리: %d건", stale_count)
             cfg = repository.get_config(session)
             enabled = cfg.enabled
             auto_halted = cfg.auto_halted
@@ -2590,96 +2593,428 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
 
-# --- 분석 API (Phase 6.2a) -------------------------------------------
+# --- 분석 API (Phase 8.1) -------------------------------------------
 
 _ANALYSIS_MAX_BYTES = 50 * 1024 * 1024  # 업로드 최대 50MB
 
+# 파일 형식 우선순위 (낮을수록 우선).
+_ANALYSIS_PRIORITY: dict[str, int] = {
+    ".pdf": 0,
+    ".docx": 1,
+    ".doc": 2,
+    ".hwp": 3,
+    ".hwpx": 4,
+}
 
-@app.post("/api/analysis/pre-spec/{bf_spec_rgst_no}", response_model=AnalysisResponse)
-async def analysis_pre_spec(bf_spec_rgst_no: str, response: Response):
-    """사전규격 파일 URL → RFP 분석.
 
-    DB에서 `bf_spec_rgst_no`로 첨부 파일 URL 목록 조회 후
-    지원 형식(.pdf/.hwp/.hwpx/.doc/.docx)을 첫 번째부터 탐색·분석한다.
-    """
+def _normalize_source_type(source_type: str) -> str:
+    """URL/form source_type 값을 DB 저장용 표준값으로 정규화한다."""
+    normalized = (source_type or "").strip().replace("-", "_")
+    if normalized not in {"bid", "pre_spec"}:
+        raise HTTPException(status_code=400, detail="source_type은 bid 또는 pre_spec이어야 합니다.")
+    return normalized
+
+
+def _source_exists(session, source_type: str, source_id: str) -> bool:  # noqa: ANN001
+    """분석 대상 엔티티 존재 여부를 확인한다."""
+    if source_type == "bid":
+        return session.get(BidNotice, source_id) is not None
+    return session.get(PreSpec, source_id) is not None
+
+
+def _find_auto_analysis_url(session, source_type: str, source_id: str) -> str | None:  # noqa: ANN001
+    """기존 첨부 목록 로직으로 자동 분석 대상 URL을 찾는다."""
+    if source_type == "bid":
+        files = repository.get_notice_files(session, source_id)
+        candidates = [
+            f for f in files
+            if "제안요청서" in f["name"]
+            and Path(f["name"]).suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        candidates.sort(
+            key=lambda f: _ANALYSIS_PRIORITY.get(Path(f["name"]).suffix.lower(), 99)
+        )
+        return candidates[0]["url"] if candidates else None
+
+    files = repository.get_pre_spec_files(session, source_id)
+    # 사전규격 파일 URL은 확장자 없는 downloadFile.do 형태가 많아 첫 첨부를 그대로 분석한다.
+    return files[0]["url"] if files else None
+
+
+def _need_upload_message(source_type: str) -> str:
+    if source_type == "bid":
+        return "제안요청서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요."
+    return "첨부 파일이 없습니다. 파일을 직접 업로드해주세요."
+
+
+async def _run_analysis_bg(
+    source_type: str,
+    source_id: str,
+    *,
+    url: str | None = None,
+    file_bytes: bytes | None = None,
+    filename: str | None = None,
+) -> None:
+    """BackgroundTasks 실행 함수. 요청 세션 대신 자체 SessionLocal을 사용한다."""
+    source_type = _normalize_source_type(source_type)
+    try:
+        if url:
+            result: ServiceAnalysisResult = await analyze_from_url(url)
+        elif file_bytes is not None:
+            result = await analyze_file(file_bytes, filename or "upload")
+        else:
+            raise ValueError("분석할 URL 또는 파일이 없습니다.")
+
+        with SessionLocal() as session:
+            if result.status == "ok" and result.analysis is not None:
+                result_json = json.dumps(
+                    result.analysis.model_dump(),
+                    ensure_ascii=False,
+                )
+                repository.set_analysis_done(session, source_type, source_id, result_json)
+            else:
+                repository.set_analysis_error(
+                    session,
+                    source_type,
+                    source_id,
+                    result.message or "분석에 실패했습니다.",
+                )
+    except UnsupportedFormatError as exc:
+        with SessionLocal() as session:
+            repository.set_analysis_error(session, source_type, source_id, str(exc))
+    except Exception as exc:  # noqa: BLE001 — analyzing 고착 방지.
+        logger.exception("분석 백그라운드 작업 실패: %s/%s", source_type, source_id)
+        with SessionLocal() as session:
+            repository.set_analysis_error(session, source_type, source_id, f"분석 중 오류: {exc}")
+
+
+@app.post("/api/analysis/upload")
+async def analysis_upload(
+    background_tasks: BackgroundTasks,
+    response: Response,
+    file: UploadFile = File(...),
+    source_type: str | None = Form(None),
+    source_id: str | None = Form(None),
+    type_alias: str | None = Form(None, alias="type"),
+    id_alias: str | None = Form(None, alias="id"),
+):
+    """수동 파일 업로드 → 분석 시작. 실제 분석은 BackgroundTasks가 수행한다."""
+    source_type_value = source_type or type_alias
+    source_id_value = source_id or id_alias
+    if not source_type_value or not source_id_value:
+        response.status_code = 400
+        return {"status": "error", "message": "source_type과 source_id가 필요합니다."}
+
+    normalized_type = _normalize_source_type(source_type_value)
+    source_id_value = str(source_id_value)
+
     with SessionLocal() as session:
-        spec = session.get(PreSpec, bf_spec_rgst_no)
-        if spec is None:
-            return JSONResponse(
-                {"status": "no_file", "analysis": None, "message": "사전규격을 찾을 수 없습니다."},
-                status_code=404,
-            )
-        files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
+        if not _source_exists(session, normalized_type, source_id_value):
+            raise HTTPException(status_code=404, detail="분석 대상을 찾을 수 없습니다.")
 
-    # 사전규격 URL은 downloadFile.do?fileSeq=N 형태라 URL에서 확장자를 알 수 없음.
-    # 다운로드 후 Content-Disposition 헤더로 파일명·형식을 판별하므로
-    # 첫 번째 URL을 그대로 사용한다.
-    if not files:
-        return AnalysisResponse(
-            status="no_file",
-            analysis=None,
-            message="첨부 파일이 없습니다. 파일을 직접 업로드해주세요.",
-        )
-    target_url: str = files[0]["url"]
-
-    result: AnalysisResult = await analyze_from_url(target_url)
-
-    if result.status == "unsupported":
-        return AnalysisResponse(
-            status="unsupported",
-            analysis=None,
-            message=result.message or "파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
-        )
-    if result.status == "error":
-        response.status_code = 429 if result.error_kind == "rate_limit" else 502
-        return AnalysisResponse(
-            status="error",
-            analysis=None,
-            message=result.message,
-        )
-
-    analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
-    return AnalysisResponse(
-        status=result.status,
-        analysis=analysis_dict,
-        message=result.message,
-    )
-
-
-@app.post("/api/analysis/upload", response_model=AnalysisResponse)
-async def analysis_upload(file: UploadFile, response: Response):
-    """수동 파일 업로드 → RFP 분석.
-
-    지원 형식: .pdf / .hwp / .hwpx / .doc / .docx
-    최대 파일 크기: 50MB
-    """
     file_bytes = await file.read()
     if len(file_bytes) > _ANALYSIS_MAX_BYTES:
         response.status_code = 413
-        return AnalysisResponse(
-            status="error",
-            analysis=None,
-            message="파일 크기가 50MB를 초과합니다.",
-        )
+        return {"status": "error", "message": "파일 크기가 50MB를 초과합니다."}
 
-    try:
-        result: AnalysisResult = await analyze_file(file_bytes, file.filename or "upload")
-    except UnsupportedFormatError:
-        return AnalysisResponse(
-            status="no_file",
-            analysis=None,
-            message="지원하지 않는 파일 형식입니다. PDF, HWP, HWPX, DOC, DOCX만 가능합니다.",
-        )
-
-    if result.status == "error":
-        response.status_code = 429 if result.error_kind == "rate_limit" else 502
-
-    analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
-    return AnalysisResponse(
-        status=result.status,
-        analysis=analysis_dict,
-        message=result.message,
+    with SessionLocal() as session:
+        repository.start_analysis(session, normalized_type, source_id_value, "upload")
+    background_tasks.add_task(
+        _run_analysis_bg,
+        normalized_type,
+        source_id_value,
+        file_bytes=file_bytes,
+        filename=file.filename or "upload",
     )
+    return {"status": "analyzing"}
+
+
+@app.post("/api/analysis/{source_type}/{source_id}")
+async def analysis_trigger(
+    source_type: str,
+    source_id: str,
+    background_tasks: BackgroundTasks,
+):
+    """자동 후보 탐색 후 분석을 비동기로 시작한다."""
+    normalized_type = _normalize_source_type(source_type)
+    with SessionLocal() as session:
+        if not _source_exists(session, normalized_type, source_id):
+            raise HTTPException(status_code=404, detail="분석 대상을 찾을 수 없습니다.")
+        existing = repository.get_analysis(session, normalized_type, source_id)
+        if existing is not None and existing.status == "analyzing":
+            return {"status": "analyzing"}
+
+        target_url = _find_auto_analysis_url(session, normalized_type, source_id)
+        if not target_url:
+            return {
+                "status": "need_upload",
+                "message": _need_upload_message(normalized_type),
+            }
+        repository.start_analysis(session, normalized_type, source_id, "auto")
+
+    background_tasks.add_task(
+        _run_analysis_bg,
+        normalized_type,
+        source_id,
+        url=target_url,
+    )
+    return {"status": "analyzing"}
+
+
+@app.get("/api/analysis/{source_type}/{source_id}/status")
+def analysis_status(source_type: str, source_id: str):
+    """분석 상태 폴링용 JSON."""
+    normalized_type = _normalize_source_type(source_type)
+    with SessionLocal() as session:
+        row = repository.get_analysis(session, normalized_type, source_id)
+        if row is None:
+            return {"status": "none"}
+        updated_at = row.updated_at.isoformat() if row.updated_at else None
+        return {
+            "status": row.status,
+            "source_kind": row.source_kind,
+            "updated_at": updated_at,
+        }
+
+
+def _analysis_page_shell(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{_e(title)}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           margin: 0; background: #f4f5f7; color: #1f2430; }}
+    header {{ background: #1f3a5f; color: #fff; padding: 14px 24px; }}
+    header h1 {{ margin: 0; font-size: 18px; }}
+    main {{ max-width: 1120px; margin: 0 auto; padding: 20px; }}
+    .card {{ background: #fff; border-radius: 8px; padding: 18px 20px; margin-bottom: 16px;
+             box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+    h2 {{ margin: 0 0 12px; font-size: 16px; color: #1f3a5f; }}
+    h3 {{ margin: 12px 0 8px; font-size: 14px; color: #334155; }}
+    p {{ font-size: 13px; line-height: 1.6; margin: 6px 0; }}
+    ul, ol {{ margin: 0; padding-left: 22px; font-size: 13px; line-height: 1.7; }}
+    li {{ margin: 3px 0; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
+    th, td {{ border: 1px solid #e2e5ea; padding: 7px 9px; text-align: left; vertical-align: top; }}
+    th {{ background: #f0f3f8; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 14px; }}
+    .label {{ color: #6b7280; font-weight: 600; margin-right: 6px; }}
+    .muted {{ color: #8a93a2; }}
+    .theme {{ border: 1px solid #d9e0ea; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }}
+    .pre {{ white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <header><h1>{_e(title)}</h1></header>
+  <main>{body}</main>
+</body>
+</html>"""
+
+
+def _li_items(items: list[Any]) -> str:
+    if not items:
+        return '<li class="muted">없음</li>'
+    return "".join(f"<li>{_e(item)}</li>" for item in items)
+
+
+def _render_requirements(title: str, items: list[dict[str, Any]]) -> str:
+    if not items:
+        content = '<li class="muted">없음</li>'
+    else:
+        parts = []
+        for item in items:
+            head = (
+                f"[{_e(item.get('category'))}] "
+                f"{_e(item.get('requirement'))} "
+                f"({_e(item.get('priority'))})"
+            )
+            notes = item.get("notes")
+            tail = f" — {_e(notes)}" if notes else ""
+            parts.append(f"<li>{head}{tail}</li>")
+        content = "".join(parts)
+    return f'<section class="card"><h2>{_e(title)}</h2><ol>{content}</ol></section>'
+
+
+def _render_budget(budget: dict[str, Any] | None) -> str:
+    if not budget:
+        return '<section class="card"><h2>예산 정보</h2><p class="muted">없음</p></section>'
+    breakdown = budget.get("budget_breakdown")
+    breakdown_html = ""
+    if isinstance(breakdown, dict) and breakdown:
+        breakdown_html = "<h3>세부 예산</h3><ul>" + "".join(
+            f"<li><span class=\"label\">{_e(k)}</span>{_e(v)}</li>"
+            for k, v in breakdown.items()
+        ) + "</ul>"
+    return f"""
+    <section class="card">
+      <h2>예산 정보</h2>
+      <div class="grid">
+        <p><span class="label">총 예산</span>{_e(budget.get('total_budget'))}</p>
+        <p><span class="label">지급 조건</span>{_e(budget.get('payment_terms'))}</p>
+        <p><span class="label">비고</span>{_e(budget.get('notes'))}</p>
+      </div>
+      {breakdown_html}
+    </section>"""
+
+
+def _render_timeline(timeline: dict[str, Any] | None) -> str:
+    if not timeline:
+        return '<section class="card"><h2>일정 정보</h2><p class="muted">없음</p></section>'
+    phases = timeline.get("phases") or []
+    phase_items = []
+    if isinstance(phases, list):
+        for phase in phases:
+            if isinstance(phase, dict):
+                phase_items.append(
+                    f"<li>{_e(phase.get('name'))} — {_e(phase.get('duration'))}</li>"
+                )
+    milestones = timeline.get("milestones") or []
+    milestone_items = []
+    if isinstance(milestones, list):
+        for milestone in milestones:
+            if isinstance(milestone, dict):
+                milestone_items.append(
+                    f"<li>{_e(milestone.get('name'))} — {_e(milestone.get('date'))}</li>"
+                )
+    return f"""
+    <section class="card">
+      <h2>일정 정보</h2>
+      <div class="grid">
+        <p><span class="label">전체 기간</span>{_e(timeline.get('total_duration'))}</p>
+        <p><span class="label">시작일</span>{_e(timeline.get('start_date'))}</p>
+        <p><span class="label">종료일</span>{_e(timeline.get('end_date'))}</p>
+      </div>
+      <h3>단계</h3><ul>{''.join(phase_items) if phase_items else '<li class="muted">없음</li>'}</ul>
+      <h3>마일스톤</h3><ul>{''.join(milestone_items) if milestone_items else '<li class="muted">없음</li>'}</ul>
+    </section>"""
+
+
+def _render_eval_table(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return '<section class="card"><h2>평가 기준</h2><p class="muted">없음</p></section>'
+    rows = "".join(
+        "<tr>"
+        f"<td>{_e(item.get('category'))}</td>"
+        f"<td>{_e(item.get('item'))}</td>"
+        f"<td>{_e(item.get('weight'))}</td>"
+        f"<td>{_e(item.get('description'))}</td>"
+        "</tr>"
+        for item in items
+    )
+    return f"""
+    <section class="card">
+      <h2>평가 기준</h2>
+      <table>
+        <thead><tr><th>구분</th><th>항목</th><th>배점</th><th>설명</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </section>"""
+
+
+def _render_deliverables(items: list[dict[str, Any]]) -> str:
+    if not items:
+        content = '<li class="muted">없음</li>'
+    else:
+        content = "".join(
+            f"<li>{_e(item.get('name'))} — {_e(item.get('description'))} ({_e(item.get('phase'))})</li>"
+            for item in items
+        )
+    return f'<section class="card"><h2>산출물</h2><ul>{content}</ul></section>'
+
+
+def _render_win_themes(items: list[dict[str, Any]]) -> str:
+    if not items:
+        body = '<p class="muted">없음</p>'
+    else:
+        body = "".join(
+            "<div class=\"theme\">"
+            f"<h3>{_e(item.get('name'))}</h3>"
+            f"<p><span class=\"label\">근거</span>{_e(item.get('rationale'))}</p>"
+            f"<p><span class=\"label\">RFP 정합성</span>{_e(item.get('rfp_alignment'))}</p>"
+            "</div>"
+            for item in items
+        )
+    return f'<section class="card"><h2>Win Theme 후보</h2>{body}</section>'
+
+
+def _render_json_block(title: str, value: Any) -> str:
+    if value is None:
+        return f'<section class="card"><h2>{_e(title)}</h2><p class="muted">없음</p></section>'
+    text = json.dumps(value, ensure_ascii=False, indent=2)
+    return f'<section class="card"><h2>{_e(title)}</h2><div class="pre">{_e(text)}</div></section>'
+
+
+def _render_analysis_html(data: dict[str, Any]) -> str:
+    string_list_fields = [
+        ("핵심 성공 요인", "key_success_factors"),
+        ("잠재 리스크", "potential_risks"),
+        ("차별화 포인트", "differentiation_points"),
+        ("Pain Points", "pain_points"),
+        ("숨겨진 니즈", "hidden_needs"),
+    ]
+    list_sections = "".join(
+        f'<section class="card"><h2>{_e(title)}</h2><ul>{_li_items(data.get(key) or [])}</ul></section>'
+        for title, key in string_list_fields
+    )
+    return f"""
+    <section class="card">
+      <h2>프로젝트 기본 정보</h2>
+      <div class="grid">
+        <p><span class="label">프로젝트명</span>{_e(data.get('project_name'))}</p>
+        <p><span class="label">발주처</span>{_e(data.get('client_name'))}</p>
+        <p><span class="label">유형</span>{_e(data.get('project_type'))}</p>
+      </div>
+      <h3>사업 개요</h3>
+      <p>{_e(data.get('project_overview'))}</p>
+    </section>
+    {_render_budget(data.get('budget'))}
+    {_render_timeline(data.get('timeline'))}
+    {_render_requirements('핵심 요구사항', data.get('key_requirements') or [])}
+    {_render_requirements('기술 요구사항', data.get('technical_requirements') or [])}
+    {_render_requirements('기능 요구사항', data.get('functional_requirements') or [])}
+    {_render_eval_table(data.get('evaluation_criteria') or [])}
+    {_render_deliverables(data.get('deliverables') or [])}
+    {list_sections}
+    <section class="card"><h2>수주 전략</h2><p>{_e(data.get('winning_strategy'))}</p></section>
+    <section class="card"><h2>예상 경쟁 환경</h2><p>{_e(data.get('competitive_landscape'))}</p></section>
+    {_render_json_block('평가 전략', data.get('evaluation_strategy'))}
+    {_render_win_themes(data.get('win_theme_candidates') or [])}
+    {_render_json_block('원본 섹션', data.get('raw_sections'))}
+    """
+
+
+@app.get("/analysis/{source_type}/{source_id}", response_class=HTMLResponse)
+def analysis_page(source_type: str, source_id: str) -> HTMLResponse:
+    """새 창에서 보는 서버 렌더 분석 결과 페이지."""
+    normalized_type = _normalize_source_type(source_type)
+    with SessionLocal() as session:
+        row = repository.get_analysis(session, normalized_type, source_id)
+
+    if row is None:
+        body = '<section class="card"><h2>분석 결과 없음</h2><p>아직 분석을 시작하지 않았습니다.</p></section>'
+    elif row.status == "analyzing":
+        body = '<section class="card"><h2>분석 중</h2><p>분석이 아직 완료되지 않았습니다.</p></section>'
+    elif row.status == "error":
+        body = (
+            '<section class="card"><h2>분석 오류</h2>'
+            f"<p>{_e(row.error_message or '분석 중 오류가 발생했습니다.')}</p></section>"
+        )
+    else:
+        try:
+            parsed = json.loads(row.result_json or "{}")
+        except json.JSONDecodeError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            body = '<section class="card"><h2>분석 결과 오류</h2><p>저장된 결과를 읽을 수 없습니다.</p></section>'
+        else:
+            body = _render_analysis_html(parsed)
+
+    return HTMLResponse(_analysis_page_shell("RFP 분석 결과", body))
 
 
 # --- /config ---------------------------------------------------------
@@ -3120,69 +3455,6 @@ async def scheduler_start(request: Request):
 async def scheduler_stop():
     scheduler.shutdown_scheduler()
     return RedirectResponse(url="/config?saved=1", status_code=303)
-
-
-# --- Phase 6.2b: 입찰공고 분석 API ------------------------------------------
-
-# 파일 형식 우선순위 (낮을수록 우선).
-_ANALYSIS_PRIORITY: dict[str, int] = {
-    ".pdf": 0,
-    ".docx": 1,
-    ".doc": 2,
-    ".hwp": 3,
-    ".hwpx": 4,
-}
-
-
-@app.post("/api/analysis/bid/{bid_ntce_no}", response_model=AnalysisResponse)
-async def analyze_bid(bid_ntce_no: str, response: Response) -> AnalysisResponse:
-    """입찰공고 첨부파일에서 제안요청서를 찾아 RFP 분석 결과를 반환한다.
-
-    1. DB에서 첨부파일 목록 조회
-    2. '제안요청서' 키워드 포함 파일명 필터
-    3. 지원 형식 우선순위로 정렬 후 최우선 파일 선택
-    4. analyze_from_url() 로 분석 후 결과 반환
-    """
-    with SessionLocal() as session:
-        notice = session.get(BidNotice, bid_ntce_no)
-        if notice is None:
-            raise HTTPException(status_code=404, detail=f"입찰공고 '{bid_ntce_no}'를 찾을 수 없습니다.")
-        files = repository.get_notice_files(session, bid_ntce_no)
-
-    # '제안요청서' 포함 + 지원 형식 필터
-    # URL은 downloadFile.do?fileSeq=N 형태라 확장자가 없으므로 파일명에서 추출
-    candidates = [
-        f for f in files
-        if "제안요청서" in f["name"]
-        and Path(f["name"]).suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
-    # 우선순위 정렬(낮은 값 우선)
-    candidates.sort(
-        key=lambda f: _ANALYSIS_PRIORITY.get(
-            Path(f["name"]).suffix.lower(), 99
-        )
-    )
-
-    if not candidates:
-        return AnalysisResponse(
-            status="no_file",
-            message="제안요청서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요.",
-        )
-
-    target = candidates[0]
-    result: AnalysisResult = await analyze_from_url(target["url"])
-
-    if result.status == "unsupported":
-        return AnalysisResponse(
-            status="unsupported",
-            message="파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
-        )
-    if result.status == "error":
-        response.status_code = 429 if result.error_kind == "rate_limit" else 502
-        return AnalysisResponse(status="error", message=result.message)
-
-    analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
-    return AnalysisResponse(status="ok", analysis=analysis_dict)
 
 
 # --- Phase 7.1: 검토 목록 장바구니 ---

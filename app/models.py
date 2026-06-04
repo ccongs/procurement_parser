@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -27,6 +27,11 @@ from sqlalchemy import (
 )
 
 from app.db import Base
+
+
+def _utcnow() -> datetime:
+    """DB 저장용 naive UTC 시각."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class BidNotice(Base):
@@ -240,6 +245,29 @@ class PreSpec(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<PreSpec {self.bf_spec_rgst_no!r} sw={self.sw_biz_obj_yn!r}>"
+
+
+class AnalysisResult(Base):
+    """RFP 분석 결과 캐시 — 공고/사전규격 1건당 최신 분석 1행."""
+
+    __tablename__ = "analysis_result"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_type = Column(Text, nullable=False)       # "bid" | "pre_spec"
+    source_id = Column(Text, nullable=False)         # bid_ntce_no | bf_spec_rgst_no
+    status = Column(Text, nullable=False)            # "analyzing" | "done" | "error"
+    result_json = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    source_kind = Column(Text, nullable=True)        # "auto" | "upload"
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_id", name="uq_analysis_result_source"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 디버그용
+        return f"<AnalysisResult {self.source_type!r}/{self.source_id!r} status={self.status!r}>"
 
 
 # --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------

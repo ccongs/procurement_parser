@@ -11,13 +11,20 @@ bid_notice upsert, halt 플래그·last_success_dt 갱신.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import AppConfig, BidNotice, CollectionRun, ExportCartItem, PreSpec
+from app.models import (
+    AnalysisResult,
+    AppConfig,
+    BidNotice,
+    CollectionRun,
+    ExportCartItem,
+    PreSpec,
+)
 
 # bid_notice 에 실제 존재하는 컬럼명 집합 — values dict 중 컬럼이 아닌 키는 무시한다.
 _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
@@ -28,6 +35,11 @@ _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
 _PRE_SPEC_COLUMNS: frozenset[str] = frozenset(
     c.name for c in PreSpec.__table__.columns
 )
+
+
+def _utcnow() -> datetime:
+    """DB 저장용 naive UTC 시각."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # --- 설정 ----------------------------------------------------------------
@@ -566,6 +578,137 @@ def get_pre_spec_files(session: Session, bf_spec_rgst_no: str) -> list[dict[str,
             continue
         files.append({"idx": i, "name": f"첨부{i}", "url": url})
     return files
+
+
+# --- 분석 결과 영속화 (Phase 8.1) -----------------------------------------
+
+def get_analysis(
+    session: Session,
+    source_type: str,
+    source_id: str,
+) -> AnalysisResult | None:
+    """분석 결과 행 1건 조회. 없으면 None."""
+    stmt = select(AnalysisResult).where(
+        AnalysisResult.source_type == source_type,
+        AnalysisResult.source_id == source_id,
+    )
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def start_analysis(
+    session: Session,
+    source_type: str,
+    source_id: str,
+    source_kind: str,
+) -> None:
+    """분석 시작 상태로 upsert 한다. 기존 완료/오류 결과는 새 분석으로 덮는다."""
+    now = _utcnow()
+    row = get_analysis(session, source_type, source_id)
+    if row is None:
+        row = AnalysisResult(
+            source_type=source_type,
+            source_id=source_id,
+            status="analyzing",
+            result_json=None,
+            error_message=None,
+            source_kind=source_kind,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    else:
+        row.status = "analyzing"
+        row.result_json = None
+        row.error_message = None
+        row.source_kind = source_kind
+        row.updated_at = now
+    session.commit()
+
+
+def set_analysis_done(
+    session: Session,
+    source_type: str,
+    source_id: str,
+    result_json: str,
+) -> None:
+    """분석 성공 결과 JSON을 저장하고 done 상태로 전환한다."""
+    now = _utcnow()
+    row = get_analysis(session, source_type, source_id)
+    if row is None:
+        row = AnalysisResult(
+            source_type=source_type,
+            source_id=source_id,
+            status="done",
+            result_json=result_json,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    else:
+        row.status = "done"
+        row.result_json = result_json
+        row.error_message = None
+        row.updated_at = now
+    session.commit()
+
+
+def set_analysis_error(
+    session: Session,
+    source_type: str,
+    source_id: str,
+    message: str,
+) -> None:
+    """분석 실패 메시지를 저장하고 error 상태로 전환한다."""
+    now = _utcnow()
+    row = get_analysis(session, source_type, source_id)
+    if row is None:
+        row = AnalysisResult(
+            source_type=source_type,
+            source_id=source_id,
+            status="error",
+            result_json=None,
+            error_message=message,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    else:
+        row.status = "error"
+        row.error_message = message
+        row.updated_at = now
+    session.commit()
+
+
+def reset_stale_analyzing(session: Session) -> int:
+    """기동 시 남은 analyzing 행을 재시작 중단 오류로 정리하고 개수를 반환한다."""
+    rows = list(
+        session.execute(
+            select(AnalysisResult).where(AnalysisResult.status == "analyzing")
+        ).scalars()
+    )
+    now = _utcnow()
+    for row in rows:
+        row.status = "error"
+        row.error_message = "서버 재시작으로 중단됨"
+        row.updated_at = now
+    session.commit()
+    return len(rows)
+
+
+def get_analysis_status_map(
+    session: Session,
+    source_type: str,
+    source_ids: list[str],
+) -> dict[str, str]:
+    """목록 렌더용 상태 맵. source_ids 전체를 한 번의 SELECT로 조회한다."""
+    if not source_ids:
+        return {}
+    stmt = select(AnalysisResult.source_id, AnalysisResult.status).where(
+        AnalysisResult.source_type == source_type,
+        AnalysisResult.source_id.in_(source_ids),
+    )
+    return {source_id: status for source_id, status in session.execute(stmt).all()}
 
 
 # --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------
