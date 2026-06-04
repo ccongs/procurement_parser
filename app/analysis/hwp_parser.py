@@ -1,4 +1,7 @@
-"""HWP 5.x 바이너리 텍스트 추출 (olefile 기반, LibreOffice 불필요).
+"""HWP/HWPX 텍스트 추출 (LibreOffice 불필요).
+
+HWP 5.x (OLE2): olefile로 BodyText/Section0 레코드 파싱
+HWPX (ZIP+XML): zipfile로 Contents/section0.xml의 hp:t 태그 추출
 
 HWP 레코드 구조:
   - 4바이트 헤더: bits[0:9]=tag_id, bits[10:19]=level, bits[20:31]=size
@@ -8,6 +11,8 @@ HWP 레코드 구조:
 """
 import re
 import struct
+import xml.etree.ElementTree as ET
+import zipfile
 import zlib
 from pathlib import Path
 
@@ -45,6 +50,51 @@ def extract_text(hwp_path: Path) -> str:
     text = re.sub(r"[ \t]+", " ", "".join(texts))
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
+
+def extract_hwpx_text(hwpx_path: Path) -> str:
+    """HWPX(ZIP+XML) 파일에서 텍스트 추출.
+
+    Contents/section0.xml 의 hp:t 태그를 순서대로 읽는다.
+    section0.xml이 없으면 Preview/PrvText.txt 로 폴백.
+    실패 시 HWPParseError.
+    """
+    try:
+        zf = zipfile.ZipFile(str(hwpx_path))
+    except Exception as e:
+        raise HWPParseError(f"ZIP 열기 실패: {e}") from e
+
+    with zf:
+        names = zf.namelist()
+
+        # 본문 XML 파싱
+        section_files = sorted(n for n in names if re.match(r"Contents/section\d+\.xml", n))
+        if section_files:
+            texts: list[str] = []
+            for sec in section_files:
+                try:
+                    xml_bytes = zf.read(sec)
+                    root = ET.fromstring(xml_bytes)
+                    for elem in root.iter():
+                        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                        if tag == "t" and elem.text:
+                            texts.append(elem.text)
+                        elif tag == "br":
+                            texts.append("\n")
+                except ET.ParseError:
+                    continue
+            if texts:
+                text = re.sub(r"[ \t]+", " ", "".join(texts))
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                return text
+
+        # 폴백: 미리보기 텍스트
+        if "Preview/PrvText.txt" in names:
+            prv = zf.read("Preview/PrvText.txt").decode("utf-8", errors="replace").strip()
+            if prv:
+                return prv
+
+    raise HWPParseError("텍스트를 추출할 수 있는 스트림을 찾지 못했습니다.")
 
 
 def _parse_records(data: bytes) -> list[str]:

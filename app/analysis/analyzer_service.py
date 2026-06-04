@@ -14,7 +14,7 @@ import httpx
 from app.analysis.doc_converter import DocConversionError, convert_to_pdf
 from app.analysis.docx_parser import DOCXParser
 from app.analysis.hwp_parser import HWPParseError
-from app.analysis.hwp_parser import extract_text as hwp_extract_text
+from app.analysis.hwp_parser import extract_hwpx_text, extract_text as hwp_extract_text
 from app.analysis.pdf_parser import PDFParser
 from app.analysis.rfp_analyzer import RFPAnalyzer
 from app.analysis.rfp_schema import RFPAnalysis
@@ -89,13 +89,21 @@ async def analyze_file(file_bytes: bytes, filename: str) -> AnalysisResult:
                 text = DOCXParser().extract_text(src)
                 logger.info("[분석] DOCX 추출 완료: %d자", len(text))
 
-            elif ext in (".hwp", ".hwpx"):
-                logger.info("[분석] HWP 직접 파싱 시작: %s", ext)
+            elif ext == ".hwp":
+                logger.info("[분석] HWP(OLE) 직접 파싱 시작")
                 try:
                     text = hwp_extract_text(src)
                     logger.info("[분석] HWP 파싱 완료: %d자", len(text))
                 except HWPParseError as e:
                     raise DocConversionError(f"HWP 파싱 실패: {e}") from e
+
+            elif ext == ".hwpx":
+                logger.info("[분석] HWPX(ZIP+XML) 직접 파싱 시작")
+                try:
+                    text = extract_hwpx_text(src)
+                    logger.info("[분석] HWPX 파싱 완료: %d자", len(text))
+                except HWPParseError as e:
+                    raise DocConversionError(f"HWPX 파싱 실패: {e}") from e
 
             else:  # .doc
                 logger.info("[분석] LibreOffice 변환 시작: %s", ext)
@@ -117,14 +125,20 @@ async def analyze_file(file_bytes: bytes, filename: str) -> AnalysisResult:
 
 def _extract_filename(resp: httpx.Response, fallback_url: str) -> str:
     """Content-Disposition 헤더에서 파일명 추출, 없으면 URL 마지막 경로 세그먼트."""
+    from urllib.parse import unquote
     cd = resp.headers.get("content-disposition", "")
     for part in cd.split(";"):
         part = part.strip()
-        if part.startswith("filename=") or part.startswith("filename*="):
-            name = part.split("=", 1)[1].strip().strip('"')
-            # RFC 5987 인코딩 처리
-            if "UTF-8''" in name:
-                from urllib.parse import unquote
+        if part.startswith("filename*="):
+            name = part.split("=", 1)[1].strip()
+            # RFC 5987: filename*=UTF-8''encoded-name
+            if "UTF-8''" in name.upper():
                 name = unquote(name.split("''", 1)[1])
+            return name
+        if part.startswith("filename="):
+            name = part.split("=", 1)[1].strip().strip('"')
+            # 나라장터는 filename=에 percent-encode 사용
+            if "%" in name:
+                name = unquote(name)
             return name
     return Path(fallback_url.split("?")[0]).name or "document"

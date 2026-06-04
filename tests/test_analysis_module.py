@@ -368,7 +368,7 @@ async def test_analyze_file_hwpx_ok():
         project_overview="개요",
     )
 
-    with patch("app.analysis.analyzer_service.hwp_extract_text", return_value="HWPX 텍스트") as mock_hwp, \
+    with patch("app.analysis.analyzer_service.extract_hwpx_text", return_value="HWPX 텍스트") as mock_hwpx, \
          patch("app.analysis.analyzer_service.RFPAnalyzer") as mock_analyzer_cls:
 
         mock_analyzer_cls.return_value.execute = AsyncMock(return_value=mock_rfp)
@@ -376,7 +376,7 @@ async def test_analyze_file_hwpx_ok():
         result = await analyze_file(b"HWPX data", "test.hwpx")
 
     assert result.status == "ok"
-    mock_hwp.assert_called_once()
+    mock_hwpx.assert_called_once()
 
 
 @pytest.mark.asyncio
