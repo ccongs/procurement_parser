@@ -35,6 +35,20 @@ class AnalysisResult:
     status: Literal["ok", "no_file", "unsupported", "error"]
     analysis: RFPAnalysis | None = None
     message: str = ""
+    error_kind: str | None = None
+
+
+def _classify_error(exc: Exception) -> str:
+    """LLM/provider 예외를 SDK 의존 없이 HTTP 매핑용으로 분류."""
+    exc_name = type(exc).__name__
+    if exc_name in {"ResourceExhausted", "RateLimitError", "TooManyRequests"}:
+        return "rate_limit"
+    if getattr(exc, "status_code", None) == 429 or getattr(exc, "code", None) == 429:
+        return "rate_limit"
+    message = str(exc).lower()
+    if any(token in message for token in ("429", "quota", "rate limit", "resourceexhausted")):
+        return "rate_limit"
+    return "processing"
 
 
 async def analyze_from_url(url: str) -> AnalysisResult:
@@ -58,7 +72,7 @@ async def analyze_from_url(url: str) -> AnalysisResult:
         )
     except Exception as e:
         logger.error("[분석] URL 처리 예외: %s", e, exc_info=True)
-        return AnalysisResult(status="error", message=f"분석 중 오류: {e}")
+        return AnalysisResult(status="error", message=f"분석 중 오류: {e}", error_kind=_classify_error(e))
 
 
 async def analyze_file(file_bytes: bytes, filename: str) -> AnalysisResult:
@@ -122,7 +136,7 @@ async def analyze_file(file_bytes: bytes, filename: str) -> AnalysisResult:
         raise
     except Exception as e:
         logger.error("[분석] 처리 중 예외: %s", e, exc_info=True)
-        return AnalysisResult(status="error", message=f"분석 중 오류: {e}")
+        return AnalysisResult(status="error", message=f"분석 중 오류: {e}", error_kind=_classify_error(e))
 
 
 def _extract_filename(resp: httpx.Response, fallback_url: str) -> str:

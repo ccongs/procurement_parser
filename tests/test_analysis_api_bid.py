@@ -222,10 +222,25 @@ def test_bid_analysis_error(client):
     with patch("app.main.analyze_from_url", new_callable=AsyncMock, return_value=mock_result):
         resp = client.post("/api/analysis/bid/TEST-ONLYHWP")
 
-    assert resp.status_code == 200
+    assert resp.status_code == 502
     body = resp.json()
     assert body["status"] == "error"
     assert "오류" in body["message"]
+
+
+def test_bid_analysis_rate_limit_error(client):
+    """analyze_from_url이 rate_limit error 반환 → HTTP 429 + status=error."""
+    mock_result = AnalysisResult(
+        status="error",
+        message="분석 중 오류: quota exceeded",
+        error_kind="rate_limit",
+    )
+    with patch("app.main.analyze_from_url", new_callable=AsyncMock, return_value=mock_result):
+        resp = client.post("/api/analysis/bid/TEST-ONLYHWP")
+
+    assert resp.status_code == 429
+    body = resp.json()
+    assert body["status"] == "error"
 
 
 def test_get_notice_files_ordering(tmp_path, monkeypatch):

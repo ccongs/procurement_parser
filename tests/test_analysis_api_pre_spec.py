@@ -211,7 +211,7 @@ def test_pre_spec_analysis_error_result(client, monkeypatch):
     monkeypatch.setattr(_main, "analyze_from_url", _mock_analyze_from_url)
 
     resp = client.post("/api/analysis/pre-spec/PS001")
-    assert resp.status_code == 200
+    assert resp.status_code == 502
     body = resp.json()
     assert body["status"] == "error"
     assert body["analysis"] is None
@@ -295,7 +295,7 @@ def test_upload_file_too_large(client):
         "/api/analysis/upload",
         files={"file": ("big.pdf", large_bytes, "application/pdf")},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 413
     body = resp.json()
     assert body["status"] == "error"
     assert "50MB" in body["message"]
@@ -318,7 +318,7 @@ def test_upload_analysis_error(client, monkeypatch):
         "/api/analysis/upload",
         files={"file": ("test.pdf", b"%PDF-1.4", "application/pdf")},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 502
     body = resp.json()
     assert body["status"] == "error"
     assert body["analysis"] is None

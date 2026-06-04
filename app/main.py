@@ -2596,7 +2596,7 @@ _ANALYSIS_MAX_BYTES = 50 * 1024 * 1024  # 업로드 최대 50MB
 
 
 @app.post("/api/analysis/pre-spec/{bf_spec_rgst_no}", response_model=AnalysisResponse)
-async def analysis_pre_spec(bf_spec_rgst_no: str):
+async def analysis_pre_spec(bf_spec_rgst_no: str, response: Response):
     """사전규격 파일 URL → RFP 분석.
 
     DB에서 `bf_spec_rgst_no`로 첨부 파일 URL 목록 조회 후
@@ -2630,6 +2630,13 @@ async def analysis_pre_spec(bf_spec_rgst_no: str):
             analysis=None,
             message=result.message or "파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
         )
+    if result.status == "error":
+        response.status_code = 429 if result.error_kind == "rate_limit" else 502
+        return AnalysisResponse(
+            status="error",
+            analysis=None,
+            message=result.message,
+        )
 
     analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
     return AnalysisResponse(
@@ -2640,7 +2647,7 @@ async def analysis_pre_spec(bf_spec_rgst_no: str):
 
 
 @app.post("/api/analysis/upload", response_model=AnalysisResponse)
-async def analysis_upload(file: UploadFile):
+async def analysis_upload(file: UploadFile, response: Response):
     """수동 파일 업로드 → RFP 분석.
 
     지원 형식: .pdf / .hwp / .hwpx / .doc / .docx
@@ -2648,6 +2655,7 @@ async def analysis_upload(file: UploadFile):
     """
     file_bytes = await file.read()
     if len(file_bytes) > _ANALYSIS_MAX_BYTES:
+        response.status_code = 413
         return AnalysisResponse(
             status="error",
             analysis=None,
@@ -2662,6 +2670,9 @@ async def analysis_upload(file: UploadFile):
             analysis=None,
             message="지원하지 않는 파일 형식입니다. PDF, HWP, HWPX, DOC, DOCX만 가능합니다.",
         )
+
+    if result.status == "error":
+        response.status_code = 429 if result.error_kind == "rate_limit" else 502
 
     analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
     return AnalysisResponse(
@@ -3124,7 +3135,7 @@ _ANALYSIS_PRIORITY: dict[str, int] = {
 
 
 @app.post("/api/analysis/bid/{bid_ntce_no}", response_model=AnalysisResponse)
-async def analyze_bid(bid_ntce_no: str) -> AnalysisResponse:
+async def analyze_bid(bid_ntce_no: str, response: Response) -> AnalysisResponse:
     """입찰공고 첨부파일에서 제안요청서를 찾아 RFP 분석 결과를 반환한다.
 
     1. DB에서 첨부파일 목록 조회
@@ -3167,6 +3178,7 @@ async def analyze_bid(bid_ntce_no: str) -> AnalysisResponse:
             message="파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
         )
     if result.status == "error":
+        response.status_code = 429 if result.error_kind == "rate_limit" else 502
         return AnalysisResponse(status="error", message=result.message)
 
     analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
