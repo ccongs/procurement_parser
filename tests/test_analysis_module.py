@@ -637,6 +637,29 @@ async def test_rfp_analyzer_writes_md_log_when_enabled(tmp_path, monkeypatch):
     assert len(files) == 1
 
     content = files[0].read_text(encoding="utf-8")
+    system_prompt, user_message = provider.complete.await_args.args
+    system_prompt_bytes = len(system_prompt.encode("utf-8"))
+    user_message_bytes = len(user_message.encode("utf-8"))
+    request_chars = len(system_prompt) + len(user_message)
+    request_bytes = system_prompt_bytes + user_message_bytes
+    response_bytes = len(response.encode("utf-8"))
+
+    assert "## 데이터 크기" in content
+    assert (
+        f"Request — system prompt: {len(system_prompt)}자 / {system_prompt_bytes} bytes"
+        in content
+    )
+    assert (
+        f"Request — user message: {len(user_message)}자 / {user_message_bytes} bytes"
+        in content
+    )
+    assert f"Request 합계: {request_chars}자 / {request_bytes} bytes" in content
+    assert f"Response: {len(response)}자 / {response_bytes} bytes" in content
+    assert (
+        "토큰(근사·참고용, 매우 근사; 정확값 아님): "
+        f"요청 ≈ {request_bytes // 4}, 응답 ≈ {response_bytes // 4}"
+        in content
+    )
     assert "## Request — system prompt" in content
     assert "## Request — user message" in content
     assert "## Response (raw)" in content

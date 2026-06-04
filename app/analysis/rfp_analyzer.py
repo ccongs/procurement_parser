@@ -274,6 +274,11 @@ class RFPAnalyzer:
                 or getattr(provider, "model_name", None)
                 or ""
             )
+            system_prompt_bytes = len(system_prompt.encode("utf-8"))
+            user_message_bytes = len(user_message.encode("utf-8"))
+            request_chars = len(system_prompt) + len(user_message)
+            request_bytes = system_prompt_bytes + user_message_bytes
+            response_bytes = len(response.encode("utf-8"))
 
             content = "\n".join(
                 [
@@ -286,6 +291,16 @@ class RFPAnalyzer:
                     f"- 입력 텍스트 길이: {input_text_length}",
                     f"- 응답 길이: {len(response)}",
                     f"- JSON 파싱 성공: {json_parse_success}",
+                    "",
+                    "## 데이터 크기",
+                    f"- Request — system prompt: {len(system_prompt)}자 / {system_prompt_bytes} bytes",
+                    f"- Request — user message: {len(user_message)}자 / {user_message_bytes} bytes",
+                    f"- Request 합계: {request_chars}자 / {request_bytes} bytes",
+                    f"- Response: {len(response)}자 / {response_bytes} bytes",
+                    (
+                        "- 토큰(근사·참고용, 매우 근사; 정확값 아님): "
+                        f"요청 ≈ {request_bytes // 4}, 응답 ≈ {response_bytes // 4}"
+                    ),
                     "",
                     "## Request — system prompt",
                     "````",
