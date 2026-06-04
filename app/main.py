@@ -25,8 +25,9 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel
 
 from app import api_client, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal, init_db
@@ -41,8 +42,22 @@ from app.api_client import (
     ApiResult,
     ParamSpec,
 )
+from app.analysis.analyzer_service import (
+    AnalysisResult,
+    UnsupportedFormatError,
+    analyze_file,
+    analyze_from_url,
+    SUPPORTED_EXTENSIONS,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# --- 분석 API 응답 모델 (Phase 6.2a) ---
+class AnalysisResponse(BaseModel):
+    status: str  # "ok" | "no_file" | "unsupported" | "error"
+    analysis: dict | None = None
+    message: str = ""
 
 
 @asynccontextmanager
@@ -1890,6 +1905,93 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     filename = quote(f"{bf_spec_rgst_no}.zip")
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+
+
+# --- 분석 API (Phase 6.2a) -------------------------------------------
+
+_ANALYSIS_MAX_BYTES = 50 * 1024 * 1024  # 업로드 최대 50MB
+
+
+@app.post("/api/analysis/pre-spec/{bf_spec_rgst_no}", response_model=AnalysisResponse)
+async def analysis_pre_spec(bf_spec_rgst_no: str):
+    """사전규격 파일 URL → RFP 분석.
+
+    DB에서 `bf_spec_rgst_no`로 첨부 파일 URL 목록 조회 후
+    지원 형식(.pdf/.hwp/.hwpx/.doc/.docx)을 첫 번째부터 탐색·분석한다.
+    """
+    with SessionLocal() as session:
+        spec = session.get(PreSpec, bf_spec_rgst_no)
+        if spec is None:
+            return JSONResponse(
+                {"status": "no_file", "analysis": None, "message": "사전규격을 찾을 수 없습니다."},
+                status_code=404,
+            )
+        files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
+
+    # 지원 형식 URL 순서대로 탐색
+    target_url: str | None = None
+    for f in files:
+        url = f.get("url", "")
+        from pathlib import Path as _Path
+        ext = _Path(url.split("?")[0]).suffix.lower()
+        if ext in SUPPORTED_EXTENSIONS:
+            target_url = url
+            break
+
+    if target_url is None:
+        return AnalysisResponse(
+            status="no_file",
+            analysis=None,
+            message="제안요청서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요.",
+        )
+
+    result: AnalysisResult = await analyze_from_url(target_url)
+
+    if result.status == "unsupported":
+        return AnalysisResponse(
+            status="unsupported",
+            analysis=None,
+            message=result.message or "파일 변환에 실패했습니다. PDF 또는 DOCX를 업로드해주세요.",
+        )
+
+    analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
+    return AnalysisResponse(
+        status=result.status,
+        analysis=analysis_dict,
+        message=result.message,
+    )
+
+
+@app.post("/api/analysis/upload", response_model=AnalysisResponse)
+async def analysis_upload(file: UploadFile):
+    """수동 파일 업로드 → RFP 분석.
+
+    지원 형식: .pdf / .hwp / .hwpx / .doc / .docx
+    최대 파일 크기: 50MB
+    """
+    file_bytes = await file.read()
+    if len(file_bytes) > _ANALYSIS_MAX_BYTES:
+        return AnalysisResponse(
+            status="error",
+            analysis=None,
+            message="파일 크기가 50MB를 초과합니다.",
+        )
+
+    try:
+        result: AnalysisResult = await analyze_file(file_bytes, file.filename or "upload")
+    except UnsupportedFormatError:
+        return AnalysisResponse(
+            status="no_file",
+            analysis=None,
+            message="지원하지 않는 파일 형식입니다. PDF, HWP, HWPX, DOC, DOCX만 가능합니다.",
+        )
+
+    analysis_dict = result.analysis.model_dump() if result.analysis is not None else None
+    return AnalysisResponse(
+        status=result.status,
+        analysis=analysis_dict,
+        message=result.message,
+    )
 
 
 # --- /config ---------------------------------------------------------
