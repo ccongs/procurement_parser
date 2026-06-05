@@ -5,7 +5,7 @@
 
 - 스케줄러가 주기적으로 API 호출 → 회사 조건 필터 → 중복 제거 후 SQLite 누적.
 - FastAPI 웹 화면에서 적재분 조회·필터·정렬·첨부 다운로드, 수집 설정·이력 확인.
-- 제안요청서(RFP) 자동 분석(선택 기능) 및 검토항목 장바구니 → 엑셀 일괄 다운로드.
+- 제안요청서(RFP) 비동기 자동 분석(선택 기능, 결과 캐싱·새 창 보기) 및 검토항목 장바구니 → 엑셀 일괄 다운로드.
 
 ## 기술 스택
 
@@ -27,7 +27,7 @@
   - 일시 장애(특정 resultCode)는 재시도, 비재시도 에러는 자동 중단(`auto_halted`) 후 화면에서 재개.
 - **수집 설정은 코드/ENV 가 아니라 DB(`app_config` 단일 행)** 에 저장되고 **`/config` 화면**에서 편집한다
   (수집 on/off `enabled`·`pre_spec_enabled`, 주기 `interval_minutes`(기본 60), 업종코드 `indstryty_cds`(기본 `1426,1468,1469,1470`), 백필 등).
-- **RFP 분석(선택 기능)**: 목록의 "분석" 버튼 → 제안요청서 첨부 자동 탐색·다운로드 → 텍스트 추출(PDF/HWP/HWPX/DOC/DOCX) → LLM 분석 → 인라인 결과 패널. 프로바이더는 `ANALYSIS_PROVIDER`(claude/openai/gemini)로 교체. **`USE_ANALYSIS_PROVIDER` 는 기본 `false`** 라 분석 컬럼·버튼이 숨겨지며, 명시적으로 `true` 일 때만 노출(AI 미사용 환경 대비). `.hwp`/`.hwpx`는 olefile 로 직접 파싱하고 `.doc`만 LibreOffice 변환을 쓴다.
+- **RFP 분석(선택 기능, 비동기)**: 목록의 분석 버튼 → 제안요청서 첨부 자동 탐색·다운로드 → 텍스트 추출(PDF/HWP/HWPX/DOC/DOCX) → LLM 분석. 분석은 **백그라운드(BackgroundTasks)로 비동기** 실행되며 **결과는 `analysis_result` 테이블에 영속화**된다(재분석은 같은 행 갱신, 서버 재시작으로 중단된 `analyzing` 행은 기동 시 자동 리셋). 목록 버튼은 상태별로 렌더된다 — **분석 → 분석중 → 분석완료**(드롭다운: 분석보기·재분석) / **재분석**(오류 시). 분석·재분석 클릭 시 **비용 확인 알럿**, 진행 중에는 **~5초 폴링**으로 상태 갱신, 완료 결과는 **새 창의 서버 렌더 보고서 페이지**(`/analysis/{type}/{id}`)로 표시한다. 프로바이더는 `ANALYSIS_PROVIDER`(claude/openai/gemini)로 교체. **`USE_ANALYSIS_PROVIDER` 는 기본 `false`** 라 분석 컬럼·버튼이 숨겨지며 `true` 일 때만 노출(AI 미사용 환경 대비). `.hwp`/`.hwpx`는 olefile 로 직접 파싱하고 `.doc`만 LibreOffice 변환을 쓴다.
 - **검토항목 장바구니**: 목록에서 행을 체크해 "담기" → 헤더 **"검토항목 장바구니"** 에 모아 보고 → 엑셀(xlsx) 일괄 다운로드.
 
 ## 화면 / 엔드포인트
@@ -42,8 +42,10 @@
 | `GET /config` · `POST /config` | 수집 설정·스케줄러 제어·실행 이력. 검색 기본값(입찰 추정가격 / 사전규격 배정예산액) 분리 설정 |
 | `POST /config/scheduler/start`·`/stop`·`/config/resume` | 스케줄러 수동 시작/정지·중단 재개 |
 | `GET /api-test` | 원시 API 호출·응답 확인용 화면 |
-| `POST /api/analysis/bid/{bid_ntce_no}` · `/pre-spec/{bf_spec_rgst_no}` | 제안요청서 자동 탐색·다운로드 후 RFP 분석(선택 기능, `USE_ANALYSIS_PROVIDER=true` 시) |
-| `POST /api/analysis/upload` | 파일 직접 업로드 후 RFP 분석 |
+| `POST /api/analysis/{type}/{id}` (type=`bid`·`pre_spec`) | 제안요청서 자동 탐색 후 **비동기 분석 트리거**. `{status: analyzing}`(시작·이미 진행 중) 또는 `{status: need_upload}`(후보 없음) 반환 (선택 기능, `USE_ANALYSIS_PROVIDER=true` 시) |
+| `POST /api/analysis/upload` | 파일 직접 업로드 후 비동기 분석 트리거(`{status: analyzing}`) |
+| `GET /api/analysis/{type}/{id}/status` | 분석 상태 폴링(`none`/`analyzing`/`done`/`error`) |
+| `GET /analysis/{type}/{id}` | **새 창 서버 렌더 분석 보고서**(영속화된 결과 표시) |
 | `GET·POST /api/export-cart` · `DELETE /api/export-cart/{id}`·`/all` | 검토항목 장바구니 조회·담기·삭제 |
 | `GET /api/export-cart/download` | 검토항목 장바구니 엑셀(xlsx) 다운로드 |
 
@@ -62,6 +64,8 @@
 | `USE_ANALYSIS_PROVIDER` | 분석 컬럼·버튼 노출 여부. **기본 `false`(숨김)**, `true` 일 때만 표시 |
 | `CLAUDE_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | 선택한 프로바이더 API 키(분석 사용 시). **시크릿 — 커밋 금지** |
 | `ANALYSIS_MODEL` | 분석 모델 오버라이드(비우면 프로바이더 기본값) |
+| `ANALYSIS_MAX_TOKENS` | 분석 출력 토큰 상한(기본 `16384`) |
+| `USER_RFP_ANALYZER_LOG` | `true` 시 `rfp_analyzer_logs/` 에 분석 요청/응답 진단 md 기록(기본 `false`) |
 
 - 시크릿은 `.env` 에서만 로드하며 저장소에 커밋하지 않는다. 키 목록은 `.env.example` 참조.
 - 로깅은 콘솔 + 회전 파일(`logs/app.log`). `serviceKey` 는 로그에서 마스킹된다.
@@ -90,7 +94,7 @@ app/
   main.py            # FastAPI 앱·lifespan(스케줄러 자동시작)·전 화면·라우트
   api_client.py      # OpenAPI 호출(입찰/사전규격), 시크릿 로드
   db.py              # 엔진·세션·init_db(생성+멱등 마이그레이션+시드)
-  models.py          # ORM(BidNotice / PreSpec / AppConfig / CollectionRun / ExportCartItem)
+  models.py          # ORM(BidNotice / PreSpec / AppConfig / CollectionRun / ExportCartItem / AnalysisResult)
   transform.py       # API 응답 → ORM 값 변환(입찰/사전규격)
   collector.py       # 입찰 수집기(윈도우·재시도·partial 판정). __main__=수동 백필
   pre_spec_collector.py  # 사전규격 수집기. __main__=수동 백필
