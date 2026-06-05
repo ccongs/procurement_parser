@@ -1,4 +1,4 @@
-"""Phase 6.3 — 분석 UI 라우트 스모크 테스트.
+"""Phase 8.2 — 분석 UI 라우트 스모크 테스트.
 
 UI 동작(JS/CSS)은 pytest로 완전 검증 불가능하므로:
 - /list, /pre-spec 라우트 응답 코드 + btn-analyze 키워드 포함 확인
@@ -21,7 +21,7 @@ from sqlalchemy.orm import sessionmaker
 # ANTHROPIC_API_KEY 없어도 import 가능하도록 미리 설정
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-placeholder")
 
-from app import main
+from app import main, repository
 from app.db import Base
 from app.models import AppConfig, BidNotice, PreSpec
 
@@ -119,6 +119,32 @@ def test_list_page_analyze_button_data_type(client):
     assert 'data-type="bid"' in resp.text
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("none", ['data-status="none"', ">분석</button>"]),
+        ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
+        ("done", ['data-status="done"', "분석보기", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
+        ("error", ['data-status="error"', ">재분석</button>"]),
+    ],
+)
+def test_list_page_renders_analysis_button_by_status(client, status, expected):
+    """입찰공고 목록 버튼이 analysis_result 상태별로 서버 렌더된다."""
+    with main.SessionLocal() as s:
+        if status == "analyzing":
+            repository.start_analysis(s, "bid", "BID-001", "auto")
+        elif status == "done":
+            repository.set_analysis_done(s, "bid", "BID-001", "{}")
+        elif status == "error":
+            repository.set_analysis_error(s, "bid", "BID-001", "실패")
+
+    resp = client.get("/list")
+    assert resp.status_code == 200
+    for needle in expected:
+        assert needle in resp.text
+    assert 'data-name="소프트웨어 유지보수 용역"' in resp.text
+
+
 def test_list_page_has_upload_modal(client):
     """입찰공고 목록 페이지에 업로드 모달 HTML이 포함된다."""
     resp = client.get("/list")
@@ -152,6 +178,32 @@ def test_pre_spec_page_analyze_button_data_type(client):
     resp = client.get("/pre-spec")
     assert resp.status_code == 200
     assert 'data-type="pre-spec"' in resp.text
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("none", ['data-status="none"', ">분석</button>"]),
+        ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
+        ("done", ['data-status="done"', "분석보기", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
+        ("error", ['data-status="error"', ">재분석</button>"]),
+    ],
+)
+def test_pre_spec_page_renders_analysis_button_by_status(client, status, expected):
+    """사전규격 목록 버튼이 analysis_result 상태별로 서버 렌더된다."""
+    with main.SessionLocal() as s:
+        if status == "analyzing":
+            repository.start_analysis(s, "pre_spec", "PS-001", "auto")
+        elif status == "done":
+            repository.set_analysis_done(s, "pre_spec", "PS-001", "{}")
+        elif status == "error":
+            repository.set_analysis_error(s, "pre_spec", "PS-001", "실패")
+
+    resp = client.get("/pre-spec")
+    assert resp.status_code == 200
+    for needle in expected:
+        assert needle in resp.text
+    assert 'data-name="소프트웨어 개발"' in resp.text
 
 
 def test_pre_spec_page_has_upload_modal(client):
@@ -229,7 +281,7 @@ def test_analysis_css_included(client):
     """분석 관련 CSS 클래스가 페이지에 포함된다."""
     resp = client.get("/list")
     assert resp.status_code == 200
-    assert "analysis-panel" in resp.text
-    assert "analysis-section" in resp.text
-    assert "win-theme-cards" in resp.text
+    assert "analysis-actions" in resp.text
+    assert "analysis-menu" in resp.text
+    assert "analysis-menu-toggle" in resp.text
     assert "upload-area" in resp.text

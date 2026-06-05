@@ -239,6 +239,33 @@ def test_upload_accepts_type_id_alias(client, monkeypatch):
     assert calls == [("pre_spec", "PS001")]
 
 
+def test_upload_already_analyzing_does_not_register_background_task(client, db, monkeypatch):
+    with db() as s:
+        repository.start_analysis(s, "pre_spec", "PS001", "auto")
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_run_bg(source_type: str, source_id: str, **kwargs):
+        calls.append((source_type, source_id))
+
+    monkeypatch.setattr(main, "_run_analysis_bg", fake_run_bg)
+
+    resp = client.post(
+        "/api/analysis/upload",
+        data={"type": "pre_spec", "id": "PS001"},
+        files={"file": ("manual.pdf", b"%PDF-1.4", "application/pdf")},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "analyzing"}
+    assert calls == []
+    with db() as s:
+        row = repository.get_analysis(s, "pre_spec", "PS001")
+        assert row is not None
+        assert row.status == "analyzing"
+        assert row.source_kind == "auto"
+
+
 def test_upload_file_too_large(client):
     large_bytes = b"x" * (50 * 1024 * 1024 + 1)
 

@@ -682,37 +682,22 @@ BASE_CSS = """
   table.filetable a.dl { background: #1f3a5f; color: #fff; text-decoration: none; padding: 5px 10px;
                          border-radius: 6px; font-size: 12px; white-space: nowrap; }
   table.filetable a.dl:hover { background: #16294a; }
-  /* 분석 버튼 (Phase 6.3) */
+  /* 분석 버튼 (Phase 8.2) */
   button.btn-analyze { border: 1px solid #7e5cb0; background: #f3eeff; color: #5a3e8a; padding: 4px 10px;
                        border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
   button.btn-analyze:hover { background: #e8dcff; }
   button.btn-analyze:disabled { opacity: .6; cursor: default; }
   button.btn-analyze.open { background: #5a3e8a; color: #fff; border-color: #5a3e8a; }
-  /* 분석 결과 패널 */
-  .analysis-result-row td { padding: 0; background: #f8f6ff; }
-  .analysis-panel { padding: 20px 24px; border-top: 2px solid #c9b8ef; }
-  .analysis-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-  .analysis-header h3 { margin: 0; font-size: 15px; color: #3d2870; }
-  .analysis-close { background: transparent; border: 1px solid #b9b0cc; color: #5a3e8a;
-                    padding: 4px 10px; border-radius: 6px; font-size: 13px; cursor: pointer; }
-  .analysis-close:hover { background: #ede5ff; }
-  .analysis-section { margin-bottom: 20px; border-top: 1px solid #e0d8f5; padding-top: 14px; }
-  .analysis-section:first-of-type { border-top: none; padding-top: 0; }
-  .analysis-section h4 { margin: 0 0 10px; font-size: 13px; color: #5a3e8a; font-weight: 600; }
-  .info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
-  .info-grid > div { font-size: 13px; }
-  .info-grid .label { font-weight: 600; color: #6b7280; margin-right: 6px; }
-  .analysis-section p { margin: 0; font-size: 13px; line-height: 1.6; }
-  .analysis-section ol, .analysis-section ul { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.8; }
-  .analysis-section table { border-collapse: collapse; width: 100%; font-size: 12px; }
-  .analysis-section table th, .analysis-section table td { border: 1px solid #d8d0ee; padding: 5px 8px; text-align: left; }
-  .analysis-section table th { background: #ede5ff; }
-  /* Win Theme 카드 */
-  .win-theme-cards { display: flex; gap: 12px; flex-wrap: wrap; }
-  .win-theme-card { background: #fff; border: 1px solid #c9b8ef; border-radius: 8px;
-                    padding: 12px 14px; min-width: 160px; max-width: 280px; flex: 1; }
-  .win-theme-card .theme-title { font-weight: 600; font-size: 13px; color: #3d2870; margin-bottom: 6px; }
-  .win-theme-card .theme-desc { font-size: 12px; color: #4a5568; line-height: 1.5; }
+  /* 분석 완료 드롭다운 */
+  .analysis-actions { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
+  .analysis-actions .analysis-menu-toggle { padding: 4px 7px; }
+  .analysis-menu { display: none; position: absolute; right: 0; top: calc(100% + 4px); min-width: 96px;
+                   background: #fff; border: 1px solid #cbd2dc; border-radius: 6px;
+                   box-shadow: 0 4px 14px rgba(0,0,0,.14); z-index: 35; overflow: hidden; }
+  .analysis-actions.open .analysis-menu { display: block; }
+  .analysis-menu button { display: block; width: 100%; border: 0; background: #fff; color: #1f2430;
+                          padding: 7px 10px; text-align: left; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .analysis-menu button:hover { background: #f3eeff; color: #5a3e8a; }
   /* 업로드 모달 */
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; z-index: 60;
                    align-items: center; justify-content: center; }
@@ -1034,7 +1019,74 @@ def _sort_header(
     )
 
 
-def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
+def _analysis_data_attrs(
+    *,
+    source_type: str,
+    source_id: str,
+    source_name: str,
+    total_cols: int,
+    status: str,
+) -> str:
+    return (
+        f'data-status="{_e(status)}" '
+        f'data-type="{_e(source_type)}" '
+        f'data-id="{_e(source_id)}" '
+        f'data-colspan="{_e(total_cols)}" '
+        f'data-name="{_e(source_name)}"'
+    )
+
+
+def _render_analysis_cell(
+    *,
+    source_type: str,
+    source_id: str,
+    source_name: str,
+    total_cols: int,
+    status: str,
+) -> str:
+    """분석 상태별 목록 셀을 렌더한다."""
+    safe_status = status if status in {"none", "analyzing", "done", "error"} else "none"
+    attrs = _analysis_data_attrs(
+        source_type=source_type,
+        source_id=source_id,
+        source_name=source_name,
+        total_cols=total_cols,
+        status=safe_status,
+    )
+    if safe_status == "analyzing":
+        return (
+            f'<td><button type="button" class="btn-analyze" {attrs} '
+            f'disabled aria-label="제안요청서 분석">분석중</button></td>'
+        )
+    if safe_status == "done":
+        return (
+            f'<td><div class="analysis-actions" {attrs}>'
+            f'<button type="button" class="btn-analyze" data-action="view" '
+            f'aria-label="분석 결과 보기">분석보기</button>'
+            f'<button type="button" class="btn-analyze analysis-menu-toggle" '
+            f'aria-label="분석 메뉴" aria-expanded="false">▾</button>'
+            f'<div class="analysis-menu" role="menu">'
+            f'<button type="button" data-action="view" role="menuitem">분석보기</button>'
+            f'<button type="button" data-action="reanalyze" role="menuitem">재분석</button>'
+            f'</div></div></td>'
+        )
+    if safe_status == "error":
+        return (
+            f'<td><button type="button" class="btn-analyze" {attrs} '
+            f'aria-label="제안요청서 재분석">재분석</button></td>'
+        )
+    return (
+        f'<td><button type="button" class="btn-analyze" {attrs} '
+        f'aria-label="제안요청서 분석">분석</button></td>'
+    )
+
+
+def _render_list_rows(
+    rows: list[dict],
+    sort: str,
+    qs: dict[str, str],
+    status_map: dict[str, str] | None = None,
+) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
     analysis_on = analysis_enabled()
@@ -1054,7 +1106,8 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
     total_cols = 1 + 1 + len(_LIST_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
     for i, r in enumerate(rows, start=1):
-        row_id = _e(r.get("bid_ntce_no") or "")
+        raw_id = str(r.get("bid_ntce_no") or "")
+        row_id = _e(raw_id)
         chk_cell = (
             f'<td class="col-chk">'
             f'<input type="checkbox" class="row-select-chk" '
@@ -1092,14 +1145,16 @@ def _render_list_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
             )
         else:
             cells.append('<td>-</td>')
-        # 분석 버튼 컬럼 (Phase 6.3, USE_ANALYSIS_PROVIDER 토글)
+        # 분석 버튼 컬럼 (Phase 8.2, USE_ANALYSIS_PROVIDER 토글)
         if analysis_on:
-            cells.append(
-                f'<td><button type="button" class="btn-analyze" '
-                f'data-type="bid" data-id="{row_id}" '
-                f'data-colspan="{total_cols}" '
-                f'aria-label="제안요청서 분석">분석</button></td>'
-            )
+            status = (status_map or {}).get(raw_id, "none")
+            cells.append(_render_analysis_cell(
+                source_type="bid",
+                source_id=raw_id,
+                source_name=r.get("bid_ntce_nm") or "",
+                total_cols=total_cols,
+                status=status,
+            ))
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
@@ -1342,15 +1397,17 @@ _LIST_SCRIPT = """
   })();
 """
 
-# 분석 UI 스크립트 (Phase 6.3) — 분석 버튼 동작, 결과 패널, 업로드 모달.
+# 분석 UI 스크립트 (Phase 8.2) — 상태 버튼, 새 창 보기, 폴링, 업로드 모달.
 # 평문 상수라 중괄호 이스케이프 불필요.
 _ANALYSIS_SCRIPT = """
   (function () {
     'use strict';
 
-    var _openBtnEl = null;  // 현재 열린 패널의 버튼 element
-
-    // --- 유틸 -------------------------------------------------------
+    var _pollTimers = {};
+    var _requesting = {};
+    var _uploadMeta = null;
+    var _uploadRoot = null;
+    var _uploadFile = null;
 
     function esc(s) {
       if (!s) return '';
@@ -1366,112 +1423,195 @@ _ANALYSIS_SCRIPT = """
       setTimeout(function () { t.style.display = 'none'; }, 4000);
     }
 
-    // --- 결과 패널 --------------------------------------------------
+    function readJson(resp) {
+      return resp.json().catch(function () { return {}; });
+    }
 
-    function closeResultPanel() {
-      var existing = document.querySelector('.analysis-result-row');
-      if (existing) existing.remove();
-      if (_openBtnEl) {
-        _openBtnEl.textContent = '분석';
-        _openBtnEl.classList.remove('open');
-        _openBtnEl.disabled = false;
-        _openBtnEl = null;
+    function pollKey(type, id) {
+      return type + ':' + id;
+    }
+
+    function getRoot(el) {
+      if (!el) return null;
+      return el.closest('.analysis-actions') || el.closest('.btn-analyze');
+    }
+
+    function getMeta(el) {
+      var root = getRoot(el);
+      if (!root) return null;
+      return {
+        root: root,
+        type: root.getAttribute('data-type') || '',
+        id: root.getAttribute('data-id') || '',
+        name: root.getAttribute('data-name') || '',
+        colspan: root.getAttribute('data-colspan') || '',
+        status: root.getAttribute('data-status') || ''
+      };
+    }
+
+    function dataAttrs(meta, status) {
+      return 'data-status="' + esc(status) + '" '
+        + 'data-type="' + esc(meta.type) + '" '
+        + 'data-id="' + esc(meta.id) + '" '
+        + 'data-colspan="' + esc(meta.colspan || '') + '" '
+        + 'data-name="' + esc(meta.name || '') + '"';
+    }
+
+    function renderControl(meta, status) {
+      var attrs = dataAttrs(meta, status);
+      if (status === 'analyzing') {
+        return '<button type="button" class="btn-analyze" ' + attrs
+          + ' disabled aria-label="제안요청서 분석">분석중</button>';
+      }
+      if (status === 'done') {
+        return '<div class="analysis-actions" ' + attrs + '>'
+          + '<button type="button" class="btn-analyze" data-action="view" aria-label="분석 결과 보기">분석보기</button>'
+          + '<button type="button" class="btn-analyze analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">▾</button>'
+          + '<div class="analysis-menu" role="menu">'
+          + '<button type="button" data-action="view" role="menuitem">분석보기</button>'
+          + '<button type="button" data-action="reanalyze" role="menuitem">재분석</button>'
+          + '</div></div>';
+      }
+      if (status === 'error') {
+        return '<button type="button" class="btn-analyze" ' + attrs
+          + ' aria-label="제안요청서 재분석">재분석</button>';
+      }
+      return '<button type="button" class="btn-analyze" ' + attrs
+        + ' aria-label="제안요청서 분석">분석</button>';
+    }
+
+    function setBusy(root, busy) {
+      var holder = getRoot(root);
+      if (!holder) return;
+      var buttons = holder.classList.contains('analysis-actions')
+        ? holder.querySelectorAll('button')
+        : [holder];
+      Array.prototype.forEach.call(buttons, function (btn) {
+        btn.disabled = busy;
+      });
+    }
+
+    function setCellStatus(root, status) {
+      var meta = getMeta(root);
+      if (!meta) return null;
+      var cell = meta.root.closest('td');
+      if (!cell) return null;
+      cell.innerHTML = renderControl(meta, status);
+      return findControl(meta.type, meta.id);
+    }
+
+    function findControl(type, id) {
+      var controls = document.querySelectorAll('.analysis-actions, .btn-analyze[data-status]');
+      for (var i = 0; i < controls.length; i += 1) {
+        if (controls[i].getAttribute('data-type') === type && controls[i].getAttribute('data-id') === id) {
+          return controls[i];
+        }
+      }
+      return null;
+    }
+
+    function setStatusByKey(type, id, status) {
+      var control = findControl(type, id);
+      if (control) setCellStatus(control, status);
+    }
+
+    function closeMenus(exceptRoot) {
+      document.querySelectorAll('.analysis-actions.open').forEach(function (root) {
+        if (exceptRoot && root === exceptRoot) return;
+        root.classList.remove('open');
+        var toggle = root.querySelector('.analysis-menu-toggle');
+        if (toggle) toggle.setAttribute('aria-expanded', 'false');
+      });
+    }
+
+    function confirmCost(meta) {
+      return window.confirm(
+        (meta.id || '') + '\\n' + (meta.name || '') +
+        '\\n\\n분석 1건당 API 비용이 발생합니다. 진행할까요?'
+      );
+    }
+
+    function openAnalysisWindow(meta) {
+      if (!meta || !meta.type || !meta.id) return;
+      window.open('/analysis/' + meta.type + '/' + encodeURIComponent(meta.id), '_blank');
+    }
+
+    function stopPolling(type, id) {
+      var key = pollKey(type, id);
+      if (_pollTimers[key]) {
+        window.clearInterval(_pollTimers[key]);
+        delete _pollTimers[key];
       }
     }
 
-    function buildList(items, tag) {
-      if (!items || !items.length) return '<li>(없음)</li>';
-      return items.map(function (s) { return '<' + tag + '>' + esc(s) + '</' + tag + '>'; }).join('');
+    function startPolling(type, id) {
+      if (!type || !id) return;
+      var key = pollKey(type, id);
+      if (_pollTimers[key]) return;
+
+      async function pollOnce() {
+        try {
+          var resp = await fetch('/api/analysis/' + type + '/' + encodeURIComponent(id) + '/status');
+          var data = await readJson(resp);
+          if (data.status === 'done') {
+            stopPolling(type, id);
+            setStatusByKey(type, id, 'done');
+          } else if (data.status === 'error') {
+            stopPolling(type, id);
+            setStatusByKey(type, id, 'error');
+            showToast('분석 실패');
+          }
+        } catch (e) {
+          // 일시적 네트워크 오류는 다음 폴링에서 재시도한다.
+        }
+      }
+
+      _pollTimers[key] = window.setInterval(pollOnce, 5000);
+      pollOnce();
     }
 
-    function buildEvalTable(criteria) {
-      if (!criteria || !criteria.length) return '<p class="muted">없음</p>';
-      var rows = criteria.map(function (c) {
-        return '<tr><td>' + esc(c.item) + '</td><td>' + esc(c.weight) + '</td><td>' + esc(c.details) + '</td></tr>';
-      }).join('');
-      return '<table><thead><tr><th>평가항목</th><th>배점</th><th>세부기준</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    async function runAnalysis(meta, triggerEl) {
+      if (!meta || !meta.type || !meta.id) return;
+      if (!confirmCost(meta)) return;
+
+      var key = pollKey(meta.type, meta.id);
+      if (_requesting[key]) return;
+      _requesting[key] = true;
+      setBusy(triggerEl || meta.root, true);
+
+      try {
+        var resp = await fetch('/api/analysis/' + meta.type + '/' + encodeURIComponent(meta.id), { method: 'POST' });
+        var data = await readJson(resp);
+        if (!resp.ok) {
+          showToast(data.message || data.detail || '분석 요청 중 오류가 발생했습니다.');
+          setBusy(triggerEl || meta.root, false);
+        } else if (data.status === 'analyzing') {
+          setCellStatus(triggerEl || meta.root, 'analyzing');
+          startPolling(meta.type, meta.id);
+        } else if (data.status === 'need_upload') {
+          setBusy(triggerEl || meta.root, false);
+          openUploadModal(data.message, meta, triggerEl || meta.root);
+        } else {
+          showToast(data.message || '분석 요청 중 오류가 발생했습니다.');
+          setBusy(triggerEl || meta.root, false);
+        }
+      } catch (e) {
+        showToast('서버 요청 중 오류가 발생했습니다.');
+        setBusy(triggerEl || meta.root, false);
+      } finally {
+        delete _requesting[key];
+      }
     }
 
-    function buildWinThemeCards(themes) {
-      if (!themes || !themes.length) return '<p class="muted">없음</p>';
-      return themes.slice(0, 3).map(function (t) {
-        return '<div class="win-theme-card"><div class="theme-title">' + esc(t.theme) + '</div>'
-             + '<div class="theme-desc">' + esc(t.rationale) + '</div></div>';
-      }).join('');
-    }
-
-    function buildPainPoints(pts) {
-      if (!pts || !pts.length) return '<li>(없음)</li>';
-      return pts.map(function (p) {
-        var label = typeof p === 'string' ? p : (p.point || '');
-        var detail = typeof p === 'object' ? (p.description || '') : '';
-        return '<li><b>' + esc(label) + '</b>' + (detail ? ': ' + esc(detail) : '') + '</li>';
-      }).join('');
-    }
-
-    function showResultPanel(btnEl, analysis) {
-      closeResultPanel();  // 기존 패널 닫기
-
-      var a = analysis || {};
-      var colspan = btnEl.getAttribute('data-colspan') || '10';
-
-      var panelHtml = '<div class="analysis-panel">'
-        + '<div class="analysis-header"><h3>RFP 분석 결과</h3>'
-        + '<button type="button" class="analysis-close">× 닫기</button></div>'
-        // 섹션 1: 기본 정보
-        + '<section class="analysis-section"><h4>프로젝트 기본 정보</h4>'
-        + '<div class="info-grid">'
-        + (a.project_name ? '<div><span class="label">프로젝트명</span><span>' + esc(a.project_name) + '</span></div>' : '')
-        + (a.client_name  ? '<div><span class="label">발주처</span><span>' + esc(a.client_name) + '</span></div>' : '')
-        + (a.budget       ? '<div><span class="label">예산</span><span>' + esc(a.budget) + '</span></div>' : '')
-        + (a.timeline     ? '<div><span class="label">기간</span><span>' + esc(a.timeline) + '</span></div>' : '')
-        + '</div></section>'
-        // 섹션 2: 사업 개요
-        + '<section class="analysis-section"><h4>사업 개요</h4><p>' + esc(a.project_overview || '') + '</p></section>'
-        // 섹션 3: 핵심 요구사항
-        + '<section class="analysis-section"><h4>핵심 요구사항</h4><ol>' + buildList(a.key_requirements, 'li') + '</ol></section>'
-        // 섹션 4: 평가 기준
-        + '<section class="analysis-section"><h4>평가 기준</h4>' + buildEvalTable(a.evaluation_criteria) + '</section>'
-        // 섹션 5: 납품물
-        + '<section class="analysis-section"><h4>납품물</h4><ul>' + buildList(a.deliverables, 'li') + '</ul></section>'
-        // 섹션 6: Win Theme
-        + '<section class="analysis-section"><h4>Win Theme 후보</h4><div class="win-theme-cards">' + buildWinThemeCards(a.win_theme_candidates) + '</div></section>'
-        // 섹션 7: Pain Points
-        + '<section class="analysis-section"><h4>Pain Points</h4><ul>' + buildPainPoints(a.pain_points) + '</ul></section>'
-        // 섹션 8: 숨겨진 니즈
-        + '<section class="analysis-section"><h4>숨겨진 니즈</h4><ul>' + buildList(a.hidden_needs, 'li') + '</ul></section>'
-        + '</div>';
-
-      // 해당 행(data-row-id) 바로 다음에 결과 <tr> 삽입
-      var rowEl = btnEl.closest('tr');
-      var resultRow = document.createElement('tr');
-      resultRow.className = 'analysis-result-row';
-      resultRow.innerHTML = '<td colspan="' + colspan + '">' + panelHtml + '</td>';
-      rowEl.parentNode.insertBefore(resultRow, rowEl.nextSibling);
-
-      // 닫기 버튼 이벤트
-      resultRow.querySelector('.analysis-close').addEventListener('click', function () {
-        closeResultPanel();
-      });
-
-      // 버튼 상태 변경
-      btnEl.textContent = '닫기';
-      btnEl.classList.add('open');
-      _openBtnEl = btnEl;
-    }
-
-    // --- 업로드 모달 ------------------------------------------------
-
-    var _uploadType = '';
-    var _uploadId = '';
-    var _uploadFile = null;
-    var _uploadBtnEl = null;
-
-    function openUploadModal(message, type, id, btnEl) {
-      _uploadType = type;
-      _uploadId = id;
+    function openUploadModal(message, meta, root) {
+      _uploadMeta = {
+        type: meta.type,
+        id: meta.id,
+        name: meta.name,
+        colspan: meta.colspan
+      };
+      _uploadRoot = getRoot(root);
       _uploadFile = null;
-      _uploadBtnEl = btnEl;
 
       var modal = document.getElementById('analysisUploadModal');
       var msgEl = document.getElementById('uploadModalMessage');
@@ -1492,58 +1632,55 @@ _ANALYSIS_SCRIPT = """
       var modal = document.getElementById('analysisUploadModal');
       if (modal) modal.classList.remove('open');
       _uploadFile = null;
-      if (_uploadBtnEl) {
-        _uploadBtnEl.textContent = '분석';
-        _uploadBtnEl.classList.remove('open');
-        _uploadBtnEl.disabled = false;
+      _uploadMeta = null;
+      _uploadRoot = null;
+      var submitBtn = document.getElementById('uploadSubmitBtn');
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = '분석 시작';
       }
-      _uploadBtnEl = null;
     }
 
-    // --- 핵심 분석 함수 ---------------------------------------------
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest('.analysis-actions')) closeMenus();
 
-    async function runAnalysis(type, id, btnEl) {
-      // 이미 결과 패널이 열려 있으면 토글(닫기)
-      if (btnEl.classList.contains('open')) {
-        closeResultPanel();
+      var toggle = e.target.closest('.analysis-menu-toggle');
+      if (toggle) {
+        var root = toggle.closest('.analysis-actions');
+        var willOpen = root && !root.classList.contains('open');
+        closeMenus(root);
+        if (root && willOpen) {
+          root.classList.add('open');
+          toggle.setAttribute('aria-expanded', 'true');
+        } else if (toggle) {
+          toggle.setAttribute('aria-expanded', 'false');
+        }
         return;
       }
 
-      btnEl.disabled = true;
-      btnEl.textContent = '분석 중...';
-
-      try {
-        var resp = await fetch('/api/analysis/' + type + '/' + encodeURIComponent(id), { method: 'POST' });
-        var data = await resp.json();
-
-        if (data.status === 'ok') {
-          showResultPanel(btnEl, data.analysis);
-        } else if (data.status === 'no_file' || data.status === 'unsupported') {
-          openUploadModal(data.message, type, id, btnEl);
-        } else {
-          showToast(data.message || '분석 중 오류가 발생했습니다.');
-          btnEl.disabled = false;
-          btnEl.textContent = '분석';
+      var action = e.target.closest('[data-action]');
+      if (action && action.closest('.analysis-actions')) {
+        var actionMeta = getMeta(action);
+        var actionName = action.getAttribute('data-action');
+        closeMenus();
+        if (actionName === 'view') {
+          openAnalysisWindow(actionMeta);
+        } else if (actionName === 'reanalyze') {
+          runAnalysis(actionMeta, action);
         }
-      } catch (e) {
-        showToast('서버 요청 중 오류가 발생했습니다.');
-        btnEl.disabled = false;
-        btnEl.textContent = '분석';
+        return;
       }
-    }
 
-    // --- 이벤트 바인딩 (이벤트 위임) --------------------------------
-
-    document.addEventListener('click', function (e) {
-      var btn = e.target.closest('.btn-analyze');
+      var btn = e.target.closest('.btn-analyze[data-status]');
       if (btn) {
-        var type = btn.getAttribute('data-type');
-        var id = btn.getAttribute('data-id');
-        runAnalysis(type, id, btn);
+        var meta = getMeta(btn);
+        if (meta && (meta.status === 'none' || meta.status === 'error')) {
+          runAnalysis(meta, btn);
+        }
+        return;
       }
     });
 
-    // 업로드 모달 파일 입력
     var uploadInput = document.getElementById('uploadFileInput');
     var dropZone = document.getElementById('uploadDropZone');
     var submitBtn = document.getElementById('uploadSubmitBtn');
@@ -1565,6 +1702,12 @@ _ANALYSIS_SCRIPT = """
       dropZone.addEventListener('click', function () {
         if (uploadInput) uploadInput.click();
       });
+      dropZone.addEventListener('keydown', function (e) {
+        if ((e.key === 'Enter' || e.key === ' ') && uploadInput) {
+          e.preventDefault();
+          uploadInput.click();
+        }
+      });
       dropZone.addEventListener('dragover', function (e) {
         e.preventDefault();
         dropZone.classList.add('dragover');
@@ -1582,36 +1725,33 @@ _ANALYSIS_SCRIPT = """
 
     if (submitBtn) {
       submitBtn.addEventListener('click', async function () {
-        if (!_uploadFile) return;
+        if (!_uploadFile || !_uploadMeta) return;
         submitBtn.disabled = true;
         submitBtn.textContent = '업로드 중...';
 
         var form = new FormData();
         form.append('file', _uploadFile);
+        form.append('source_type', _uploadMeta.type);
+        form.append('source_id', _uploadMeta.id);
+        form.append('type', _uploadMeta.type);
+        form.append('id', _uploadMeta.id);
 
         try {
           var resp = await fetch('/api/analysis/upload', { method: 'POST', body: form });
-          var data = await resp.json();
+          var data = await readJson(resp);
+          var msgEl = document.getElementById('uploadModalMessage');
 
-          if (data.status === 'ok') {
-            var modal = document.getElementById('analysisUploadModal');
-            if (modal) modal.classList.remove('open');
-            // 업로드 후 결과 패널 표시: _uploadBtnEl 이 없으면 임시 처리
-            var targetBtn = _uploadBtnEl;
-            _uploadBtnEl = null;
-            if (targetBtn) {
-              targetBtn.disabled = false;
-              showResultPanel(targetBtn, data.analysis);
-            } else {
-              showToast('분석 완료!');
-            }
-          } else if (data.status === 'unsupported' || data.status === 'no_file') {
-            var msgEl = document.getElementById('uploadModalMessage');
-            if (msgEl) msgEl.textContent = data.message || '지원하지 않는 파일 형식입니다.';
+          if (!resp.ok) {
+            if (msgEl) msgEl.textContent = data.message || data.detail || '업로드 중 오류가 발생했습니다.';
             submitBtn.disabled = false;
             submitBtn.textContent = '분석 시작';
+          } else if (data.status === 'analyzing') {
+            var meta = _uploadMeta;
+            var root = findControl(meta.type, meta.id) || _uploadRoot;
+            closeUploadModal();
+            if (root) setCellStatus(root, 'analyzing');
+            startPolling(meta.type, meta.id);
           } else {
-            var msgEl = document.getElementById('uploadModalMessage');
             if (msgEl) msgEl.textContent = data.message || '분석 중 오류가 발생했습니다.';
             submitBtn.disabled = false;
             submitBtn.textContent = '분석 시작';
@@ -1638,20 +1778,32 @@ _ANALYSIS_SCRIPT = """
       });
     }
 
-    // ESC 키로 모달 닫기
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') {
         var modal = document.getElementById('analysisUploadModal');
         if (modal && modal.classList.contains('open')) closeUploadModal();
+        closeMenus();
       }
     });
+
+    function startInitialPolling() {
+      document.querySelectorAll('.btn-analyze[data-status="analyzing"]').forEach(function (btn) {
+        startPolling(btn.getAttribute('data-type'), btn.getAttribute('data-id'));
+      });
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', startInitialPolling);
+    } else {
+      startInitialPolling();
+    }
 
   })();
 """
 
 # 업로드 모달 + 토스트 HTML (list·pre-spec 공용, 스크립트 앞에 한 번만 삽입)
 _ANALYSIS_MODAL_HTML = """
-    <!-- 분석 업로드 모달 (Phase 6.3) -->
+    <!-- 분석 업로드 모달 (Phase 8.2) -->
     <div id="analysisUploadModal" class="modal-overlay" aria-label="제안요청서 업로드" role="dialog">
       <div class="modal-content">
         <div class="modal-header">
@@ -1675,7 +1827,7 @@ _ANALYSIS_MODAL_HTML = """
         </div>
       </div>
     </div>
-    <!-- 에러 토스트 (Phase 6.3) -->
+    <!-- 에러 토스트 (Phase 8.2) -->
     <div id="analyzeToast" role="alert"></div>
     <!-- 장바구니 토스트 (Phase 7.2) -->
     <div id="cartToast" role="alert"></div>
@@ -1834,7 +1986,12 @@ _CART_SCRIPT = """
 """
 
 
-def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> str:
+def _render_pre_spec_rows(
+    rows: list[dict],
+    sort: str,
+    qs: dict[str, str],
+    status_map: dict[str, str] | None = None,
+) -> str:
     """사전규격 목록 테이블 렌더(_render_list_rows 패턴). 파일 컬럼 포함(4.9-B2)."""
     if not rows:
         return '<p class="muted">조건에 맞는 사전규격이 없습니다.</p>'
@@ -1864,7 +2021,8 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
     total_cols = 1 + 1 + len(_PRE_SPEC_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
     for i, r in enumerate(rows, start=1):
-        row_id = _e(r.get("bf_spec_rgst_no") or "")
+        raw_id = str(r.get("bf_spec_rgst_no") or "")
+        row_id = _e(raw_id)
         chk_cell = (
             f'<td class="col-chk">'
             f'<input type="checkbox" class="row-select-chk" '
@@ -1894,14 +2052,16 @@ def _render_pre_spec_rows(rows: list[dict], sort: str, qs: dict[str, str]) -> st
             )
         else:
             cells.append('<td>-</td>')
-        # 분석 버튼 컬럼 (Phase 6.3, USE_ANALYSIS_PROVIDER 토글)
+        # 분석 버튼 컬럼 (Phase 8.2, USE_ANALYSIS_PROVIDER 토글)
         if analysis_on:
-            cells.append(
-                f'<td><button type="button" class="btn-analyze" '
-                f'data-type="pre-spec" data-id="{row_id}" '
-                f'data-colspan="{total_cols}" '
-                f'aria-label="제안요청서 분석">분석</button></td>'
-            )
+            status = (status_map or {}).get(raw_id, "none")
+            cells.append(_render_analysis_cell(
+                source_type="pre-spec",
+                source_id=raw_id,
+                source_name=r.get("prdct_clsfc_no_nm") or "",
+                total_cols=total_cols,
+                status=status,
+            ))
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
@@ -2044,6 +2204,8 @@ def pre_spec_page(
     df = _parse_date(dt_from_eff)
     dtto = _parse_date(dt_to_eff, end_of_day=True)
 
+    analysis_on = analysis_enabled()
+    status_map: dict[str, str] = {}
     # 가격: 화면 입력값 우선, 비었으면 설정 기본값(cfg.pre_spec_amt_bgn/end).
     # list_page 의 cfg 기본값 로직과 동형.
     with SessionLocal() as session:
@@ -2083,6 +2245,12 @@ def pre_spec_page(
             d = {c: getattr(o, c, None) for c in cols}
             d["_file_count"] = sum(1 for c in _PRE_SPEC_FILE_URL_COLUMNS if d.get(c))
             rows.append(d)
+        if analysis_on:
+            status_map = repository.get_analysis_status_map(
+                session,
+                "pre_spec",
+                [str(r.get("bf_spec_rgst_no")) for r in rows if r.get("bf_spec_rgst_no")],
+            )
 
     # 입력칸 표시값(문자열). 정규화된 정수를 그대로 보여준다(없으면 빈칸).
     price_min_field = "" if price_min_disp is None else str(price_min_disp)
@@ -2169,13 +2337,15 @@ def pre_spec_page(
         card_id="filterCard",
         right_html='<button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>',
     )
+    analysis_ui_html = _ANALYSIS_MODAL_HTML if analysis_on else '    <div id="cartToast" role="alert"></div>'
+    analysis_script_html = f"<script>{_ANALYSIS_SCRIPT}</script>" if analysis_on else ""
 
     body = f"""
     {filter_card}
 
     <div class="card">
       <h2>수집된 사전규격</h2>
-      {_render_pre_spec_rows(rows, sort, qs)}
+      {_render_pre_spec_rows(rows, sort, qs, status_map)}
       {_render_pager(total, page, page_size, qs, base_path="/pre-spec")}
     </div>
 
@@ -2194,10 +2364,10 @@ def pre_spec_page(
       </div>
     </aside>
 
-    {_ANALYSIS_MODAL_HTML}
+    {analysis_ui_html}
     {_CART_MODAL_HTML}
     <script>{_PRE_SPEC_SCRIPT}</script>
-    <script>{_ANALYSIS_SCRIPT}</script>
+    {analysis_script_html}
     <script>{_CART_SCRIPT}</script>"""
 
     return HTMLResponse(
@@ -2261,6 +2431,8 @@ def list_page(
     df = _parse_date(dt_from_eff)
     dtto = _parse_date(dt_to_eff, end_of_day=True)
 
+    analysis_on = analysis_enabled()
+    status_map: dict[str, str] = {}
     # 가격: 화면 입력값 우선, 비었으면 설정 기본값(presmpt_prce_bgn/end).
     with SessionLocal() as session:
         cfg = repository.get_config(session)
@@ -2299,6 +2471,12 @@ def list_page(
             d = {c: getattr(o, c, None) for c in cols}
             d["_file_count"] = sum(1 for c in _SPEC_URL_COLUMNS if d.get(c))
             rows.append(d)
+        if analysis_on:
+            status_map = repository.get_analysis_status_map(
+                session,
+                "bid",
+                [str(r.get("bid_ntce_no")) for r in rows if r.get("bid_ntce_no")],
+            )
 
     # 입력칸 표시값(문자열). 정규화된 정수를 그대로 보여준다(없으면 빈칸).
     price_min_field = "" if price_min_disp is None else str(price_min_disp)
@@ -2382,6 +2560,8 @@ def list_page(
         </label>
         <input type="hidden" name="sort" value="{_e(sort)}">
       </div>"""
+    analysis_ui_html = _ANALYSIS_MODAL_HTML if analysis_on else '    <div id="cartToast" role="alert"></div>'
+    analysis_script_html = f"<script>{_ANALYSIS_SCRIPT}</script>" if analysis_on else ""
 
     body = f"""
     {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard",
@@ -2389,7 +2569,7 @@ def list_page(
 
     <div class="card">
       <h2>수집된 공고</h2>
-      {_render_list_rows(rows, sort, qs)}
+      {_render_list_rows(rows, sort, qs, status_map)}
       {_render_pager(total, page, page_size, qs)}
     </div>
 
@@ -2408,10 +2588,10 @@ def list_page(
       </div>
     </aside>
 
-    {_ANALYSIS_MODAL_HTML}
+    {analysis_ui_html}
     {_CART_MODAL_HTML}
     <script>{_LIST_SCRIPT}</script>
-    <script>{_ANALYSIS_SCRIPT}</script>
+    {analysis_script_html}
     <script>{_CART_SCRIPT}</script>"""
 
     return HTMLResponse(
@@ -2718,6 +2898,9 @@ async def analysis_upload(
         return {"status": "error", "message": "파일 크기가 50MB를 초과합니다."}
 
     with SessionLocal() as session:
+        existing = repository.get_analysis(session, normalized_type, source_id_value)
+        if existing is not None and existing.status == "analyzing":
+            return {"status": "analyzing"}
         repository.start_analysis(session, normalized_type, source_id_value, "upload")
     background_tasks.add_task(
         _run_analysis_bg,
