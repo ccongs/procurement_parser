@@ -136,7 +136,16 @@ def _full_analysis() -> RFPAnalysis:
         project_type="it_system",
         pain_points=["분산된 데이터"],
         hidden_needs=["운영 자동화"],
-        evaluation_strategy={"high_weight_items": ["아키텍처"]},
+        evaluation_strategy={
+            "high_weight_items": [
+                {
+                    "item": "아키텍처",
+                    "weight": 30,
+                    "proposal_emphasis": "확장성을 정량 근거로 제시",
+                }
+            ],
+            "emphasis_mapping": {"분석 단계": "이해관계자 협의 계획 강조"},
+        },
         win_theme_candidates=[
             {
                 "name": "안정적 전환",
@@ -272,9 +281,15 @@ def test_bid_analysis_html_renders_object_fields(client, db):
     assert resp.status_code == 200
     html = resp.text
     assert "[object Object]" not in html
+    assert "<title>RFP 분석 : 스마트 통합 플랫폼</title>" in html
     assert "스마트 통합 플랫폼" in html
     assert "100,000,000원" in html
     assert "분석 — 1개월" in html
     assert "[기능] 실시간 데이터 수집 (필수)" in html
     assert "아키텍처" in html
+    assert "제안 강조점" in html
+    assert "확장성을 정량 근거로 제시" in html
+    assert "분석 단계" in html
+    assert "이해관계자 협의 계획 강조" in html
+    assert "high_weight_items" not in html
     assert "안정적 전환" in html

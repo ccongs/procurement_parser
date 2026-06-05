@@ -124,7 +124,7 @@ def test_list_page_analyze_button_data_type(client):
     [
         ("none", ['data-status="none"', ">분석</button>"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', "분석보기", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
+        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
         ("error", ['data-status="error"', ">재분석</button>"]),
     ],
 )
@@ -185,7 +185,7 @@ def test_pre_spec_page_analyze_button_data_type(client):
     [
         ("none", ['data-status="none"', ">분석</button>"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', "분석보기", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
+        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
         ("error", ['data-status="error"', ">재분석</button>"]),
     ],
 )
@@ -284,4 +284,7 @@ def test_analysis_css_included(client):
     assert "analysis-actions" in resp.text
     assert "analysis-menu" in resp.text
     assert "analysis-menu-toggle" in resp.text
+    assert ".analysis-menu { display: none; position: fixed" in resp.text
+    assert "is-analyzing" in resp.text
+    assert "is-done" in resp.text
     assert "upload-area" in resp.text

@@ -688,12 +688,16 @@ BASE_CSS = """
   button.btn-analyze:hover { background: #e8dcff; }
   button.btn-analyze:disabled { opacity: .6; cursor: default; }
   button.btn-analyze.open { background: #5a3e8a; color: #fff; border-color: #5a3e8a; }
+  button.btn-analyze.is-analyzing { border-color: #e0a050; background: #fff4e0; color: #9a5b00; }
+  button.btn-analyze.is-analyzing:disabled { opacity: .85; }
+  button.btn-analyze.is-done { border-color: #4a9d68; background: #e7f6ec; color: #2f7d4f; }
+  button.btn-analyze.is-done:hover { background: #d8f0df; }
   /* 분석 완료 드롭다운 */
   .analysis-actions { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
   .analysis-actions .analysis-menu-toggle { padding: 4px 7px; }
-  .analysis-menu { display: none; position: absolute; right: 0; top: calc(100% + 4px); min-width: 96px;
+  .analysis-menu { display: none; position: fixed; min-width: 96px;
                    background: #fff; border: 1px solid #cbd2dc; border-radius: 6px;
-                   box-shadow: 0 4px 14px rgba(0,0,0,.14); z-index: 35; overflow: hidden; }
+                   box-shadow: 0 4px 14px rgba(0,0,0,.14); z-index: 80; overflow: hidden; }
   .analysis-actions.open .analysis-menu { display: block; }
   .analysis-menu button { display: block; width: 100%; border: 0; background: #fff; color: #1f2430;
                           padding: 7px 10px; text-align: left; font-size: 12px; cursor: pointer; white-space: nowrap; }
@@ -1055,15 +1059,15 @@ def _render_analysis_cell(
     )
     if safe_status == "analyzing":
         return (
-            f'<td><button type="button" class="btn-analyze" {attrs} '
+            f'<td><button type="button" class="btn-analyze is-analyzing" {attrs} '
             f'disabled aria-label="제안요청서 분석">분석중</button></td>'
         )
     if safe_status == "done":
         return (
             f'<td><div class="analysis-actions" {attrs}>'
-            f'<button type="button" class="btn-analyze" data-action="view" '
-            f'aria-label="분석 결과 보기">분석보기</button>'
-            f'<button type="button" class="btn-analyze analysis-menu-toggle" '
+            f'<button type="button" class="btn-analyze is-done" data-action="view" '
+            f'aria-label="분석 결과 보기">분석완료</button>'
+            f'<button type="button" class="btn-analyze is-done analysis-menu-toggle" '
             f'aria-label="분석 메뉴" aria-expanded="false">▾</button>'
             f'<div class="analysis-menu" role="menu">'
             f'<button type="button" data-action="view" role="menuitem">분석보기</button>'
@@ -1460,13 +1464,13 @@ _ANALYSIS_SCRIPT = """
     function renderControl(meta, status) {
       var attrs = dataAttrs(meta, status);
       if (status === 'analyzing') {
-        return '<button type="button" class="btn-analyze" ' + attrs
+        return '<button type="button" class="btn-analyze is-analyzing" ' + attrs
           + ' disabled aria-label="제안요청서 분석">분석중</button>';
       }
       if (status === 'done') {
         return '<div class="analysis-actions" ' + attrs + '>'
-          + '<button type="button" class="btn-analyze" data-action="view" aria-label="분석 결과 보기">분석보기</button>'
-          + '<button type="button" class="btn-analyze analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">▾</button>'
+          + '<button type="button" class="btn-analyze is-done" data-action="view" aria-label="분석 결과 보기">분석완료</button>'
+          + '<button type="button" class="btn-analyze is-done analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">▾</button>'
           + '<div class="analysis-menu" role="menu">'
           + '<button type="button" data-action="view" role="menuitem">분석보기</button>'
           + '<button type="button" data-action="reanalyze" role="menuitem">재분석</button>'
@@ -1515,13 +1519,40 @@ _ANALYSIS_SCRIPT = """
       if (control) setCellStatus(control, status);
     }
 
+    function closeMenu(root) {
+      if (!root) return;
+      root.classList.remove('open');
+      var toggle = root.querySelector('.analysis-menu-toggle');
+      var menu = root.querySelector('.analysis-menu');
+      if (toggle) toggle.setAttribute('aria-expanded', 'false');
+      if (menu) {
+        menu.style.left = '';
+        menu.style.top = '';
+      }
+    }
+
     function closeMenus(exceptRoot) {
       document.querySelectorAll('.analysis-actions.open').forEach(function (root) {
         if (exceptRoot && root === exceptRoot) return;
-        root.classList.remove('open');
-        var toggle = root.querySelector('.analysis-menu-toggle');
-        if (toggle) toggle.setAttribute('aria-expanded', 'false');
+        closeMenu(root);
       });
+    }
+
+    function positionMenu(root) {
+      var toggle = root && root.querySelector('.analysis-menu-toggle');
+      var menu = root && root.querySelector('.analysis-menu');
+      if (!toggle || !menu) return;
+      var gap = 4;
+      var edge = 8;
+      var rect = toggle.getBoundingClientRect();
+      var menuRect = menu.getBoundingClientRect();
+      var left = Math.max(edge, Math.min(rect.right - menuRect.width, window.innerWidth - menuRect.width - edge));
+      var top = rect.bottom + gap;
+      if (top + menuRect.height > window.innerHeight - edge) {
+        top = Math.max(edge, rect.top - menuRect.height - gap);
+      }
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
     }
 
     function confirmCost(meta) {
@@ -1652,8 +1683,9 @@ _ANALYSIS_SCRIPT = """
         if (root && willOpen) {
           root.classList.add('open');
           toggle.setAttribute('aria-expanded', 'true');
-        } else if (toggle) {
-          toggle.setAttribute('aria-expanded', 'false');
+          positionMenu(root);
+        } else {
+          closeMenu(root);
         }
         return;
       }
@@ -1680,6 +1712,9 @@ _ANALYSIS_SCRIPT = """
         return;
       }
     });
+
+    window.addEventListener('scroll', function () { closeMenus(); }, true);
+    window.addEventListener('resize', function () { closeMenus(); });
 
     var uploadInput = document.getElementById('uploadFileInput');
     var dropZone = document.getElementById('uploadDropZone');
@@ -2960,36 +2995,42 @@ def analysis_status(source_type: str, source_id: str):
         }
 
 
-def _analysis_page_shell(title: str, body: str) -> str:
+def _analysis_page_shell(title: str, body: str, head_title: str | None = None) -> str:
+    page_title = head_title or title
     return f"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{_e(title)}</title>
+  <title>{_e(page_title)}</title>
   <style>
     * {{ box-sizing: border-box; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-           margin: 0; background: #f4f5f7; color: #1f2430; }}
-    header {{ background: #1f3a5f; color: #fff; padding: 14px 24px; }}
+           margin: 0; background: #f6f4fb; color: #2f2740; }}
+    header {{ background: #5a3e8a; color: #fff; padding: 14px 24px; }}
     header h1 {{ margin: 0; font-size: 18px; }}
     main {{ max-width: 1120px; margin: 0 auto; padding: 20px; }}
     .card {{ background: #fff; border-radius: 8px; padding: 18px 20px; margin-bottom: 16px;
-             box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
-    h2 {{ margin: 0 0 12px; font-size: 16px; color: #1f3a5f; }}
-    h3 {{ margin: 12px 0 8px; font-size: 14px; color: #334155; }}
+             border: 1px solid #e0d8f5; border-top: 3px solid #c9b8ef;
+             box-shadow: 0 1px 3px rgba(61,40,112,.08); }}
+    h2 {{ margin: 0 0 12px; font-size: 16px; color: #5a3e8a; }}
+    h3 {{ margin: 12px 0 8px; font-size: 14px; color: #3d2870; }}
     p {{ font-size: 13px; line-height: 1.6; margin: 6px 0; }}
     ul, ol {{ margin: 0; padding-left: 22px; font-size: 13px; line-height: 1.7; }}
     li {{ margin: 3px 0; }}
     table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
-    th, td {{ border: 1px solid #e2e5ea; padding: 7px 9px; text-align: left; vertical-align: top; }}
-    th {{ background: #f0f3f8; }}
+    th, td {{ border: 1px solid #d8d0ee; padding: 7px 9px; text-align: left; vertical-align: top; }}
+    th {{ background: #ede5ff; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 14px; }}
-    .label {{ color: #6b7280; font-weight: 600; margin-right: 6px; }}
-    .muted {{ color: #8a93a2; }}
-    .theme {{ border: 1px solid #d9e0ea; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }}
+    .label {{ color: #5a3e8a; font-weight: 600; margin-right: 6px; }}
+    .muted {{ color: #7d728f; }}
+    .theme {{ border: 1px solid #e0d8f5; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }}
+    .kv-list {{ margin: 0; font-size: 13px; line-height: 1.6; }}
+    .kv-list dt {{ color: #3d2870; font-weight: 600; margin-top: 8px; }}
+    .kv-list dd {{ margin: 2px 0 8px 0; }}
+    .kv-list.compact {{ margin-left: 0; }}
     .pre {{ white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; font-size: 12px; }}
+            background: #fbf8ff; border: 1px solid #e0d8f5; border-radius: 6px; padding: 10px; font-size: 12px; }}
   </style>
 </head>
 <body>
@@ -3099,6 +3140,96 @@ def _render_eval_table(items: list[dict[str, Any]]) -> str:
     </section>"""
 
 
+def _render_readable_value(value: Any) -> str:
+    if isinstance(value, dict):
+        if not value:
+            return '<span class="muted">없음</span>'
+        return '<dl class="kv-list compact">' + "".join(
+            f"<dt>{_e(k)}</dt><dd>{_render_readable_value(v)}</dd>"
+            for k, v in value.items()
+        ) + "</dl>"
+    if isinstance(value, list):
+        if not value:
+            return '<span class="muted">없음</span>'
+        return "<ul>" + "".join(
+            f"<li>{_render_readable_value(item)}</li>"
+            for item in value
+        ) + "</ul>"
+    return _e(value)
+
+
+def _render_eval_strategy(value: Any) -> str:
+    if not value:
+        return '<section class="card"><h2>평가 전략</h2><p class="muted">없음</p></section>'
+    if not isinstance(value, dict):
+        return (
+            '<section class="card"><h2>평가 전략</h2>'
+            f"{_render_readable_value(value)}</section>"
+        )
+
+    high_items = value.get("high_weight_items")
+    mapping = value.get("emphasis_mapping")
+    parts: list[str] = []
+    if isinstance(high_items, list) and high_items:
+        rows = []
+        for item in high_items:
+            if isinstance(item, dict):
+                if any(k in item for k in ("item", "weight", "proposal_emphasis")):
+                    rows.append(
+                        "<tr>"
+                        f"<td>{_e(item.get('item'))}</td>"
+                        f"<td>{_e(item.get('weight'))}</td>"
+                        f"<td>{_e(item.get('proposal_emphasis'))}</td>"
+                        "</tr>"
+                    )
+                else:
+                    rows.append(
+                        "<tr>"
+                        f'<td colspan="3">{_render_readable_value(item)}</td>'
+                        "</tr>"
+                    )
+            else:
+                rows.append(
+                    "<tr>"
+                    f"<td>{_e(item)}</td>"
+                    "<td></td><td></td>"
+                    "</tr>"
+                )
+        parts.append(
+            "<h3>고배점 항목</h3><table>"
+            "<thead><tr><th>항목</th><th>배점</th><th>제안 강조점</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+    elif high_items:
+        parts.append(
+            "<h3>고배점 항목</h3>"
+            f"{_render_readable_value(high_items)}"
+        )
+
+    if isinstance(mapping, dict) and mapping:
+        items = "".join(
+            f"<dt>{_e(phase)}</dt><dd>{_render_readable_value(text)}</dd>"
+            for phase, text in mapping.items()
+        )
+        parts.append(f'<h3>전략 매핑</h3><dl class="kv-list">{items}</dl>')
+    elif mapping:
+        parts.append(
+            "<h3>전략 매핑</h3>"
+            f"{_render_readable_value(mapping)}"
+        )
+
+    extra = {
+        k: v
+        for k, v in value.items()
+        if k not in {"high_weight_items", "emphasis_mapping"}
+    }
+    if extra:
+        parts.append(f"<h3>기타</h3>{_render_readable_value(extra)}")
+    if not parts:
+        parts.append(_render_readable_value(value))
+    return f'<section class="card"><h2>평가 전략</h2>{"".join(parts)}</section>'
+
+
 def _render_deliverables(items: list[dict[str, Any]]) -> str:
     if not items:
         content = '<li class="muted">없음</li>'
@@ -3165,7 +3296,7 @@ def _render_analysis_html(data: dict[str, Any]) -> str:
     {list_sections}
     <section class="card"><h2>수주 전략</h2><p>{_e(data.get('winning_strategy'))}</p></section>
     <section class="card"><h2>예상 경쟁 환경</h2><p>{_e(data.get('competitive_landscape'))}</p></section>
-    {_render_json_block('평가 전략', data.get('evaluation_strategy'))}
+    {_render_eval_strategy(data.get('evaluation_strategy'))}
     {_render_win_themes(data.get('win_theme_candidates') or [])}
     {_render_json_block('원본 섹션', data.get('raw_sections'))}
     """
@@ -3178,6 +3309,7 @@ def analysis_page(source_type: str, source_id: str) -> HTMLResponse:
     with SessionLocal() as session:
         row = repository.get_analysis(session, normalized_type, source_id)
 
+    head_title = "RFP 분석 결과"
     if row is None:
         body = '<section class="card"><h2>분석 결과 없음</h2><p>아직 분석을 시작하지 않았습니다.</p></section>'
     elif row.status == "analyzing":
@@ -3195,9 +3327,12 @@ def analysis_page(source_type: str, source_id: str) -> HTMLResponse:
         if not isinstance(parsed, dict):
             body = '<section class="card"><h2>분석 결과 오류</h2><p>저장된 결과를 읽을 수 없습니다.</p></section>'
         else:
+            project_name = parsed.get("project_name")
+            if project_name:
+                head_title = f"RFP 분석 : {project_name}"
             body = _render_analysis_html(parsed)
 
-    return HTMLResponse(_analysis_page_shell("RFP 분석 결과", body))
+    return HTMLResponse(_analysis_page_shell("RFP 분석 결과", body, head_title=head_title))
 
 
 # --- /config ---------------------------------------------------------

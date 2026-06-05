@@ -13,7 +13,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "openai": "gpt-4o",
     "gemini": "gemini-2.0-flash",
 }
-DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 16384
 
 
 class AnalysisProvider(ABC):

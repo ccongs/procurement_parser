@@ -151,13 +151,13 @@ def test_gemini_default_model(monkeypatch):
 
 
 def test_create_provider_default_max_tokens(monkeypatch):
-    """ANALYSIS_MAX_TOKENS 미설정 시 기본 8192."""
+    """ANALYSIS_MAX_TOKENS 미설정 시 기본 16384."""
     monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
     monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
     monkeypatch.delenv("ANALYSIS_MAX_TOKENS", raising=False)
     with patch("anthropic.AsyncAnthropic"):
         p = create_provider()
-    assert p.max_tokens == 8192
+    assert p.max_tokens == 16384
 
 
 def test_create_provider_override_max_tokens(monkeypatch):
@@ -171,23 +171,23 @@ def test_create_provider_override_max_tokens(monkeypatch):
 
 
 def test_create_provider_invalid_max_tokens_fallback(monkeypatch):
-    """ANALYSIS_MAX_TOKENS 비정상 값은 8192로 폴백."""
+    """ANALYSIS_MAX_TOKENS 비정상 값은 16384로 폴백."""
     monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
     monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
     monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "not-a-number")
     with patch("anthropic.AsyncAnthropic"):
         p = create_provider()
-    assert p.max_tokens == 8192
+    assert p.max_tokens == 16384
 
 
 def test_create_provider_empty_max_tokens_fallback(monkeypatch):
-    """ANALYSIS_MAX_TOKENS 빈 문자열은 8192로 폴백."""
+    """ANALYSIS_MAX_TOKENS 빈 문자열은 16384로 폴백."""
     monkeypatch.setenv("ANALYSIS_PROVIDER", "claude")
     monkeypatch.setenv("CLAUDE_API_KEY", "sk-test")
     monkeypatch.setenv("ANALYSIS_MAX_TOKENS", "")
     with patch("anthropic.AsyncAnthropic"):
         p = create_provider()
-    assert p.max_tokens == 8192
+    assert p.max_tokens == 16384
 
 
 def test_create_provider_openai_max_tokens(monkeypatch):
