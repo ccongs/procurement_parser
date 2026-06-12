@@ -866,12 +866,31 @@ def _fmt_amt(value: Any) -> str:
         return str(value)
 
 
+# 공고종류명(ntceKindNm) 값별 배지 클래스. 등록공고=기본, 재공고/변경공고=warn, 취소공고=err.
+_NTCE_KIND_BADGE: dict[str, str] = {
+    "재공고": "warn",
+    "변경공고": "warn",
+    "취소공고": "err",
+}
+
+
+def _render_ntce_kind(value: Any) -> str:
+    """'구분' 셀: 공고종류명을 배지로 표시. 값 없으면 '-'."""
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return "<td>-</td>"
+    cls = _NTCE_KIND_BADGE.get(s, "")
+    cls_attr = f"badge {cls}".strip()
+    return f'<td><span class="{cls_attr}">{_e(s)}</span></td>'
+
+
 # --- /list -----------------------------------------------------------
 # (컬럼명, 표시 종류, 한글 헤더). /list 는 한글 헤더만 노출한다(영문 병기 없음).
 # field_labels.py(camelCase 키)는 /list 의 snake_case 와 맞지 않아 미해석되므로,
 # 여기서 컬럼별 한글 헤더를 직접 큐레이션한다(field_labels.py 는 /api-test 전용으로 유지).
 _LIST_COLUMNS: list[tuple[str, str, str]] = [
     ("bid_ntce_no", "text", "공고번호"),
+    ("ntce_kind_nm", "ntcekind", "구분"),
     ("bid_ntce_nm", "link", "공고명"),
     ("ntce_instt_nm", "instt", "공고기관/수요기관"),
     ("asign_bdgt_amt", "amt", "배정예산"),
@@ -1127,6 +1146,8 @@ def _render_list_rows(
                 cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
             elif kind == "matchind":
                 cells.append(_render_matched_inds(val))
+            elif kind == "ntcekind":
+                cells.append(_render_ntce_kind(val))
             elif kind == "instt":
                 cells.append(_render_instt(val, r.get("dminstt_nm")))
             elif kind == "link":
