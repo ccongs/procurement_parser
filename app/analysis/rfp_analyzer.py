@@ -183,22 +183,25 @@ class RFPAnalyzer:
     def _format_documents(self, documents: list[dict[str, Any]]) -> str:
         """다중 문서 입력을 모델용 섹션 문자열로 변환한다."""
         document_count = max(len(documents), 1)
-        if document_count * _MULTI_MIN_CHARS_PER_DOC <= _MULTI_INPUT_CHARS:
+        separator = "\n\n"
+        separator_budget = len(separator) * max(len(documents) - 1, 0)
+        section_budget = max(0, _MULTI_INPUT_CHARS - separator_budget)
+        if document_count * _MULTI_MIN_CHARS_PER_DOC <= section_budget:
             per_doc_chars = max(
-                _MULTI_INPUT_CHARS // document_count,
+                section_budget // document_count,
                 _MULTI_MIN_CHARS_PER_DOC,
             )
         else:
-            per_doc_chars = _MULTI_INPUT_CHARS // document_count
+            per_doc_chars = section_budget // document_count
         sections: list[str] = []
         for index, doc in enumerate(documents, start=1):
             label = str(doc.get("label") or "기타")
             filename = str(doc.get("filename") or f"document-{index}")
-            text = self._truncate_text(str(doc.get("text", "")), per_doc_chars)
-            sections.append(
-                f"## 문서 {index} — {label} (파일명: {filename})\n{text}"
-            )
-        return "\n\n".join(sections)
+            header = f"## 문서 {index} — {label} (파일명: {filename})\n"
+            body_budget = max(0, per_doc_chars - len(header))
+            text = self._truncate_text(str(doc.get("text", "")), body_budget)
+            sections.append(f"{header}{text}")
+        return separator.join(sections)
 
     def _json_response_instruction(self) -> str:
         """분석 결과 JSON 출력 지시문."""

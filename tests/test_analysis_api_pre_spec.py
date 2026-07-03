@@ -266,6 +266,38 @@ def test_upload_starts_analysis_and_registers_background_task(client, db, monkey
         assert row.source_kind == "upload"
 
 
+def test_upload_accepts_legacy_file_field_and_registers_background_task(client, monkeypatch):
+    calls: list[dict] = []
+    registered_tasks: list[tuple[object, tuple, dict]] = []
+    original_add_task = BackgroundTasks.add_task
+
+    async def fake_run_bg(source_type: str, source_id: str, **kwargs):
+        calls.append({"source_type": source_type, "source_id": source_id, **kwargs})
+
+    def recording_add_task(self, func, *args, **kwargs):  # noqa: ANN001
+        registered_tasks.append((func, args, kwargs))
+        return original_add_task(self, func, *args, **kwargs)
+
+    monkeypatch.setattr(main, "_run_analysis_bg", fake_run_bg)
+    monkeypatch.setattr(BackgroundTasks, "add_task", recording_add_task)
+
+    resp = client.post(
+        "/api/analysis/upload",
+        data={"source_type": "pre_spec", "source_id": "PS001"},
+        files={"file": ("manual.pdf", b"%PDF-1.4", "application/pdf")},
+    )
+
+    expected_items = [{"filename": "manual.pdf", "bytes": b"%PDF-1.4", "label": "manual.pdf"}]
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "analyzing"}
+    assert len(registered_tasks) == 1
+    func, args, kwargs = registered_tasks[0]
+    assert func is fake_run_bg
+    assert args == ("pre_spec", "PS001")
+    assert kwargs == {"items": expected_items}
+    assert calls == [{"source_type": "pre_spec", "source_id": "PS001", "items": expected_items}]
+
+
 def test_upload_accepts_type_id_alias(client, monkeypatch):
     calls: list[tuple[str, str]] = []
 
@@ -359,7 +391,8 @@ def test_upload_zero_files_returns_400(client):
     assert resp.json()["status"] == "error"
 
 
-def test_upload_too_many_files_returns_413_without_reading_files():
+def test_upload_too_many_files_returns_413_without_reading_files(db, monkeypatch):
+    monkeypatch.setattr(main, "SessionLocal", db)
     bg = BackgroundTasks()
     response = Response()
     upload_files = [

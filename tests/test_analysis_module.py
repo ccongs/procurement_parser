@@ -650,7 +650,7 @@ async def test_rfp_analyzer_multi_documents_prompt(monkeypatch):
 
 
 def test_rfp_analyzer_multi_documents_total_text_budget():
-    """문서가 6개 이상이어도 모델 입력 문서 본문 합계는 다중 입력 상한을 넘지 않는다."""
+    """문서가 6개 이상이어도 헤더 포함 렌더 결과는 다중 입력 상한을 넘지 않는다."""
     from app.analysis import rfp_analyzer as rfp_analyzer_module
     from app.analysis.rfp_analyzer import RFPAnalyzer
 
@@ -661,16 +661,17 @@ def test_rfp_analyzer_multi_documents_total_text_budget():
     ]
 
     formatted = analyzer._format_documents(documents)
-    bodies = re.findall(
-        r"## 문서 \d+ — .*?\n([\s\S]*?)(?=\n\n## 문서 \d+ —|\Z)",
+    sections = re.findall(
+        r"## 문서 \d+ — .*?\n[\s\S]*?(?=\n\n## 문서 \d+ —|\Z)",
         formatted,
     )
 
-    assert len(bodies) == len(documents)
-    assert sum(len(body) for body in bodies) <= rfp_analyzer_module._MULTI_INPUT_CHARS
+    assert len(formatted) <= rfp_analyzer_module._MULTI_INPUT_CHARS
+    assert len(sections) == len(documents)
+    assert sum(len(section) for section in sections) <= rfp_analyzer_module._MULTI_INPUT_CHARS
     assert all(
-        len(body) <= rfp_analyzer_module._MULTI_INPUT_CHARS // len(documents)
-        for body in bodies
+        len(section) <= rfp_analyzer_module._MULTI_INPUT_CHARS // len(documents)
+        for section in sections
     )
 
 
