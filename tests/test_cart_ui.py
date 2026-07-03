@@ -14,7 +14,7 @@ UI 동작(JS/CSS)은 pytest로 완전 검증 불가능하므로:
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -50,7 +50,10 @@ def _cfg() -> AppConfig:
     )
 
 
-_META = datetime(2026, 6, 1, 12, 0, 0)
+_TODAY = date.today()
+_META = datetime.combine(_TODAY - timedelta(days=1), time(12, 0, 0))
+_FUTURE_OPEN = datetime.combine(_TODAY + timedelta(days=30), time(10, 0, 0))
+_FUTURE_CLOSE = datetime.combine(_TODAY + timedelta(days=30), time(18, 0, 0))
 
 
 @pytest.fixture
@@ -73,7 +76,7 @@ def client(tmp_path, monkeypatch):
             bid_ntce_nm="장바구니 테스트 입찰공고",
             ntce_instt_nm="테스트기관",
             bid_ntce_dt=_META,
-            openg_dt=datetime(2026, 8, 1, 10, 0, 0),
+            openg_dt=_FUTURE_OPEN,
             collected_at=_META,
             updated_at=_META,
         ))
@@ -83,7 +86,7 @@ def client(tmp_path, monkeypatch):
             prdct_clsfc_no_nm="장바구니 테스트 사전규격",
             order_instt_nm="테스트기관",
             rcpt_dt=_META,
-            opnin_rgst_clse_dt=datetime(2026, 8, 1, 18, 0, 0),
+            opnin_rgst_clse_dt=_FUTURE_CLOSE,
             collected_at=_META,
             updated_at=_META,
         ))

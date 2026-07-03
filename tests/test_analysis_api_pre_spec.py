@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, Response
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -17,7 +17,6 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-placeholder")
 
 from app import main, repository
 from app.analysis.analyzer_service import AnalysisResult as ServiceAnalysisResult
-from app.analysis.analyzer_service import UnsupportedFormatError
 from app.analysis.rfp_schema import RFPAnalysis
 from app.db import Base
 from app.models import AppConfig, PreSpec
@@ -107,6 +106,36 @@ def _analysis() -> RFPAnalysis:
     )
 
 
+class _CountingUploadFile:
+    def __init__(self, filename: str, payload=b"%PDF-1.4", *, fail_on_read: bool = False):
+        self.filename = filename
+        self._payload = payload
+        self._fail_on_read = fail_on_read
+        self.read_count = 0
+
+    async def read(self) -> bytes:
+        self.read_count += 1
+        if self._fail_on_read:
+            raise AssertionError("read() 호출 전에 반환되어야 합니다.")
+        if callable(self._payload):
+            return self._payload()
+        return self._payload
+
+
+def test_find_auto_analysis_urls_pre_spec_first_file(db):
+    with db() as s:
+        urls = main._find_auto_analysis_urls(s, "pre_spec", "PS001")
+
+    assert urls == [
+        {"url": "https://example.test/spec.pdf", "name": "첨부1", "doc_kind": "기타"}
+    ]
+
+
+def test_find_auto_analysis_urls_pre_spec_no_file(db):
+    with db() as s:
+        assert main._find_auto_analysis_urls(s, "pre_spec", "PS002") == []
+
+
 def test_pre_spec_trigger_registers_background_task_with_standard_type(db):
     bg = BackgroundTasks()
 
@@ -117,7 +146,9 @@ def test_pre_spec_trigger_registers_background_task_with_standard_type(db):
     task = bg.tasks[0]
     assert task.func is main._run_analysis_bg
     assert task.args == ("pre_spec", "PS001")
-    assert task.kwargs["url"] == "https://example.test/spec.pdf"
+    assert task.kwargs["items"] == [
+        {"url": "https://example.test/spec.pdf", "name": "첨부1", "doc_kind": "기타"}
+    ]
     with db() as s:
         row = repository.get_analysis(s, "pre_spec", "PS001")
         assert row is not None
@@ -151,16 +182,22 @@ def test_pre_spec_not_found(client):
 
 
 def test_pre_spec_background_success_updates_done(db, monkeypatch):
-    async def fake_analyze_from_url(url: str) -> ServiceAnalysisResult:
-        assert url == "https://example.test/spec.pdf"
+    async def fake_analyze_from_urls(items: list[dict]) -> ServiceAnalysisResult:
+        assert items == [
+            {"url": "https://example.test/spec.pdf", "doc_kind": "기타"}
+        ]
         return ServiceAnalysisResult(status="ok", analysis=_analysis())
 
-    monkeypatch.setattr(main, "analyze_from_url", fake_analyze_from_url)
+    monkeypatch.setattr(main, "analyze_from_urls", fake_analyze_from_urls)
     with db() as s:
         repository.start_analysis(s, "pre_spec", "PS001", "auto")
 
     asyncio.run(
-        main._run_analysis_bg("pre_spec", "PS001", url="https://example.test/spec.pdf")
+        main._run_analysis_bg(
+            "pre_spec",
+            "PS001",
+            items=[{"url": "https://example.test/spec.pdf", "doc_kind": "기타"}],
+        )
     )
 
     with db() as s:
@@ -171,15 +208,19 @@ def test_pre_spec_background_success_updates_done(db, monkeypatch):
 
 
 def test_pre_spec_background_exception_updates_error(db, monkeypatch):
-    async def fake_analyze_from_url(url: str) -> ServiceAnalysisResult:
+    async def fake_analyze_from_urls(items: list[dict]) -> ServiceAnalysisResult:
         raise RuntimeError("provider timeout")
 
-    monkeypatch.setattr(main, "analyze_from_url", fake_analyze_from_url)
+    monkeypatch.setattr(main, "analyze_from_urls", fake_analyze_from_urls)
     with db() as s:
         repository.start_analysis(s, "pre_spec", "PS001", "auto")
 
     asyncio.run(
-        main._run_analysis_bg("pre_spec", "PS001", url="https://example.test/spec.pdf")
+        main._run_analysis_bg(
+            "pre_spec",
+            "PS001",
+            items=[{"url": "https://example.test/spec.pdf", "doc_kind": "기타"}],
+        )
     )
 
     with db() as s:
@@ -200,7 +241,10 @@ def test_upload_starts_analysis_and_registers_background_task(client, db, monkey
     resp = client.post(
         "/api/analysis/upload",
         data={"source_type": "pre_spec", "source_id": "PS001"},
-        files={"file": ("manual.pdf", b"%PDF-1.4", "application/pdf")},
+        files=[
+            ("files", ("manual.pdf", b"%PDF-1.4", "application/pdf")),
+            ("files", ("task.docx", b"PK\x03\x04", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+        ],
     )
 
     assert resp.status_code == 200
@@ -209,8 +253,10 @@ def test_upload_starts_analysis_and_registers_background_task(client, db, monkey
         {
             "source_type": "pre_spec",
             "source_id": "PS001",
-            "file_bytes": b"%PDF-1.4",
-            "filename": "manual.pdf",
+            "items": [
+                {"filename": "manual.pdf", "bytes": b"%PDF-1.4", "label": "manual.pdf"},
+                {"filename": "task.docx", "bytes": b"PK\x03\x04", "label": "task.docx"},
+            ],
         }
     ]
     with db() as s:
@@ -239,26 +285,31 @@ def test_upload_accepts_type_id_alias(client, monkeypatch):
     assert calls == [("pre_spec", "PS001")]
 
 
-def test_upload_already_analyzing_does_not_register_background_task(client, db, monkeypatch):
+def test_upload_already_analyzing_does_not_read_files_or_register_background_task(db):
     with db() as s:
         repository.start_analysis(s, "pre_spec", "PS001", "auto")
 
-    calls: list[tuple[str, str]] = []
-
-    async def fake_run_bg(source_type: str, source_id: str, **kwargs):
-        calls.append((source_type, source_id))
-
-    monkeypatch.setattr(main, "_run_analysis_bg", fake_run_bg)
-
-    resp = client.post(
-        "/api/analysis/upload",
-        data={"type": "pre_spec", "id": "PS001"},
-        files={"file": ("manual.pdf", b"%PDF-1.4", "application/pdf")},
+    bg = BackgroundTasks()
+    response = Response()
+    upload_file = _CountingUploadFile(
+        "too-large.pdf",
+        payload=lambda: b"x" * (main._ANALYSIS_MAX_BYTES + 1),
     )
 
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "analyzing"}
-    assert calls == []
+    body = asyncio.run(
+        main.analysis_upload(
+            background_tasks=bg,
+            response=response,
+            files=[upload_file],
+            source_type="pre_spec",
+            source_id="PS001",
+        )
+    )
+
+    assert response.status_code == 200
+    assert body == {"status": "analyzing"}
+    assert upload_file.read_count == 0
+    assert bg.tasks == []
     with db() as s:
         row = repository.get_analysis(s, "pre_spec", "PS001")
         assert row is not None
@@ -272,7 +323,7 @@ def test_upload_file_too_large(client):
     resp = client.post(
         "/api/analysis/upload",
         data={"source_type": "pre_spec", "source_id": "PS001"},
-        files={"file": ("big.pdf", large_bytes, "application/pdf")},
+        files={"files": ("big.pdf", large_bytes, "application/pdf")},
     )
 
     assert resp.status_code == 413
@@ -280,11 +331,64 @@ def test_upload_file_too_large(client):
     assert "50MB" in resp.json()["message"]
 
 
-def test_upload_background_unsupported_updates_error(db, monkeypatch):
-    async def fake_analyze_file(file_bytes: bytes, filename: str) -> ServiceAnalysisResult:
-        raise UnsupportedFormatError("지원하지 않는 형식: .zip")
+def test_upload_total_too_large(client):
+    chunk = b"x" * (50 * 1024 * 1024)
 
-    monkeypatch.setattr(main, "analyze_file", fake_analyze_file)
+    resp = client.post(
+        "/api/analysis/upload",
+        data={"source_type": "pre_spec", "source_id": "PS001"},
+        files=[
+            ("files", ("a.pdf", chunk, "application/pdf")),
+            ("files", ("b.pdf", chunk, "application/pdf")),
+            ("files", ("c.pdf", b"x", "application/pdf")),
+        ],
+    )
+
+    assert resp.status_code == 413
+    assert resp.json()["status"] == "error"
+    assert "100MB" in resp.json()["message"]
+
+
+def test_upload_zero_files_returns_400(client):
+    resp = client.post(
+        "/api/analysis/upload",
+        data={"source_type": "pre_spec", "source_id": "PS001"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["status"] == "error"
+
+
+def test_upload_too_many_files_returns_413_without_reading_files():
+    bg = BackgroundTasks()
+    response = Response()
+    upload_files = [
+        _CountingUploadFile(f"manual-{idx}.pdf", fail_on_read=True)
+        for idx in range(main._ANALYSIS_UPLOAD_MAX_FILES + 1)
+    ]
+
+    body = asyncio.run(
+        main.analysis_upload(
+            background_tasks=bg,
+            response=response,
+            files=upload_files,
+            source_type="pre_spec",
+            source_id="PS001",
+        )
+    )
+
+    assert response.status_code == 413
+    assert body["status"] == "error"
+    assert str(main._ANALYSIS_UPLOAD_MAX_FILES) in body["message"]
+    assert [file.read_count for file in upload_files] == [0] * len(upload_files)
+    assert bg.tasks == []
+
+
+def test_upload_background_unsupported_updates_error(db, monkeypatch):
+    async def fake_analyze_documents(items: list[dict]) -> ServiceAnalysisResult:
+        return ServiceAnalysisResult(status="unsupported", message="지원하지 않는 형식: .zip")
+
+    monkeypatch.setattr(main, "analyze_documents", fake_analyze_documents)
     with db() as s:
         repository.start_analysis(s, "pre_spec", "PS001", "upload")
 
@@ -292,8 +396,7 @@ def test_upload_background_unsupported_updates_error(db, monkeypatch):
         main._run_analysis_bg(
             "pre_spec",
             "PS001",
-            file_bytes=b"PK\x03\x04",
-            filename="archive.zip",
+            items=[{"bytes": b"PK\x03\x04", "filename": "archive.zip", "label": "archive.zip"}],
         )
     )
 

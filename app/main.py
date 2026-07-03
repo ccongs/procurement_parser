@@ -46,9 +46,8 @@ from app.api_client import (
 )
 from app.analysis.analyzer_service import (
     AnalysisResult as ServiceAnalysisResult,
-    UnsupportedFormatError,
-    analyze_file,
-    analyze_from_url,
+    analyze_documents,
+    analyze_from_urls,
     SUPPORTED_EXTENSIONS,
 )
 from app.analysis.provider import analysis_enabled
@@ -1090,17 +1089,28 @@ def _render_analysis_cell(
             f'aria-label="분석 메뉴" aria-expanded="false">▾</button>'
             f'<div class="analysis-menu" role="menu">'
             f'<button type="button" data-action="view" role="menuitem">분석보기</button>'
-            f'<button type="button" data-action="reanalyze" role="menuitem">재분석</button>'
+            f'<button type="button" data-action="auto" role="menuitem">자동 재분석</button>'
+            f'<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
             f'</div></div></td>'
         )
     if safe_status == "error":
         return (
-            f'<td><button type="button" class="btn-analyze" {attrs} '
-            f'aria-label="제안요청서 재분석">재분석</button></td>'
+            f'<td><div class="analysis-actions" {attrs}>'
+            f'<button type="button" class="btn-analyze analysis-menu-toggle" '
+            f'aria-label="분석 메뉴" aria-expanded="false">재분석 ▾</button>'
+            f'<div class="analysis-menu" role="menu">'
+            f'<button type="button" data-action="auto" role="menuitem">자동</button>'
+            f'<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
+            f'</div></div></td>'
         )
     return (
-        f'<td><button type="button" class="btn-analyze" {attrs} '
-        f'aria-label="제안요청서 분석">분석</button></td>'
+        f'<td><div class="analysis-actions" {attrs}>'
+        f'<button type="button" class="btn-analyze analysis-menu-toggle" '
+        f'aria-label="분석 메뉴" aria-expanded="false">분석 ▾</button>'
+        f'<div class="analysis-menu" role="menu">'
+        f'<button type="button" data-action="auto" role="menuitem">자동</button>'
+        f'<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
+        f'</div></div></td>'
     )
 
 
@@ -1432,7 +1442,8 @@ _ANALYSIS_SCRIPT = """
     var _requesting = {};
     var _uploadMeta = null;
     var _uploadRoot = null;
-    var _uploadFile = null;
+    var _uploadFiles = [];
+    var _uploadConfirmed = false;
 
     function esc(s) {
       if (!s) return '';
@@ -1494,15 +1505,24 @@ _ANALYSIS_SCRIPT = """
           + '<button type="button" class="btn-analyze is-done analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">▾</button>'
           + '<div class="analysis-menu" role="menu">'
           + '<button type="button" data-action="view" role="menuitem">분석보기</button>'
-          + '<button type="button" data-action="reanalyze" role="menuitem">재분석</button>'
+          + '<button type="button" data-action="auto" role="menuitem">자동 재분석</button>'
+          + '<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
           + '</div></div>';
       }
       if (status === 'error') {
-        return '<button type="button" class="btn-analyze" ' + attrs
-          + ' aria-label="제안요청서 재분석">재분석</button>';
+        return '<div class="analysis-actions" ' + attrs + '>'
+          + '<button type="button" class="btn-analyze analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">재분석 ▾</button>'
+          + '<div class="analysis-menu" role="menu">'
+          + '<button type="button" data-action="auto" role="menuitem">자동</button>'
+          + '<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
+          + '</div></div>';
       }
-      return '<button type="button" class="btn-analyze" ' + attrs
-        + ' aria-label="제안요청서 분석">분석</button>';
+      return '<div class="analysis-actions" ' + attrs + '>'
+        + '<button type="button" class="btn-analyze analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">분석 ▾</button>'
+        + '<div class="analysis-menu" role="menu">'
+        + '<button type="button" data-action="auto" role="menuitem">자동</button>'
+        + '<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
+        + '</div></div>';
     }
 
     function setBusy(root, busy) {
@@ -1642,7 +1662,7 @@ _ANALYSIS_SCRIPT = """
           startPolling(meta.type, meta.id);
         } else if (data.status === 'need_upload') {
           setBusy(triggerEl || meta.root, false);
-          openUploadModal(data.message, meta, triggerEl || meta.root);
+          openUploadModal(data.message, meta, triggerEl || meta.root, true);
         } else {
           showToast(data.message || '분석 요청 중 오류가 발생했습니다.');
           setBusy(triggerEl || meta.root, false);
@@ -1655,7 +1675,8 @@ _ANALYSIS_SCRIPT = """
       }
     }
 
-    function openUploadModal(message, meta, root) {
+    function openUploadModal(message, meta, root, alreadyConfirmed) {
+      if (!meta) return;
       _uploadMeta = {
         type: meta.type,
         id: meta.id,
@@ -1663,7 +1684,8 @@ _ANALYSIS_SCRIPT = """
         colspan: meta.colspan
       };
       _uploadRoot = getRoot(root);
-      _uploadFile = null;
+      _uploadFiles = [];
+      _uploadConfirmed = !!alreadyConfirmed;
 
       var modal = document.getElementById('analysisUploadModal');
       var msgEl = document.getElementById('uploadModalMessage');
@@ -1671,11 +1693,10 @@ _ANALYSIS_SCRIPT = """
       var submitBtn = document.getElementById('uploadSubmitBtn');
       var input = document.getElementById('uploadFileInput');
 
-      if (msgEl) msgEl.textContent = message || '파일을 직접 업로드해 분석하세요.';
+      if (msgEl) msgEl.textContent = message || '파일을 직접 업로드해 분석하세요. 여러 개 선택할 수 있습니다.';
       if (filenameEl) filenameEl.textContent = '';
       if (submitBtn) submitBtn.disabled = true;
       if (input) input.value = '';
-      _uploadFile = null;
 
       if (modal) modal.classList.add('open');
     }
@@ -1683,9 +1704,14 @@ _ANALYSIS_SCRIPT = """
     function closeUploadModal() {
       var modal = document.getElementById('analysisUploadModal');
       if (modal) modal.classList.remove('open');
-      _uploadFile = null;
+      _uploadFiles = [];
       _uploadMeta = null;
       _uploadRoot = null;
+      _uploadConfirmed = false;
+      var filenameEl = document.getElementById('uploadFilename');
+      var input = document.getElementById('uploadFileInput');
+      if (filenameEl) filenameEl.textContent = '';
+      if (input) input.value = '';
       var submitBtn = document.getElementById('uploadSubmitBtn');
       if (submitBtn) {
         submitBtn.disabled = true;
@@ -1718,8 +1744,10 @@ _ANALYSIS_SCRIPT = """
         closeMenus();
         if (actionName === 'view') {
           openAnalysisWindow(actionMeta);
-        } else if (actionName === 'reanalyze') {
+        } else if (actionName === 'auto') {
           runAnalysis(actionMeta, action);
+        } else if (actionName === 'upload') {
+          openUploadModal('분석할 파일을 업로드하세요. 여러 개 선택할 수 있습니다.', actionMeta, action);
         }
         return;
       }
@@ -1742,15 +1770,24 @@ _ANALYSIS_SCRIPT = """
     var submitBtn = document.getElementById('uploadSubmitBtn');
     var filenameEl = document.getElementById('uploadFilename');
 
-    function handleFile(file) {
-      _uploadFile = file;
-      if (filenameEl) filenameEl.textContent = file.name;
-      if (submitBtn) submitBtn.disabled = false;
+    function handleFiles(fileList) {
+      _uploadFiles = Array.prototype.slice.call(fileList || []).filter(Boolean);
+      if (filenameEl) {
+        if (_uploadFiles.length === 0) {
+          filenameEl.textContent = '';
+        } else if (_uploadFiles.length === 1) {
+          filenameEl.textContent = _uploadFiles[0].name;
+        } else {
+          filenameEl.textContent = _uploadFiles.length + '개 파일: '
+            + _uploadFiles.map(function (file) { return file.name; }).join(', ');
+        }
+      }
+      if (submitBtn) submitBtn.disabled = _uploadFiles.length === 0;
     }
 
     if (uploadInput) {
       uploadInput.addEventListener('change', function () {
-        if (uploadInput.files[0]) handleFile(uploadInput.files[0]);
+        handleFiles(uploadInput.files);
       });
     }
 
@@ -1774,19 +1811,22 @@ _ANALYSIS_SCRIPT = """
       dropZone.addEventListener('drop', function (e) {
         e.preventDefault();
         dropZone.classList.remove('dragover');
-        var file = e.dataTransfer.files[0];
-        if (file) handleFile(file);
+        handleFiles(e.dataTransfer.files);
       });
     }
 
     if (submitBtn) {
       submitBtn.addEventListener('click', async function () {
-        if (!_uploadFile || !_uploadMeta) return;
+        if (!_uploadFiles.length || !_uploadMeta) return;
+        if (!_uploadConfirmed && !confirmCost(_uploadMeta)) return;
+        _uploadConfirmed = true;
         submitBtn.disabled = true;
         submitBtn.textContent = '업로드 중...';
 
         var form = new FormData();
-        form.append('file', _uploadFile);
+        _uploadFiles.forEach(function (file) {
+          form.append('files', file);
+        });
         form.append('source_type', _uploadMeta.type);
         form.append('source_id', _uploadMeta.id);
         form.append('type', _uploadMeta.type);
@@ -1867,13 +1907,13 @@ _ANALYSIS_MODAL_HTML = """
           <button type="button" class="modal-close-btn" aria-label="닫기">&times;</button>
         </div>
         <div class="modal-body">
-          <p class="modal-message" id="uploadModalMessage">파일을 직접 업로드해 분석하세요.</p>
+          <p class="modal-message" id="uploadModalMessage">파일을 직접 업로드해 분석하세요. 여러 개 선택할 수 있습니다.</p>
           <div class="upload-area" id="uploadDropZone" role="button" tabindex="0"
                aria-label="파일 선택 영역">
             <p>PDF, HWP, HWPX, DOC, DOCX 파일을 끌어다 놓거나 클릭해 선택</p>
-            <p class="upload-hint">최대 50MB</p>
+            <p class="upload-hint">최대 10개, 파일당 최대 50MB, 합산 최대 100MB</p>
             <input type="file" id="uploadFileInput"
-                   accept=".pdf,.hwp,.hwpx,.doc,.docx" hidden>
+                   accept=".pdf,.hwp,.hwpx,.doc,.docx" multiple hidden>
           </div>
           <p class="upload-filename" id="uploadFilename"></p>
         </div>
@@ -2831,7 +2871,9 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
 
 # --- 분석 API (Phase 8.1) -------------------------------------------
 
-_ANALYSIS_MAX_BYTES = 50 * 1024 * 1024  # 업로드 최대 50MB
+_ANALYSIS_MAX_BYTES = 50 * 1024 * 1024  # 업로드 파일당 최대 50MB
+_ANALYSIS_UPLOAD_TOTAL_MAX_BYTES = 100 * 1024 * 1024  # 업로드 합산 최대 100MB
+_ANALYSIS_UPLOAD_MAX_FILES = 10  # 업로드 파일 개수 최대
 
 # 파일 형식 우선순위 (낮을수록 우선).
 _ANALYSIS_PRIORITY: dict[str, int] = {
@@ -2858,28 +2900,66 @@ def _source_exists(session, source_type: str, source_id: str) -> bool:  # noqa: 
     return session.get(PreSpec, source_id) is not None
 
 
-def _find_auto_analysis_url(session, source_type: str, source_id: str) -> str | None:  # noqa: ANN001
-    """기존 첨부 목록 로직으로 자동 분석 대상 URL을 찾는다."""
+def _analysis_file_priority(file_info: dict[str, Any]) -> tuple[int, int, str]:
+    """자동 분석 후보 정렬 키."""
+    name = str(file_info.get("name") or "")
+    return (
+        _ANALYSIS_PRIORITY.get(Path(name).suffix.lower(), 99),
+        int(file_info.get("idx") or 0),
+        name,
+    )
+
+
+def _find_auto_analysis_urls(session, source_type: str, source_id: str) -> list[dict[str, str]]:  # noqa: ANN001
+    """기존 첨부 목록 로직으로 자동 분석 대상 URL 목록을 찾는다."""
     if source_type == "bid":
         files = repository.get_notice_files(session, source_id)
-        candidates = [
-            f for f in files
-            if "제안요청서" in f["name"]
-            and Path(f["name"]).suffix.lower() in SUPPORTED_EXTENSIONS
-        ]
-        candidates.sort(
-            key=lambda f: _ANALYSIS_PRIORITY.get(Path(f["name"]).suffix.lower(), 99)
-        )
-        return candidates[0]["url"] if candidates else None
+        rfp_candidates: list[dict[str, Any]] = []
+        task_candidates: list[dict[str, Any]] = []
+        for file_info in files:
+            name = str(file_info.get("name") or "")
+            if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            if "제안요청서" in name:
+                rfp_candidates.append(file_info)
+            elif "과업지시서" in name:
+                task_candidates.append(file_info)
+
+        selected: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for doc_kind, candidates in (
+            ("제안요청서", rfp_candidates),
+            ("과업지시서", task_candidates),
+        ):
+            candidates.sort(key=_analysis_file_priority)
+            for file_info in candidates:
+                url = str(file_info.get("url") or "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                selected.append({
+                    "url": url,
+                    "name": str(file_info.get("name") or doc_kind),
+                    "doc_kind": doc_kind,
+                })
+                break
+        return selected
 
     files = repository.get_pre_spec_files(session, source_id)
     # 사전규격 파일 URL은 확장자 없는 downloadFile.do 형태가 많아 첫 첨부를 그대로 분석한다.
-    return files[0]["url"] if files else None
+    if not files:
+        return []
+    first = files[0]
+    return [{
+        "url": str(first.get("url") or ""),
+        "name": str(first.get("name") or "첨부1"),
+        "doc_kind": "기타",
+    }]
 
 
 def _need_upload_message(source_type: str) -> str:
     if source_type == "bid":
-        return "제안요청서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요."
+        return "제안요청서/과업지시서 파일을 찾을 수 없습니다. 파일을 직접 업로드해주세요."
     return "첨부 파일이 없습니다. 파일을 직접 업로드해주세요."
 
 
@@ -2887,6 +2967,7 @@ async def _run_analysis_bg(
     source_type: str,
     source_id: str,
     *,
+    items: list[dict[str, Any]] | None = None,
     url: str | None = None,
     file_bytes: bytes | None = None,
     filename: str | None = None,
@@ -2894,10 +2975,20 @@ async def _run_analysis_bg(
     """BackgroundTasks 실행 함수. 요청 세션 대신 자체 SessionLocal을 사용한다."""
     source_type = _normalize_source_type(source_type)
     try:
-        if url:
-            result: ServiceAnalysisResult = await analyze_from_url(url)
-        elif file_bytes is not None:
-            result = await analyze_file(file_bytes, filename or "upload")
+        if items is None:
+            if url:
+                items = [{"url": url}]
+            elif file_bytes is not None:
+                items = [{"bytes": file_bytes, "filename": filename or "upload", "label": filename or "upload"}]
+            else:
+                items = []
+
+        url_items = [item for item in items if item.get("url")]
+        byte_items = [item for item in items if item.get("bytes") is not None]
+        if url_items:
+            result: ServiceAnalysisResult = await analyze_from_urls(url_items)
+        elif byte_items:
+            result = await analyze_documents(byte_items)
         else:
             raise ValueError("분석할 URL 또는 파일이 없습니다.")
 
@@ -2915,9 +3006,6 @@ async def _run_analysis_bg(
                     source_id,
                     result.message or "분석에 실패했습니다.",
                 )
-    except UnsupportedFormatError as exc:
-        with SessionLocal() as session:
-            repository.set_analysis_error(session, source_type, source_id, str(exc))
     except Exception as exc:  # noqa: BLE001 — analyzing 고착 방지.
         logger.exception("분석 백그라운드 작업 실패: %s/%s", source_type, source_id)
         with SessionLocal() as session:
@@ -2928,7 +3016,8 @@ async def _run_analysis_bg(
 async def analysis_upload(
     background_tasks: BackgroundTasks,
     response: Response,
-    file: UploadFile = File(...),
+    files: list[UploadFile] | None = File(None),
+    legacy_file: UploadFile | None = File(None, alias="file"),
     source_type: str | None = Form(None),
     source_id: str | None = Form(None),
     type_alias: str | None = Form(None, alias="type"),
@@ -2944,26 +3033,47 @@ async def analysis_upload(
     normalized_type = _normalize_source_type(source_type_value)
     source_id_value = str(source_id_value)
 
+    upload_files = list(files or [])
+    if legacy_file is not None:
+        upload_files.append(legacy_file)
+    if not upload_files:
+        response.status_code = 400
+        return {"status": "error", "message": "업로드할 파일이 필요합니다."}
+    if len(upload_files) > _ANALYSIS_UPLOAD_MAX_FILES:
+        response.status_code = 413
+        return {
+            "status": "error",
+            "message": f"업로드 파일은 최대 {_ANALYSIS_UPLOAD_MAX_FILES}개까지 가능합니다.",
+        }
+
     with SessionLocal() as session:
         if not _source_exists(session, normalized_type, source_id_value):
             raise HTTPException(status_code=404, detail="분석 대상을 찾을 수 없습니다.")
-
-    file_bytes = await file.read()
-    if len(file_bytes) > _ANALYSIS_MAX_BYTES:
-        response.status_code = 413
-        return {"status": "error", "message": "파일 크기가 50MB를 초과합니다."}
-
-    with SessionLocal() as session:
         existing = repository.get_analysis(session, normalized_type, source_id_value)
         if existing is not None and existing.status == "analyzing":
             return {"status": "analyzing"}
+
+    items: list[dict[str, Any]] = []
+    total_bytes = 0
+    for upload_file in upload_files:
+        file_bytes = await upload_file.read()
+        filename = upload_file.filename or "upload"
+        if len(file_bytes) > _ANALYSIS_MAX_BYTES:
+            response.status_code = 413
+            return {"status": "error", "message": "파일 크기가 50MB를 초과합니다."}
+        total_bytes += len(file_bytes)
+        if total_bytes > _ANALYSIS_UPLOAD_TOTAL_MAX_BYTES:
+            response.status_code = 413
+            return {"status": "error", "message": "파일 합산 크기가 100MB를 초과합니다."}
+        items.append({"filename": filename, "bytes": file_bytes, "label": filename})
+
+    with SessionLocal() as session:
         repository.start_analysis(session, normalized_type, source_id_value, "upload")
     background_tasks.add_task(
         _run_analysis_bg,
         normalized_type,
         source_id_value,
-        file_bytes=file_bytes,
-        filename=file.filename or "upload",
+        items=items,
     )
     return {"status": "analyzing"}
 
@@ -2983,8 +3093,8 @@ async def analysis_trigger(
         if existing is not None and existing.status == "analyzing":
             return {"status": "analyzing"}
 
-        target_url = _find_auto_analysis_url(session, normalized_type, source_id)
-        if not target_url:
+        target_urls = _find_auto_analysis_urls(session, normalized_type, source_id)
+        if not target_urls:
             return {
                 "status": "need_upload",
                 "message": _need_upload_message(normalized_type),
@@ -2995,7 +3105,7 @@ async def analysis_trigger(
         _run_analysis_bg,
         normalized_type,
         source_id,
-        url=target_url,
+        items=target_urls,
     )
     return {"status": "analyzing"}
 

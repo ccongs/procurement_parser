@@ -75,6 +75,15 @@ def db(tmp_path, monkeypatch):
                 ntce_spec_doc_url1="https://example.test/rfp.hwp",
                 ntce_spec_file_nm2="제안요청서.pdf",
                 ntce_spec_doc_url2="https://example.test/rfp.pdf",
+                ntce_spec_file_nm3="과업지시서.docx",
+                ntce_spec_doc_url3="https://example.test/task.docx",
+            )
+        )
+        s.add(
+            _notice(
+                "TEST-ONLY-RFP",
+                ntce_spec_file_nm1="제안요청서.docx",
+                ntce_spec_doc_url1="https://example.test/only-rfp.docx",
             )
         )
         s.add(
@@ -158,6 +167,42 @@ def _full_analysis() -> RFPAnalysis:
     )
 
 
+def test_find_auto_analysis_urls_selects_rfp_and_task(db):
+    with db() as s:
+        urls = main._find_auto_analysis_urls(s, "bid", "TEST-PDF")
+
+    assert urls == [
+        {
+            "url": "https://example.test/rfp.pdf",
+            "name": "제안요청서.pdf",
+            "doc_kind": "제안요청서",
+        },
+        {
+            "url": "https://example.test/task.docx",
+            "name": "과업지시서.docx",
+            "doc_kind": "과업지시서",
+        },
+    ]
+
+
+def test_find_auto_analysis_urls_only_rfp(db):
+    with db() as s:
+        urls = main._find_auto_analysis_urls(s, "bid", "TEST-ONLY-RFP")
+
+    assert urls == [
+        {
+            "url": "https://example.test/only-rfp.docx",
+            "name": "제안요청서.docx",
+            "doc_kind": "제안요청서",
+        }
+    ]
+
+
+def test_find_auto_analysis_urls_no_keyword(db):
+    with db() as s:
+        assert main._find_auto_analysis_urls(s, "bid", "TEST-NORFP") == []
+
+
 def test_bid_trigger_registers_background_task_and_sets_analyzing(db):
     bg = BackgroundTasks()
 
@@ -168,7 +213,18 @@ def test_bid_trigger_registers_background_task_and_sets_analyzing(db):
     task = bg.tasks[0]
     assert task.func is main._run_analysis_bg
     assert task.args == ("bid", "TEST-PDF")
-    assert task.kwargs["url"] == "https://example.test/rfp.pdf"
+    assert task.kwargs["items"] == [
+        {
+            "url": "https://example.test/rfp.pdf",
+            "name": "제안요청서.pdf",
+            "doc_kind": "제안요청서",
+        },
+        {
+            "url": "https://example.test/task.docx",
+            "name": "과업지시서.docx",
+            "doc_kind": "과업지시서",
+        },
+    ]
 
     with db() as s:
         row = repository.get_analysis(s, "bid", "TEST-PDF")
@@ -207,16 +263,22 @@ def test_bid_trigger_not_found(client):
 
 
 def test_bid_background_success_updates_done(db, monkeypatch):
-    async def fake_analyze_from_url(url: str) -> ServiceAnalysisResult:
-        assert url == "https://example.test/rfp.pdf"
+    async def fake_analyze_from_urls(items: list[dict]) -> ServiceAnalysisResult:
+        assert items == [
+            {"url": "https://example.test/rfp.pdf", "doc_kind": "제안요청서"}
+        ]
         return ServiceAnalysisResult(status="ok", analysis=_full_analysis())
 
-    monkeypatch.setattr(main, "analyze_from_url", fake_analyze_from_url)
+    monkeypatch.setattr(main, "analyze_from_urls", fake_analyze_from_urls)
     with db() as s:
         repository.start_analysis(s, "bid", "TEST-PDF", "auto")
 
     asyncio.run(
-        main._run_analysis_bg("bid", "TEST-PDF", url="https://example.test/rfp.pdf")
+        main._run_analysis_bg(
+            "bid",
+            "TEST-PDF",
+            items=[{"url": "https://example.test/rfp.pdf", "doc_kind": "제안요청서"}],
+        )
     )
 
     with db() as s:
@@ -229,15 +291,19 @@ def test_bid_background_success_updates_done(db, monkeypatch):
 
 
 def test_bid_background_error_updates_error(db, monkeypatch):
-    async def fake_analyze_from_url(url: str) -> ServiceAnalysisResult:
+    async def fake_analyze_from_urls(items: list[dict]) -> ServiceAnalysisResult:
         return ServiceAnalysisResult(status="error", message="분석 실패")
 
-    monkeypatch.setattr(main, "analyze_from_url", fake_analyze_from_url)
+    monkeypatch.setattr(main, "analyze_from_urls", fake_analyze_from_urls)
     with db() as s:
         repository.start_analysis(s, "bid", "TEST-PDF", "auto")
 
     asyncio.run(
-        main._run_analysis_bg("bid", "TEST-PDF", url="https://example.test/rfp.pdf")
+        main._run_analysis_bg(
+            "bid",
+            "TEST-PDF",
+            items=[{"url": "https://example.test/rfp.pdf", "doc_kind": "제안요청서"}],
+        )
     )
 
     with db() as s:

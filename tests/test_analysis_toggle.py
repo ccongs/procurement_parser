@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import re
+from datetime import date, datetime, time, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,7 +41,17 @@ def _cfg() -> AppConfig:
     )
 
 
-_META = datetime(2026, 6, 1, 12, 0, 0)
+_TODAY = date.today()
+_META = datetime.combine(_TODAY - timedelta(days=1), time(12, 0, 0))
+_FUTURE_OPEN = datetime.combine(_TODAY + timedelta(days=30), time(10, 0, 0))
+_FUTURE_CLOSE = datetime.combine(_TODAY + timedelta(days=30), time(18, 0, 0))
+
+
+def _has_class_token(html: str, token: str) -> bool:
+    return any(
+        token in match.group(2).split()
+        for match in re.finditer(r"class=(['\"])(.*?)\1", html)
+    )
 
 
 @pytest.fixture
@@ -62,7 +73,7 @@ def client_with_seed(tmp_path, monkeypatch):
             bid_ntce_nm="토글 테스트 입찰공고",
             ntce_instt_nm="테스트기관",
             bid_ntce_dt=_META,
-            openg_dt=datetime(2026, 8, 1, 10, 0, 0),
+            openg_dt=_FUTURE_OPEN,
             collected_at=_META,
             updated_at=_META,
         ))
@@ -71,7 +82,7 @@ def client_with_seed(tmp_path, monkeypatch):
             prdct_clsfc_no_nm="토글 테스트 사전규격",
             order_instt_nm="테스트기관",
             rcpt_dt=_META,
-            opnin_rgst_clse_dt=datetime(2026, 8, 1, 18, 0, 0),
+            opnin_rgst_clse_dt=_FUTURE_CLOSE,
             collected_at=_META,
             updated_at=_META,
         ))
@@ -95,7 +106,7 @@ class TestAnalysisToggleFalse:
         mp.setenv("USE_ANALYSIS_PROVIDER", "false")
         r = client.get("/list")
         assert r.status_code == 200
-        assert 'class="btn-analyze"' not in r.text, "false일 때 btn-analyze가 존재하면 안 됨"
+        assert not _has_class_token(r.text, "btn-analyze"), "false일 때 btn-analyze가 존재하면 안 됨"
 
     def test_list_no_analysis_th(self, client_with_seed):
         client, mp = client_with_seed
@@ -122,7 +133,7 @@ class TestAnalysisToggleFalse:
         mp.setenv("USE_ANALYSIS_PROVIDER", "false")
         r = client.get("/pre-spec")
         assert r.status_code == 200
-        assert 'class="btn-analyze"' not in r.text, "false일 때 btn-analyze가 존재하면 안 됨"
+        assert not _has_class_token(r.text, "btn-analyze"), "false일 때 btn-analyze가 존재하면 안 됨"
 
     def test_pre_spec_no_analysis_th(self, client_with_seed):
         client, mp = client_with_seed
@@ -157,7 +168,8 @@ class TestAnalysisToggleTrue:
         mp.setenv("USE_ANALYSIS_PROVIDER", "true")
         r = client.get("/list")
         assert r.status_code == 200
-        assert 'class="btn-analyze"' in r.text, "true일 때 btn-analyze가 없음"
+        assert _has_class_token(r.text, "btn-analyze"), "true일 때 btn-analyze 클래스 토큰이 없음"
+        assert 'data-status="none"' in r.text, "true일 때 분석 버튼 상태 속성이 없음"
 
     def test_list_analysis_th_present(self, client_with_seed):
         client, mp = client_with_seed
@@ -170,7 +182,8 @@ class TestAnalysisToggleTrue:
         mp.setenv("USE_ANALYSIS_PROVIDER", "true")
         r = client.get("/pre-spec")
         assert r.status_code == 200
-        assert 'class="btn-analyze"' in r.text, "true일 때 btn-analyze가 없음"
+        assert _has_class_token(r.text, "btn-analyze"), "true일 때 btn-analyze 클래스 토큰이 없음"
+        assert 'data-status="none"' in r.text, "true일 때 분석 버튼 상태 속성이 없음"
 
     def test_pre_spec_analysis_th_present(self, client_with_seed):
         client, mp = client_with_seed
@@ -184,11 +197,11 @@ class TestAnalysisToggleTrue:
         # 환경변수를 명시적으로 제거해 기본값(false) 동작 확인
         mp.delenv("USE_ANALYSIS_PROVIDER", raising=False)
         r = client.get("/list")
-        assert 'class="btn-analyze"' not in r.text, "기본값(false)일 때 btn-analyze가 존재하면 안 됨"
+        assert not _has_class_token(r.text, "btn-analyze"), "기본값(false)일 때 btn-analyze가 존재하면 안 됨"
 
     def test_pre_spec_default_hides_analysis(self, client_with_seed):
         """USE_ANALYSIS_PROVIDER 미설정 시 기본값 false → 분석 숨김."""
         client, mp = client_with_seed
         mp.delenv("USE_ANALYSIS_PROVIDER", raising=False)
         r = client.get("/pre-spec")
-        assert 'class="btn-analyze"' not in r.text, "기본값(false)일 때 btn-analyze가 존재하면 안 됨"
+        assert not _has_class_token(r.text, "btn-analyze"), "기본값(false)일 때 btn-analyze가 존재하면 안 됨"

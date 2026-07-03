@@ -3,6 +3,7 @@
 모든 테스트는 Claude API 호출 없이 green이어야 함.
 """
 import os
+import re
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -257,7 +258,9 @@ def test_base_agent_truncate_text_short():
 # analyzer_service — 지원/미지원 형식 경계 + 분석 흐름
 # ---------------------------------------------------------------------------
 from app.analysis.analyzer_service import (
+    analyze_documents,
     analyze_file,
+    analyze_from_urls,
     analyze_from_url,
     UnsupportedFormatError,
     AnalysisResult,
@@ -454,6 +457,88 @@ async def test_analyze_from_url_ok():
     assert result.analysis.project_name == "URL 프로젝트"
 
 
+@pytest.mark.asyncio
+async def test_analyze_documents_partial_parse_failure_still_analyzes():
+    """다중 문서 중 일부 추출 실패가 있어도 성공 문서가 있으면 분석을 진행한다."""
+    mock_rfp = RFPAnalysis(
+        project_name="다중 문서 프로젝트",
+        client_name="기관",
+        project_overview="개요",
+    )
+
+    def fake_extract(file_bytes, filename):
+        if filename == "bad.zip":
+            raise UnsupportedFormatError("지원하지 않는 형식: .zip")
+        return f"{filename} 본문"
+
+    with patch("app.analysis.analyzer_service.extract_text_from_file", side_effect=fake_extract), \
+         patch("app.analysis.analyzer_service.RFPAnalyzer") as mock_analyzer_cls:
+
+        mock_analyzer_cls.return_value.execute = AsyncMock(return_value=mock_rfp)
+        result = await analyze_documents([
+            {"filename": "rfp.pdf", "bytes": b"pdf", "label": "제안요청서"},
+            {"filename": "bad.zip", "bytes": b"zip", "label": "기타"},
+        ])
+
+    assert result.status == "ok"
+    docs_arg = mock_analyzer_cls.return_value.execute.await_args.args[0]["documents"]
+    assert docs_arg == [
+        {"label": "제안요청서", "filename": "rfp.pdf", "text": "rfp.pdf 본문"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_analyze_documents_all_parse_fail_returns_unsupported():
+    """모든 문서 추출 실패 시 unsupported 상태를 반환한다."""
+    with patch(
+        "app.analysis.analyzer_service.extract_text_from_file",
+        side_effect=UnsupportedFormatError("지원하지 않는 형식: .zip"),
+    ):
+        result = await analyze_documents([
+            {"filename": "bad.zip", "bytes": b"zip", "label": "기타"}
+        ])
+
+    assert result.status == "unsupported"
+    assert ".zip" in result.message
+
+
+@pytest.mark.asyncio
+async def test_analyze_from_urls_downloads_multiple_and_delegates():
+    """URL 다중 분석은 각 URL을 다운로드해 analyze_documents로 위임한다."""
+    resp1 = MagicMock()
+    resp1.content = b"pdf"
+    resp1.headers = {}
+    resp1.raise_for_status = MagicMock()
+    resp2 = MagicMock()
+    resp2.content = b"docx"
+    resp2.headers = {}
+    resp2.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=[resp1, resp2])
+
+    expected = AnalysisResult(status="ok", analysis=RFPAnalysis(
+        project_name="URL 다중",
+        client_name="기관",
+        project_overview="개요",
+    ))
+
+    with patch("app.analysis.analyzer_service.httpx.AsyncClient", return_value=mock_client), \
+         patch("app.analysis.analyzer_service.analyze_documents", AsyncMock(return_value=expected)) as mock_docs:
+
+        result = await analyze_from_urls([
+            {"url": "http://example.test/rfp.pdf", "name": "제안요청서.pdf", "doc_kind": "제안요청서"},
+            {"url": "http://example.test/task.docx", "name": "과업지시서.docx", "doc_kind": "과업지시서"},
+        ])
+
+    assert result is expected
+    docs = mock_docs.await_args.args[0]
+    assert [doc["filename"] for doc in docs] == ["제안요청서.pdf", "과업지시서.docx"]
+    assert [doc["label"] for doc in docs] == ["제안요청서", "과업지시서"]
+
+
 # ---------------------------------------------------------------------------
 # _extract_filename
 # ---------------------------------------------------------------------------
@@ -533,6 +618,60 @@ async def test_rfp_analyzer_with_provider_mock(monkeypatch):
     assert result.project_name == "테스트 프로젝트"
     assert result.client_name == "서울시"
     mock_provider.complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rfp_analyzer_multi_documents_prompt(monkeypatch):
+    """다중 문서 입력 시 라벨·파일명·본문과 종합 지시가 user_message에 포함된다."""
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    monkeypatch.delenv("USER_RFP_ANALYZER_LOG", raising=False)
+    mock_provider = AsyncMock()
+    mock_provider.complete = AsyncMock(
+        return_value='{"project_name": "다중 프로젝트", "client_name": "기관", "project_overview": "개요"}'
+    )
+
+    analyzer = RFPAnalyzer(provider=mock_provider)
+    result = await analyzer.execute({
+        "documents": [
+            {"label": "제안요청서", "filename": "rfp.pdf", "text": "제안서 목차 본문"},
+            {"label": "과업지시서", "filename": "task.pdf", "text": "실제 과업 요구사항 본문"},
+        ]
+    })
+
+    assert result.project_name == "다중 프로젝트"
+    user_message = mock_provider.complete.await_args.args[1]
+    assert "관련 문서 2개" in user_message
+    assert "종합" in user_message
+    assert "## 문서 1 — 제안요청서 (파일명: rfp.pdf)" in user_message
+    assert "## 문서 2 — 과업지시서 (파일명: task.pdf)" in user_message
+    assert "제안서 목차 본문" in user_message
+    assert "실제 과업 요구사항 본문" in user_message
+
+
+def test_rfp_analyzer_multi_documents_total_text_budget():
+    """문서가 6개 이상이어도 모델 입력 문서 본문 합계는 다중 입력 상한을 넘지 않는다."""
+    from app.analysis import rfp_analyzer as rfp_analyzer_module
+    from app.analysis.rfp_analyzer import RFPAnalyzer
+
+    analyzer = RFPAnalyzer(provider=_CannedAnalysisProvider("{}"))
+    documents = [
+        {"label": f"문서{idx}", "filename": f"doc-{idx}.pdf", "text": "가" * 50000}
+        for idx in range(6)
+    ]
+
+    formatted = analyzer._format_documents(documents)
+    bodies = re.findall(
+        r"## 문서 \d+ — .*?\n([\s\S]*?)(?=\n\n## 문서 \d+ —|\Z)",
+        formatted,
+    )
+
+    assert len(bodies) == len(documents)
+    assert sum(len(body) for body in bodies) <= rfp_analyzer_module._MULTI_INPUT_CHARS
+    assert all(
+        len(body) <= rfp_analyzer_module._MULTI_INPUT_CHARS // len(documents)
+        for body in bodies
+    )
 
 
 @pytest.mark.asyncio

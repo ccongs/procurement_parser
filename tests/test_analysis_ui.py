@@ -11,7 +11,8 @@ UI 동작(JS/CSS)은 pytest로 완전 검증 불가능하므로:
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import re
+from datetime import date, datetime, time, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -48,7 +49,17 @@ def _cfg() -> AppConfig:
     )
 
 
-_META = datetime(2026, 6, 1, 12, 0, 0)
+_TODAY = date.today()
+_META = datetime.combine(_TODAY - timedelta(days=1), time(12, 0, 0))
+_FUTURE_OPEN = datetime.combine(_TODAY + timedelta(days=30), time(10, 0, 0))
+_FUTURE_CLOSE = datetime.combine(_TODAY + timedelta(days=30), time(18, 0, 0))
+
+
+def _has_class_token(html: str, token: str) -> bool:
+    return any(
+        token in match.group(2).split()
+        for match in re.finditer(r"class=(['\"])(.*?)\1", html)
+    )
 
 
 @pytest.fixture
@@ -71,7 +82,7 @@ def client(tmp_path, monkeypatch):
             bid_ntce_nm="소프트웨어 유지보수 용역",
             ntce_instt_nm="테스트기관",
             bid_ntce_dt=_META,
-            openg_dt=datetime(2026, 8, 1, 10, 0, 0),
+            openg_dt=_FUTURE_OPEN,
             collected_at=_META,
             updated_at=_META,
             ntce_spec_file_nm1="제안요청서.pdf",
@@ -83,7 +94,7 @@ def client(tmp_path, monkeypatch):
             prdct_clsfc_no_nm="소프트웨어 개발",
             order_instt_nm="테스트기관",
             rcpt_dt=_META,
-            opnin_rgst_clse_dt=datetime(2026, 8, 1, 0, 0, 0),
+            opnin_rgst_clse_dt=_FUTURE_CLOSE,
             collected_at=_META,
             updated_at=_META,
             spec_doc_file_url1="https://example.test/spec.pdf",
@@ -106,10 +117,10 @@ def test_list_page_returns_200(client):
 
 
 def test_list_page_has_analyze_button(client):
-    """입찰공고 목록 페이지에 btn-analyze 클래스 또는 '분석' 버튼 텍스트가 있다."""
+    """입찰공고 목록 페이지에 btn-analyze 클래스 토큰이 있다."""
     resp = client.get("/list")
     assert resp.status_code == 200
-    assert "btn-analyze" in resp.text or "분석" in resp.text
+    assert _has_class_token(resp.text, "btn-analyze")
 
 
 def test_list_page_analyze_button_data_type(client):
@@ -122,10 +133,10 @@ def test_list_page_analyze_button_data_type(client):
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        ("none", ['data-status="none"', ">분석</button>"]),
+        ("none", ['data-status="none"', "분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
-        ("error", ['data-status="error"', ">재분석</button>"]),
+        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
+        ("error", ['data-status="error"', "재분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
     ],
 )
 def test_list_page_renders_analysis_button_by_status(client, status, expected):
@@ -167,10 +178,10 @@ def test_pre_spec_page_returns_200(client):
 
 
 def test_pre_spec_page_has_analyze_button(client):
-    """사전규격 목록 페이지에 btn-analyze 클래스 또는 '분석' 버튼 텍스트가 있다."""
+    """사전규격 목록 페이지에 btn-analyze 클래스 토큰이 있다."""
     resp = client.get("/pre-spec")
     assert resp.status_code == 200
-    assert "btn-analyze" in resp.text or "분석" in resp.text
+    assert _has_class_token(resp.text, "btn-analyze")
 
 
 def test_pre_spec_page_analyze_button_data_type(client):
@@ -183,10 +194,10 @@ def test_pre_spec_page_analyze_button_data_type(client):
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        ("none", ['data-status="none"', ">분석</button>"]),
+        ("none", ['data-status="none"', "분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="reanalyze"', "재분석"]),
-        ("error", ['data-status="error"', ">재분석</button>"]),
+        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
+        ("error", ['data-status="error"', "재분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
     ],
 )
 def test_pre_spec_page_renders_analysis_button_by_status(client, status, expected):
