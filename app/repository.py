@@ -372,6 +372,7 @@ def search_bid_notices(
     price_max: int | None = None,
     openg_only_future: bool = False,
     include_past_openg: bool = True,
+    exclude_privt_cntrct: bool = False,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -391,6 +392,9 @@ def search_bid_notices(
     - include_past_openg(기본 True=하위호환): False 면 개찰 지난 공고를 숨긴다 —
       `(openg_dt >= now) OR (openg_dt IS NULL)`. **개찰일 미정(NULL)은 아직 유효하므로 표시.**
       openg_only_future 보다 완화된 조건(NULL 포함)이며 /list 기본 동작이 이것이다.
+    - exclude_privt_cntrct=True: 계약체결방법명(cntrct_cncls_mthd_nm)이 "수의계약"인
+      공고를 숨긴다. 방법 미상(NULL)은 데이터 누락일 뿐이므로 숨기지 않는다.
+      /list 화면의 "수의계약제외" 체크박스(기본 체크)가 이 플래그를 넘긴다.
     - sort(Phase 4.2 확장): _SORT_COLUMNS 의 6종 허용
       (bid_ntce_dt/openg_dt/presmpt_prce × asc/desc). NULL 은 항상 뒤로.
       기본·미허용값은 "bid_ntce_dt_desc"(최신 공고순).
@@ -422,6 +426,14 @@ def search_bid_notices(
         # 개찰 지난 공고 숨김. 개찰일 미정(NULL)은 표시(아직 유효).
         conditions.append(
             or_(BidNotice.openg_dt >= now, BidNotice.openg_dt.is_(None))
+        )
+    if exclude_privt_cntrct:
+        # 수의계약 숨김. 계약방법 미상(NULL)은 표시(데이터 누락을 필터로 오인하지 않게).
+        conditions.append(
+            or_(
+                BidNotice.cntrct_cncls_mthd_nm.is_(None),
+                BidNotice.cntrct_cncls_mthd_nm != "수의계약",
+            )
         )
 
     count_stmt = select(func.count()).select_from(BidNotice)

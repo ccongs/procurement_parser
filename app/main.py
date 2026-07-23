@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
@@ -2502,6 +2502,7 @@ def list_page(
     price_min: str | None = None,
     price_max: str | None = None,
     include_past: str | None = None,
+    excl_privt: list[str] | None = Query(None),
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -2510,6 +2511,9 @@ def list_page(
     page_size = page_size if page_size in (10, 30, 50, 100) else 50
     # 기본 동작 = 개찰 지난 공고 숨김. "지난 개찰 포함" 체크 시에만 전체 노출.
     include_past_flag = include_past in ("1", "on", "true", "Y", "y")
+    # 수의계약 제외(기본 True). 체크 해제와 "파라미터 없음(첫 진입)"을 구분하기 위해
+    # 폼은 hidden(0)+checkbox(1) 쌍으로 전송한다: 없음=기본(제외), "1" 포함=제외, 그 외=포함.
+    excl_privt_flag = True if not excl_privt else ("1" in excl_privt)
     # 정렬: 헤더 클릭 6종. 미허용·빈값은 기본(최신 공고일).
     sort = sort if sort in _LIST_SORTS else _DEFAULT_SORT
     # 날짜 적용 컬럼: 공고일/개찰일.
@@ -2550,6 +2554,7 @@ def list_page(
             price_min=price_min_disp,
             price_max=price_max_disp,
             include_past_openg=include_past_flag,
+            exclude_privt_cntrct=excl_privt_flag,
             sort=sort,
             page=page,
             page_size=page_size,
@@ -2587,6 +2592,7 @@ def list_page(
         "price_min": price_min_field,
         "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
+        "excl_privt": "1" if excl_privt_flag else "0",
         "sort": sort,
         "page_size": str(page_size),
     }
@@ -2649,6 +2655,11 @@ def list_page(
         <label class="chk">
           <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
           지난 개찰 포함
+        </label>
+        <label class="chk">
+          <input type="hidden" name="excl_privt" value="0">
+          <input type="checkbox" name="excl_privt" value="1"{' checked' if excl_privt_flag else ''}>
+          수의계약제외
         </label>
         <label class="field">
           <span class="flabel">표기개수</span>

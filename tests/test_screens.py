@@ -50,8 +50,8 @@ def session():
         s.close()
 
 
-def _bn(no, nm, ntce_dt, openg_dt):
-    """테스트용 BidNotice(필수 NOT NULL 컬럼 채움)."""
+def _bn(no, nm, ntce_dt, openg_dt, cntrct=None):
+    """테스트용 BidNotice(필수 NOT NULL 컬럼 채움). cntrct=계약체결방법명(기본 NULL)."""
     base = datetime(2026, 6, 1, 12, 0, 0)
     return BidNotice(
         bid_ntce_no=no,
@@ -59,6 +59,7 @@ def _bn(no, nm, ntce_dt, openg_dt):
         ntce_instt_nm="테스트기관",
         bid_ntce_dt=ntce_dt,
         openg_dt=openg_dt,
+        cntrct_cncls_mthd_nm=cntrct,
         collected_at=base,
         updated_at=base,
     )
@@ -145,6 +146,24 @@ def test_search_empty(session):
     rows, total = repository.search_bid_notices(session, q="존재하지않는공고명")
     assert total == 0
     assert rows == []
+
+
+def test_search_exclude_privt_cntrct(session):
+    session.add_all(
+        [
+            _bn("P-1", "일반경쟁 공고", datetime(2026, 5, 1, 9, 0), None, cntrct="일반경쟁"),
+            _bn("P-2", "수의계약건 공고", datetime(2026, 5, 2, 9, 0), None, cntrct="수의계약"),
+            _bn("P-3", "방법미상 공고", datetime(2026, 5, 3, 9, 0), None),  # cntrct NULL
+        ]
+    )
+    session.commit()
+    # 기본(False) = 필터 없음 → 전체
+    _, total = repository.search_bid_notices(session)
+    assert total == 3
+    # True → 수의계약만 제외, 방법 미상(NULL)은 유지
+    rows, total = repository.search_bid_notices(session, exclude_privt_cntrct=True)
+    assert total == 2
+    assert {r.bid_ntce_no for r in rows} == {"P-1", "P-3"}
 
 
 # --- update_config -----------------------------------------------------
@@ -245,6 +264,8 @@ def client(tmp_path, monkeypatch):
         s.add(_bn("S-1", "스모크 테스트 공고", datetime(2026, 5, 1, 9, 0), None))
         # 개찰일이 확실히 과거(2000년) → 기본 숨김, "지난 개찰 포함" 시 노출(결정적).
         s.add(_bn("S-PAST", "지난 개찰 공고", datetime(2026, 5, 2, 9, 0), datetime(2000, 1, 1, 10, 0)))
+        # 수의계약 공고 → 기본("수의계약제외" 체크) 숨김, excl_privt=0 시 노출(개찰일 NULL=항상 유효).
+        s.add(_bn("S-PRIVT", "수의계약건 스모크 공고", datetime(2026, 5, 4, 9, 0), None, cntrct="수의계약"))
         # 첨부 보유 공고(파일 컬럼·drawer·zip 테스트용). 1·3번 URL 보유, 2번 비어 있음.
         s.add(
             BidNotice(
@@ -416,6 +437,34 @@ def test_list_include_past_shows_past(client):
     assert "지난 개찰 공고" in resp.text
     # 페이지네이션·쿼리스트링에 include_past 보존
     assert "include_past=1" in resp.text
+
+
+def test_list_default_excludes_privt_cntrct(client):
+    """파라미터 없음 = '수의계약제외' 기본 체크 → 수의계약 공고 숨김."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert "수의계약건 스모크 공고" not in resp.text
+    # 링크 쿼리스트링에 상태 보존(기본 제외=1)
+    assert "excl_privt=1" in resp.text
+
+
+def test_list_excl_privt_off_shows_privt(client):
+    """excl_privt=0(체크 해제) → 수의계약 공고 포함."""
+    resp = client.get("/list", params={**_WIDE, "excl_privt": "0"})
+    assert resp.status_code == 200
+    assert "수의계약건 스모크 공고" in resp.text
+    assert "excl_privt=0" in resp.text
+
+
+def test_list_excl_privt_form_pair_checked(client):
+    """폼 제출(hidden 0 + checkbox 1 동시 전송) → 제외로 해석."""
+    resp = client.get(
+        "/list",
+        params=[("dt_from", "2000-01-01"), ("dt_to", "2099-12-31"),
+                ("excl_privt", "0"), ("excl_privt", "1")],
+    )
+    assert resp.status_code == 200
+    assert "수의계약건 스모크 공고" not in resp.text
 
 
 def test_list_korean_only_headers(client):
