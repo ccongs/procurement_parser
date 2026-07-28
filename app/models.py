@@ -270,6 +270,29 @@ class AnalysisResult(Base):
         return f"<AnalysisResult {self.source_type!r}/{self.source_id!r} status={self.status!r}>"
 
 
+# --- Phase 10: 공고명 제외 키워드 -------------------------------------------
+class ExcludeKeyword(Base):
+    """공고명 제외 키워드 목록 — /list·/pre-spec 검색필터의 단어 필터링 기본 목록.
+
+    - keyword: 제외할 단어(공고명/품명 부분일치). 대소문자 무시·부분일치로 제외한다.
+    - is_default: 체크 시 목록 화면 첫 진입에서 자동 적용(칩으로 미리 채워짐).
+    """
+
+    __tablename__ = "exclude_keyword"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    keyword = Column(String(50), nullable=False)
+    is_default = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("keyword", name="uq_exclude_keyword_keyword"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 디버그용
+        return f"<ExcludeKeyword {self.keyword!r} default={self.is_default}>"
+
+
 # --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------
 class ExportCartItem(Base):
     """검토 목록 장바구니 — 입찰공고·사전규격 혼합 저장."""

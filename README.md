@@ -29,6 +29,7 @@
   (수집 on/off `enabled`·`pre_spec_enabled`, 주기 `interval_minutes`(기본 60), 업종코드 `indstryty_cds`(기본 `1426,1468,1469,1470`), 백필 등).
 - **RFP 분석(선택 기능, 비동기)**: 목록의 분석 버튼 → 제안요청서 첨부 자동 탐색·다운로드 → 텍스트 추출(PDF/HWP/HWPX/DOC/DOCX) → LLM 분석. 분석은 **백그라운드(BackgroundTasks)로 비동기** 실행되며 **결과는 `analysis_result` 테이블에 영속화**된다(재분석은 같은 행 갱신, 서버 재시작으로 중단된 `analyzing` 행은 기동 시 자동 리셋). 목록 버튼은 상태별로 렌더된다 — **분석 → 분석중 → 분석완료**(드롭다운: 분석보기·재분석) / **재분석**(오류 시). 분석·재분석 클릭 시 **비용 확인 알럿**, 진행 중에는 **~5초 폴링**으로 상태 갱신, 완료 결과는 **새 창의 서버 렌더 보고서 페이지**(`/analysis/{type}/{id}`)로 표시한다. 프로바이더는 `ANALYSIS_PROVIDER`(claude/openai/gemini)로 교체. **`USE_ANALYSIS_PROVIDER` 는 기본 `false`** 라 분석 컬럼·버튼이 숨겨지며 `true` 일 때만 노출(AI 미사용 환경 대비). `.hwp`/`.hwpx`는 olefile 로 직접 파싱하고 `.doc`만 LibreOffice 변환을 쓴다.
 - **검토항목 장바구니**: 목록에서 행을 체크해 "담기" → 헤더 **"검토항목 장바구니"** 에 모아 보고 → 엑셀(xlsx) 일괄 다운로드.
+- **공고명 제외 키워드**: `/list`(공고명)·`/pre-spec`(품명/사업명) 검색필터에서 특정 단어가 포함된 항목을 제외한다. 입력창은 **칩(chip) 형태** — 단어를 입력하면 ✓/✕ 아이콘이 뜨고 ✓(또는 Enter)로 칩 추가, 칩 `×`로 제거하며 등록된 기본 목록은 select 로 선택한다. 목록 관리는 `/config` **"공고명 제외 키워드 목록"**(추가·삭제 + **기본 적용** 체크) — 기본 적용한 단어는 목록 화면 첫 진입에서 자동으로 칩에 채워지고, 화면에서 개별 해제할 수 있다.
 
 ## 화면 / 엔드포인트
 
@@ -40,6 +41,7 @@
 | `GET /pre-spec` | 사전규격 목록(품명·기관·접수일·배정예산 범위 필터, 첨부 다운로드) |
 | `GET /pre-spec/{bf_spec_rgst_no}/files`·`/files.zip` | 사전규격 첨부 |
 | `GET /config` · `POST /config` | 수집 설정·스케줄러 제어·실행 이력. 검색 기본값(입찰 추정가격 / 사전규격 배정예산액) 분리 설정 |
+| `POST /config/keywords` | 공고명 제외 키워드 목록 관리(추가·삭제·기본 적용 저장) |
 | `POST /config/scheduler/start`·`/stop`·`/config/resume` | 스케줄러 수동 시작/정지·중단 재개 |
 | `GET /api-test` | 원시 API 호출·응답 확인용 화면 |
 | `POST /api/analysis/{type}/{id}` (type=`bid`·`pre_spec`) | 제안요청서 자동 탐색 후 **비동기 분석 트리거**. `{status: analyzing}`(시작·이미 진행 중) 또는 `{status: need_upload}`(후보 없음) 반환 (선택 기능, `USE_ANALYSIS_PROVIDER=true` 시) |

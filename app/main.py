@@ -778,6 +778,38 @@ BASE_CSS = """
   .modal-footer { display: flex; gap: 8px; justify-content: flex-end; padding-top: 8px; border-top: 1px solid #eee; }
   .btn-primary { background: #1565C0; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
   .btn-secondary { background: #757575; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
+  /* 공고명 제외 키워드(Phase 10): 칩 입력 + 기본목록 select */
+  .kw-field { display: flex; flex-direction: column; font-size: 13px; flex: 1 1 420px; min-width: 300px; }
+  .kw-wrap { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+  .kw-box { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; background: #fff;
+            border: 1px solid #cbd2dc; border-radius: 6px; padding: 4px 8px; min-height: 34px;
+            flex: 1 1 300px; }
+  .kw-chip { display: inline-flex; align-items: center; gap: 2px; background: #eef3fb; color: #1f3a5f;
+             border: 1px solid #b6c6df; border-radius: 14px; padding: 2px 4px 2px 10px; font-size: 12px;
+             white-space: nowrap; }
+  .kw-chip-x { border: 0; background: transparent; color: #4a5568; cursor: pointer; font-size: 14px;
+               line-height: 1; padding: 0 4px; }
+  .kw-chip-x:hover { color: #b02a25; }
+  .kw-input { border: 0; outline: none; padding: 4px 2px; font-size: 13px; min-width: 110px; flex: 1 1 110px; }
+  .kw-confirm { display: inline-flex; gap: 4px; }
+  .kw-confirm[hidden] { display: none; }
+  .kw-ok, .kw-cancel { border: 1px solid #cbd2dc; border-radius: 5px; cursor: pointer;
+                       font-size: 12px; line-height: 1; padding: 4px 8px; }
+  .kw-ok { color: #1d7a43; border-color: #a9d6bb; background: #e7f6ec; }
+  .kw-ok:hover { background: #d8f0df; }
+  .kw-cancel { color: #b02a25; border-color: #e6b6b3; background: #fde3e1; }
+  .kw-cancel:hover { background: #fbd3d0; }
+  .kw-select { max-width: 220px; }
+  .kw-help { font-size: 11px; color: #8a93a2; margin-top: 4px; }
+  .kw-sum { font-size: 12px; padding: 4px 10px; border-radius: 20px; background: #fdf3df; color: #97720d;
+            white-space: nowrap; margin-bottom: 6px; }
+  .kw-sum[hidden] { display: none; }
+  /* /config 키워드 관리 표 */
+  table.kwtable { width: auto; min-width: 360px; }
+  table.kwtable td, table.kwtable th { vertical-align: middle; }
+  table.kwtable .kw-del { background: #b02a25; color: #fff; border: 0; padding: 3px 10px;
+                          border-radius: 5px; font-size: 12px; cursor: pointer; }
+  table.kwtable .kw-del:hover { background: #8f211d; }
 """
 
 
@@ -1312,6 +1344,182 @@ def _filter_card(
         f'</form>'
         f'</div>'
     )
+
+
+# --- 공고명 제외 키워드 필터 (Phase 10) -------------------------------
+# 화면 파라미터: `excl_kw`(콤마 구분 CSV) + `excl_kw_set`(폼 제출 표식).
+#  - `excl_kw_set` 없음(첫 진입·외부 링크) → 설정의 기본 적용 키워드를 자동 적용.
+#  - `excl_kw_set=1`(폼/페이저 링크) → 사용자가 정한 칩 목록 그대로(빈 값이면 필터 없음).
+_EXCL_KW_SET_TRUE = ("1", "on", "true", "Y", "y")
+
+
+def _parse_excl_kw(raw: str | None) -> list[str]:
+    """CSV 파라미터 → 정규화된 키워드 목록(빈값·중복 제거, 상한 적용)."""
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw).split(","):
+        kw = repository.normalize_keyword(part)
+        if not kw or kw in seen:
+            continue
+        seen.add(kw)
+        out.append(kw)
+        if len(out) >= repository.EXCLUDE_KEYWORD_MAX:
+            break
+    return out
+
+
+def _excl_kw_summary(keywords: list[str]) -> str:
+    """접힌 필터 카드에서도 보이는 적용 개수 배지(칩은 상세 영역에 있음)."""
+    hidden = "" if keywords else " hidden"
+    title = _e(", ".join(keywords)) if keywords else ""
+    return (
+        f'<span class="kw-sum" id="exclKwCount" title="{title}"{hidden}>'
+        f'제외 키워드 {len(keywords)}개</span>'
+    )
+
+
+def _excl_kw_field(keywords: list[str], options: list[dict[str, Any]], label: str) -> str:
+    """칩 입력 위젯 — 칩 + 입력(✓/✕) + 기본목록 select + hidden(excl_kw/excl_kw_set)."""
+    chips = "".join(
+        f'<span class="kw-chip" data-kw="{_e(kw)}">{_e(kw)}'
+        f'<button type="button" class="kw-chip-x" aria-label="{_e(kw)} 제외 해제">&times;</button>'
+        f"</span>"
+        for kw in keywords
+    )
+    opts = "".join(
+        f'<option value="{_e(o["keyword"])}">{_e(o["keyword"])}'
+        f'{" (기본)" if o.get("is_default") else ""}</option>'
+        for o in options
+    )
+    select_html = (
+        f'<select class="kw-select" id="exclKwSelect" aria-label="등록된 제외 키워드 선택">'
+        f'<option value="">목록에서 선택…</option>{opts}</select>'
+        if options
+        else '<span class="kw-help">등록된 기본 목록이 없습니다 · [설정]에서 추가</span>'
+    )
+    return f"""
+      <div class="kw-field">
+        <span class="flabel">{_e(label)}</span>
+        <div class="kw-wrap">
+          <div class="kw-box" id="exclKwBox">
+            {chips}
+            <input type="text" class="kw-input" id="exclKwInput" placeholder="제외할 단어 입력"
+                   maxlength="{repository.EXCLUDE_KEYWORD_MAX_LEN}" autocomplete="off"
+                   aria-label="제외 키워드 입력">
+            <span class="kw-confirm" id="exclKwConfirm" hidden>
+              <button type="button" class="kw-ok" id="exclKwOk" title="추가" aria-label="제외 키워드 추가">&#10003;</button>
+              <button type="button" class="kw-cancel" id="exclKwCancel" title="취소" aria-label="입력 취소">&#10005;</button>
+            </span>
+          </div>
+          {select_html}
+        </div>
+        <span class="kw-help">입력 후 ✓(또는 Enter)로 추가 · 칩의 ×로 제거 · 기본 목록 관리는 [설정]</span>
+        <input type="hidden" name="excl_kw" id="exclKwHidden" value="{_e(",".join(keywords))}">
+        <input type="hidden" name="excl_kw_set" value="1">
+      </div>"""
+
+
+# 칩 입력 위젯 스크립트(/list·/pre-spec 공용). 평문 상수라 중괄호 이스케이프 불필요.
+_EXCL_KW_SCRIPT = """
+  (function () {
+    var box = document.getElementById('exclKwBox');
+    if (!box) return;
+    var input = document.getElementById('exclKwInput');
+    var hidden = document.getElementById('exclKwHidden');
+    var confirmBox = document.getElementById('exclKwConfirm');
+    var okBtn = document.getElementById('exclKwOk');
+    var cancelBtn = document.getElementById('exclKwCancel');
+    var sel = document.getElementById('exclKwSelect');
+    var badge = document.getElementById('exclKwCount');
+    var MAX = %(max)d;
+    var MAXLEN = %(maxlen)d;
+
+    function words() {
+      return Array.prototype.map.call(box.querySelectorAll('.kw-chip'), function (c) {
+        return c.getAttribute('data-kw') || '';
+      });
+    }
+
+    function sync() {
+      var list = words();
+      hidden.value = list.join(',');
+      if (badge) {
+        badge.textContent = '제외 키워드 ' + list.length + '개';
+        badge.title = list.join(', ');
+        if (list.length) { badge.removeAttribute('hidden'); }
+        else { badge.setAttribute('hidden', 'hidden'); }
+      }
+    }
+
+    function addWord(raw) {
+      var w = String(raw == null ? '' : raw).replace(/,/g, ' ').trim().slice(0, MAXLEN);
+      if (!w) return;
+      var list = words();
+      if (list.length >= MAX) { window.alert('제외 키워드는 최대 ' + MAX + '개까지 지정할 수 있습니다.'); return; }
+      for (var i = 0; i < list.length; i += 1) {
+        if (list[i].toLowerCase() === w.toLowerCase()) return;  // 중복 무시
+      }
+      var chip = document.createElement('span');
+      chip.className = 'kw-chip';
+      chip.setAttribute('data-kw', w);
+      chip.appendChild(document.createTextNode(w));
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'kw-chip-x';
+      x.setAttribute('aria-label', w + ' 제외 해제');
+      x.innerHTML = '&times;';
+      chip.appendChild(x);
+      box.insertBefore(chip, input);
+      sync();
+    }
+
+    function clearInput() {
+      input.value = '';
+      confirmBox.setAttribute('hidden', 'hidden');
+    }
+
+    function toggleConfirm() {
+      if (input.value.trim()) { confirmBox.removeAttribute('hidden'); }
+      else { confirmBox.setAttribute('hidden', 'hidden'); }
+    }
+
+    input.addEventListener('input', toggleConfirm);
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        // 필터 폼 제출 대신 칩 추가로 처리.
+        e.preventDefault();
+        addWord(input.value);
+        clearInput();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        clearInput();
+      }
+    });
+    okBtn.addEventListener('click', function () { addWord(input.value); clearInput(); input.focus(); });
+    cancelBtn.addEventListener('click', function () { clearInput(); input.focus(); });
+
+    box.addEventListener('click', function (e) {
+      var x = e.target.closest ? e.target.closest('.kw-chip-x') : null;
+      if (x) {
+        var chip = x.closest('.kw-chip');
+        if (chip) { chip.parentNode.removeChild(chip); sync(); }
+        return;
+      }
+      if (e.target === box) input.focus();
+    });
+
+    if (sel) {
+      sel.addEventListener('change', function () {
+        if (sel.value) addWord(sel.value);
+        sel.value = '';
+      });
+    }
+
+    sync();
+  })();
+""" % {"max": repository.EXCLUDE_KEYWORD_MAX, "maxlen": repository.EXCLUDE_KEYWORD_MAX_LEN}
 
 
 # /list 클라이언트 스크립트(setRecent + 파일 drawer). 평문 상수라 중괄호 이스케이프 불필요.
@@ -2274,6 +2482,8 @@ def pre_spec_page(
     price_min: str | None = None,    # 배정예산액 최소(Phase 4.9-R2-D)
     price_max: str | None = None,    # 배정예산액 최대(Phase 4.9-R2-D)
     include_past: str | None = None,   # 체크 시 의견마감 지난 항목 포함
+    excl_kw: str | None = None,        # 품명/사업명 제외 키워드 CSV(Phase 10)
+    excl_kw_set: str | None = None,    # 폼 제출 표식(없으면 설정 기본값 적용)
     sort: str = "rcpt_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -2315,6 +2525,13 @@ def pre_spec_page(
         price_min_disp = _parse_price(price_min_in) if price_min_in is not None else _parse_price(cfg_amt_bgn)
         price_max_disp = _parse_price(price_max_in) if price_max_in is not None else _parse_price(cfg_amt_end)
 
+        # 제외 키워드(Phase 10): /list 와 동일 규칙(폼 제출이면 입력값, 아니면 설정 기본값).
+        kw_options = repository.list_exclude_keywords(session)
+        if excl_kw_set in _EXCL_KW_SET_TRUE:
+            excl_kws = _parse_excl_kw(excl_kw)
+        else:
+            excl_kws = repository.get_default_exclude_keywords(session)
+
         objs, total = repository.search_pre_specs(
             session,
             q=q,
@@ -2324,6 +2541,7 @@ def pre_spec_page(
             price_min=price_min_disp,
             price_max=price_max_disp,
             include_past_opnin=include_past_flag,
+            exclude_keywords=excl_kws,
             sort=sort,
             page=page,
             page_size=page_size,
@@ -2361,6 +2579,9 @@ def pre_spec_page(
         "price_min": price_min_field,
         "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
+        # 제외 키워드는 한글·특수문자를 담을 수 있어 링크에는 URL 인코딩해서 싣는다.
+        "excl_kw": quote(",".join(excl_kws), safe=""),
+        "excl_kw_set": "1",
         "sort": sort,
         "page_size": str(page_size),
     }
@@ -2377,10 +2598,14 @@ def pre_spec_page(
         <span class="flabel">품명/사업명 부분검색</span>
         <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
       </label>
-      <button type="submit" class="submit">검색</button>"""
+      <button type="submit" class="submit">검색</button>
+      {_excl_kw_summary(excl_kws)}"""
 
-    # _filter_card detail: 기관·날짜·가격·지난마감·표기개수.
+    # _filter_card detail: 제외 키워드·기관·날짜·가격·지난마감·표기개수.
     detail_html = f"""
+      <div class="row" style="margin-bottom:10px;">
+        {_excl_kw_field(excl_kws, kw_options, "품명/사업명 제외 키워드")}
+      </div>
       <div class="row" style="margin-bottom:10px;">
         <label class="field" style="min-width:220px;">
           <span class="flabel">발주/실수요기관 부분검색</span>
@@ -2463,6 +2688,7 @@ def pre_spec_page(
     {analysis_ui_html}
     {_CART_MODAL_HTML}
     <script>{_PRE_SPEC_SCRIPT}</script>
+    <script>{_EXCL_KW_SCRIPT}</script>
     {analysis_script_html}
     <script>{_CART_SCRIPT}</script>"""
 
@@ -2503,6 +2729,8 @@ def list_page(
     price_max: str | None = None,
     include_past: str | None = None,
     excl_privt: list[str] | None = Query(None),
+    excl_kw: str | None = None,
+    excl_kw_set: str | None = None,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -2545,6 +2773,13 @@ def list_page(
         price_min_disp = _parse_price(price_min_in) if price_min_in is not None else _parse_price(cfg_price_bgn)
         price_max_disp = _parse_price(price_max_in) if price_max_in is not None else _parse_price(cfg_price_end)
 
+        # 제외 키워드(Phase 10): 폼 제출(excl_kw_set)이면 입력값 그대로, 아니면 설정 기본값.
+        kw_options = repository.list_exclude_keywords(session)
+        if excl_kw_set in _EXCL_KW_SET_TRUE:
+            excl_kws = _parse_excl_kw(excl_kw)
+        else:
+            excl_kws = repository.get_default_exclude_keywords(session)
+
         objs, total = repository.search_bid_notices(
             session,
             q=q,
@@ -2555,6 +2790,7 @@ def list_page(
             price_max=price_max_disp,
             include_past_openg=include_past_flag,
             exclude_privt_cntrct=excl_privt_flag,
+            exclude_keywords=excl_kws,
             sort=sort,
             page=page,
             page_size=page_size,
@@ -2593,6 +2829,9 @@ def list_page(
         "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
         "excl_privt": "1" if excl_privt_flag else "0",
+        # 제외 키워드는 한글·특수문자를 담을 수 있어 링크에는 URL 인코딩해서 싣는다.
+        "excl_kw": quote(",".join(excl_kws), safe=""),
+        "excl_kw_set": "1",
         "sort": sort,
         "page_size": str(page_size),
     }
@@ -2612,10 +2851,14 @@ def list_page(
         <span class="flabel">공고명 부분검색</span>
         <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
       </label>
-      <button type="submit" class="submit">검색</button>"""
+      <button type="submit" class="submit">검색</button>
+      {_excl_kw_summary(excl_kws)}"""
 
     # detail_html: 토글로 펼쳐지는 상세 필터
     detail_html = f"""
+      <div class="row" style="margin-bottom:12px;">
+        {_excl_kw_field(excl_kws, kw_options, "공고명 제외 키워드")}
+      </div>
       <div class="row">
         <label class="field">
           <span class="flabel">날짜 기준</span>
@@ -2698,6 +2941,7 @@ def list_page(
     {analysis_ui_html}
     {_CART_MODAL_HTML}
     <script>{_LIST_SCRIPT}</script>
+    <script>{_EXCL_KW_SCRIPT}</script>
     {analysis_script_html}
     <script>{_CART_SCRIPT}</script>"""
 
@@ -3538,8 +3782,61 @@ def _render_runs_table(runs: list[dict]) -> str:
     </div>"""
 
 
+def _render_keyword_card(keywords: list[dict[str, Any]]) -> str:
+    """/config — 공고명 제외 키워드 목록 관리 카드(추가·삭제·기본 적용 저장)."""
+    if keywords:
+        rows = "".join(
+            f"<tr>"
+            f'<td><label class="chk" style="padding-bottom:0;">'
+            f'<input type="checkbox" name="default_ids" value="{int(k["id"])}"'
+            f'{" checked" if k.get("is_default") else ""}> 기본 적용</label></td>'
+            f'<td>{_e(k["keyword"])}</td>'
+            f'<td><button type="submit" class="kw-del" name="delete_id" '
+            f'value="{int(k["id"])}">삭제</button></td>'
+            f"</tr>"
+            for k in keywords
+        )
+        table_html = f"""
+      <div class="table-wrap">
+        <table class="kwtable">
+          <thead><tr><th>기본 적용</th><th>키워드</th><th>관리</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px;">
+        <button type="submit" class="submit" name="action" value="save">기본 적용 저장</button>
+      </div>"""
+    else:
+        table_html = '<p class="muted">등록된 키워드가 없습니다. 위에서 추가하세요.</p>'
+
+    return f"""
+    <div class="card" id="keywords">
+      <h2>공고명 제외 키워드 목록</h2>
+      <form method="post" action="/config/keywords">
+        <div class="row" style="margin-bottom:14px;">
+          <label class="field" style="min-width:240px;">
+            <span class="flabel">키워드 추가</span>
+            <input type="text" name="new_keyword" maxlength="{repository.EXCLUDE_KEYWORD_MAX_LEN}"
+                   placeholder="예: 감리">
+          </label>
+          <button type="submit" class="submit" name="action" value="add">추가</button>
+        </div>
+        {table_html}
+      </form>
+      <div class="note">
+        입찰공고목록·사전규격목록 검색필터의 제외 키워드 기본 목록입니다.
+        <b>기본 적용</b>에 체크한 단어는 목록 화면 첫 진입에서 자동으로 칩에 채워집니다(화면에서 개별 해제 가능).
+      </div>
+    </div>"""
+
+
 def _render_config_page(
-    cfg: dict, runs: list[dict], sched: dict, msg: str | None, err: str | None
+    cfg: dict,
+    runs: list[dict],
+    sched: dict,
+    msg: str | None,
+    err: str | None,
+    keywords: list[dict[str, Any]] | None = None,
 ) -> str:
     msg_html = ""
     if err:
@@ -3714,6 +4011,8 @@ def _render_config_page(
       </form>
     </div>
 
+    {_render_keyword_card(keywords or [])}
+
     <div class="card">
       <h2>도구</h2>
       <fieldset>
@@ -3766,6 +4065,12 @@ def _load_config_view() -> tuple[dict, list[dict]]:
     return cfg, runs
 
 
+def _load_keywords() -> list[dict[str, Any]]:
+    """/config 제외 키워드 카드용 목록(세션 안에서 스칼라 dict 로 추출)."""
+    with SessionLocal() as session:
+        return repository.list_exclude_keywords(session)
+
+
 def _sched_view() -> dict:
     return {
         "running": scheduler.is_running(),
@@ -3779,7 +4084,9 @@ def _sched_view() -> dict:
 def config_page(saved: str | None = None, err: str | None = None) -> HTMLResponse:
     cfg, runs = _load_config_view()
     msg = "설정을 저장했습니다." if saved else None
-    return HTMLResponse(_render_config_page(cfg, runs, _sched_view(), msg, err))
+    return HTMLResponse(
+        _render_config_page(cfg, runs, _sched_view(), msg, err, _load_keywords())
+    )
 
 
 @app.post("/config")
@@ -3871,7 +4178,7 @@ async def config_save(request: Request):
         # 입력값을 화면에 되살려 사용자가 고치게 한다.
         cfg.update({k: v for k, v in updates.items()})
         html_page = _render_config_page(
-            cfg, runs, _sched_view(), None, " / ".join(errors)
+            cfg, runs, _sched_view(), None, " / ".join(errors), _load_keywords()
         )
         return HTMLResponse(html_page, status_code=400)
 
@@ -3883,6 +4190,43 @@ async def config_save(request: Request):
         scheduler.reschedule(updates["interval_minutes"])
 
     return RedirectResponse(url="/config?saved=1", status_code=303)
+
+
+@app.post("/config/keywords")
+async def config_keywords_save(request: Request):
+    """제외 키워드 목록 관리 — 체크(기본 적용) 반영 + 추가 또는 삭제.
+
+    한 폼에서 세 동작을 처리한다(제출 버튼의 name/value 로 구분):
+    - `delete_id=<id>`: 해당 키워드 삭제.
+    - `action=add`: `new_keyword` 추가(빈값·중복은 에러 메시지).
+    - `action=save`(기본): 체크 상태만 저장.
+    어느 경우든 화면에 체크된 `default_ids` 를 먼저 반영해 사용자의 체크 편집을 잃지 않는다.
+    """
+    form = await request.form()
+    action = str(form.get("action") or "")
+    delete_raw = str(form.get("delete_id") or "").strip()
+    default_ids = [
+        int(v) for v in form.getlist("default_ids") if str(v).strip().isdigit()
+    ]
+
+    err: str | None = None
+    with SessionLocal() as session:
+        # 체크 상태는 항상 먼저 저장(추가·삭제와 함께 제출돼도 편집분 유지).
+        repository.set_default_exclude_keywords(session, default_ids)
+
+        if delete_raw.isdigit():
+            repository.delete_exclude_keyword(session, int(delete_raw))
+        elif action == "add":
+            raw = str(form.get("new_keyword") or "")
+            kw = repository.normalize_keyword(raw)
+            if not kw:
+                err = "추가할 키워드를 입력하세요(콤마는 사용할 수 없습니다)."
+            elif not repository.add_exclude_keyword(session, kw):
+                err = f"이미 등록된 키워드입니다('{kw}')."
+
+    if err:
+        return RedirectResponse(url=f"/config?err={quote(err)}#keywords", status_code=303)
+    return RedirectResponse(url="/config?saved=1#keywords", status_code=303)
 
 
 @app.post("/config/resume")

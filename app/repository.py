@@ -22,6 +22,7 @@ from app.models import (
     AppConfig,
     BidNotice,
     CollectionRun,
+    ExcludeKeyword,
     ExportCartItem,
     PreSpec,
 )
@@ -361,6 +362,53 @@ _PRE_SPEC_SORT_COLUMNS: dict[str, tuple[str, bool]] = {
 }
 
 
+# --- 공고명 제외 키워드(Phase 10) 공용 헬퍼 ------------------------------
+# 한 검색에 적용 가능한 제외 키워드 최대 개수(과도한 조건 누적 방지).
+EXCLUDE_KEYWORD_MAX = 20
+# 키워드 최대 길이(모델 String(50) 과 일치).
+EXCLUDE_KEYWORD_MAX_LEN = 50
+
+
+def normalize_keyword(raw: Any) -> str:
+    """입력 키워드 정규화 — 콤마 제거(CSV 구분자) + 공백 정리 + 길이 제한.
+
+    콤마는 화면 파라미터(`excl_kw`)의 구분자라 단어에 포함될 수 없어 공백으로 치환하고,
+    연속 공백은 1칸으로 접는다(눈에 안 보이는 공백 차이로 매칭이 어긋나지 않게).
+    """
+    if raw is None:
+        return ""
+    text = " ".join(str(raw).replace(",", " ").split())
+    return text[:EXCLUDE_KEYWORD_MAX_LEN]
+
+
+def _like_escape(value: str) -> str:
+    """LIKE 패턴 특수문자(`\\` `%` `_`)를 이스케이프한다(제외 조건 과잉매칭 방지)."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _exclude_keyword_conditions(column: Any, keywords: list[str] | None) -> list[Any]:
+    """제외 키워드 목록 → `(col IS NULL) OR (col NOT LIKE %kw%)` 조건 목록.
+
+    - 대소문자 무시 부분일치(ilike)로 매칭되는 행을 제외한다(AND 누적 = 모두 제외).
+    - 이름이 NULL 인 행은 데이터 누락일 뿐이므로 제외하지 않는다(기존 필터 관례와 동일).
+    - 빈 문자열·중복은 무시하고, 최대 EXCLUDE_KEYWORD_MAX 개까지만 적용한다.
+    """
+    conds: list[Any] = []
+    seen: set[str] = set()
+    for raw in keywords or []:
+        kw = normalize_keyword(raw)
+        if not kw or kw in seen:
+            continue
+        seen.add(kw)
+        pattern = f"%{_like_escape(kw)}%"
+        conds.append(
+            or_(column.is_(None), ~column.ilike(pattern, escape="\\"))
+        )
+        if len(conds) >= EXCLUDE_KEYWORD_MAX:
+            break
+    return conds
+
+
 def search_bid_notices(
     session: Session,
     *,
@@ -373,6 +421,7 @@ def search_bid_notices(
     openg_only_future: bool = False,
     include_past_openg: bool = True,
     exclude_privt_cntrct: bool = False,
+    exclude_keywords: list[str] | None = None,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -395,6 +444,8 @@ def search_bid_notices(
     - exclude_privt_cntrct=True: 계약체결방법명(cntrct_cncls_mthd_nm)이 "수의계약"인
       공고를 숨긴다. 방법 미상(NULL)은 데이터 누락일 뿐이므로 숨기지 않는다.
       /list 화면의 "수의계약제외" 체크박스(기본 체크)가 이 플래그를 넘긴다.
+    - exclude_keywords(Phase 10): 공고명(bid_ntce_nm)에 해당 단어가 포함된 공고를 숨긴다
+      (부분일치·대소문자 무시, 여러 개면 모두 제외). 공고명 NULL 은 숨기지 않는다.
     - sort(Phase 4.2 확장): _SORT_COLUMNS 의 6종 허용
       (bid_ntce_dt/openg_dt/presmpt_prce × asc/desc). NULL 은 항상 뒤로.
       기본·미허용값은 "bid_ntce_dt_desc"(최신 공고순).
@@ -435,6 +486,8 @@ def search_bid_notices(
                 BidNotice.cntrct_cncls_mthd_nm != "수의계약",
             )
         )
+    # 공고명 제외 키워드(Phase 10) — 여러 개면 AND 로 모두 제외.
+    conditions.extend(_exclude_keyword_conditions(BidNotice.bid_ntce_nm, exclude_keywords))
 
     count_stmt = select(func.count()).select_from(BidNotice)
     for cond in conditions:
@@ -474,6 +527,7 @@ def search_pre_specs(
     price_min: int | None = None,    # asign_bdgt_amt >= price_min (Phase 4.9-R2-D)
     price_max: int | None = None,    # asign_bdgt_amt <= price_max (Phase 4.9-R2-D)
     include_past_opnin: bool = True,  # False 면 의견마감 지난 항목 숨김(NULL 은 표시)
+    exclude_keywords: list[str] | None = None,  # 품명/사업명 제외 키워드(Phase 10)
     sort: str = "rcpt_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -493,6 +547,8 @@ def search_pre_specs(
       `(opnin_rgst_clse_dt >= now) OR (opnin_rgst_clse_dt IS NULL)`.
       **마감일 미정(NULL)은 아직 유효하므로 항상 표시.** now 는 테스트 결정성을 위해
       주입 가능(기본 None → datetime.now()).
+    - exclude_keywords(Phase 10): 품명/사업명(prdct_clsfc_no_nm)에 해당 단어가 포함된
+      항목을 숨긴다(부분일치·대소문자 무시, 여러 개면 모두 제외). NULL 은 숨기지 않는다.
     - sort: _PRE_SPEC_SORT_COLUMNS 의 6종 허용
       (rcpt_dt/opnin_rgst_clse_dt/asign_bdgt_amt × asc/desc). NULL 은 항상 뒤로.
       기본·미허용값은 "rcpt_dt_desc"(최신 접수순).
@@ -526,6 +582,10 @@ def search_pre_specs(
                 PreSpec.opnin_rgst_clse_dt.is_(None),
             )
         )
+    # 품명/사업명 제외 키워드(Phase 10) — /list 와 동일 규칙.
+    conditions.extend(
+        _exclude_keyword_conditions(PreSpec.prdct_clsfc_no_nm, exclude_keywords)
+    )
 
     count_stmt = select(func.count()).select_from(PreSpec)
     for cond in conditions:
@@ -721,6 +781,66 @@ def get_analysis_status_map(
         AnalysisResult.source_id.in_(source_ids),
     )
     return {source_id: status for source_id, status in session.execute(stmt).all()}
+
+
+# --- Phase 10: 공고명 제외 키워드 목록 관리 --------------------------------
+
+def list_exclude_keywords(session: Session) -> list[dict[str, Any]]:
+    """등록된 제외 키워드 전체 — [{id, keyword, is_default}] (기본적용 우선 · 가나다순)."""
+    stmt = select(ExcludeKeyword).order_by(
+        ExcludeKeyword.is_default.desc(), ExcludeKeyword.keyword.asc()
+    )
+    rows = session.execute(stmt).scalars().all()
+    return [
+        {"id": r.id, "keyword": r.keyword, "is_default": bool(r.is_default)}
+        for r in rows
+    ]
+
+
+def get_default_exclude_keywords(session: Session) -> list[str]:
+    """기본 적용(is_default=True) 키워드 문자열 목록 — 목록 화면 첫 진입 기본값."""
+    stmt = (
+        select(ExcludeKeyword.keyword)
+        .where(ExcludeKeyword.is_default.is_(True))
+        .order_by(ExcludeKeyword.keyword.asc())
+    )
+    return [k for (k,) in session.execute(stmt).all()]
+
+
+def add_exclude_keyword(
+    session: Session, keyword: str, *, is_default: bool = False
+) -> bool:
+    """키워드 1건 추가. 빈 값·중복(대소문자 무시)이면 저장하지 않고 False 를 반환한다."""
+    kw = normalize_keyword(keyword)
+    if not kw:
+        return False
+    exists = session.execute(
+        select(ExcludeKeyword.id).where(func.lower(ExcludeKeyword.keyword) == kw.lower())
+    ).first()
+    if exists:
+        return False
+    session.add(ExcludeKeyword(keyword=kw, is_default=is_default, created_at=_utcnow()))
+    session.commit()
+    return True
+
+
+def delete_exclude_keyword(session: Session, keyword_id: int) -> bool:
+    """키워드 1건 삭제. 없으면 False."""
+    row = session.get(ExcludeKeyword, keyword_id)
+    if row is None:
+        return False
+    session.delete(row)
+    session.commit()
+    return True
+
+
+def set_default_exclude_keywords(session: Session, keyword_ids: list[int]) -> None:
+    """기본 적용 체크 상태 일괄 반영 — 전달된 id 만 True, 나머지는 False."""
+    wanted = {int(i) for i in keyword_ids}
+    rows = session.execute(select(ExcludeKeyword)).scalars().all()
+    for row in rows:
+        row.is_default = row.id in wanted
+    session.commit()
 
 
 # --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------
