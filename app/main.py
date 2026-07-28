@@ -778,12 +778,31 @@ BASE_CSS = """
   .modal-footer { display: flex; gap: 8px; justify-content: flex-end; padding-top: 8px; border-top: 1px solid #eee; }
   .btn-primary { background: #1565C0; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
   .btn-secondary { background: #757575; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
-  /* 공고명 제외 키워드(Phase 10): 칩 입력 + 기본목록 select */
-  .kw-field { display: flex; flex-direction: column; font-size: 13px; flex: 1 1 420px; min-width: 300px; }
-  .kw-wrap { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
-  .kw-box { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; background: #fff;
-            border: 1px solid #cbd2dc; border-radius: 6px; padding: 4px 8px; min-height: 34px;
-            flex: 1 1 300px; }
+  /* 공고명 제외 키워드(Phase 10): 칩 입력 + 등록 목록 드롭다운(입력창 클릭 시 아래로) */
+  .kw-field { display: flex; flex-direction: column; font-size: 13px;
+              flex: 0 1 520px; max-width: 50%; min-width: 280px; }
+  .kw-wrap { display: flex; gap: 8px; align-items: flex-start; }
+  .kw-box { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+            background: #fff; border: 1px solid #cbd2dc; border-radius: 6px; padding: 4px 8px;
+            min-height: 34px; flex: 1 1 auto; cursor: text; }
+  .kw-box.open { border-color: #9bb0cf; }
+  /* 등록 목록 드롭다운 — 입력창 아래로 펼침 */
+  .kw-menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: #fff;
+             border: 1px solid #cbd2dc; border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.14);
+             max-height: 220px; overflow-y: auto; padding: 4px; z-index: 40; }
+  .kw-menu[hidden] { display: none; }
+  .kw-opt { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+            border: 0; background: transparent; color: #1f2430; text-align: left; font-size: 12px;
+            padding: 6px 8px; border-radius: 5px; cursor: pointer; }
+  .kw-opt:hover { background: #eef1f6; }
+  .kw-opt[hidden] { display: none; }
+  .kw-opt.is-default { color: #97720d; }                       /* 기본 적용 키워드 = warning */
+  .kw-opt.is-selected { background: #e3f5e9; color: #1d7a43; font-weight: 600; }  /* 적용 중 = success */
+  .kw-opt.is-selected:hover { background: #d8f0df; }
+  .kw-opt .kw-opt-mark { font-size: 11px; visibility: hidden; }
+  .kw-opt.is-selected .kw-opt-mark { visibility: visible; }
+  .kw-menu-empty { font-size: 12px; color: #8a93a2; padding: 6px 8px; }
+  .kw-menu-empty[hidden] { display: none; }
   .kw-chip { display: inline-flex; align-items: center; gap: 2px; background: #eef3fb; color: #1f3a5f;
              border: 1px solid #b6c6df; border-radius: 14px; padding: 2px 4px 2px 10px; font-size: 12px;
              white-space: nowrap; }
@@ -799,7 +818,6 @@ BASE_CSS = """
   .kw-ok:hover { background: #d8f0df; }
   .kw-cancel { color: #b02a25; border-color: #e6b6b3; background: #fde3e1; }
   .kw-cancel:hover { background: #fbd3d0; }
-  .kw-select { max-width: 220px; }
   .kw-help { font-size: 11px; color: #8a93a2; margin-top: 4px; }
   .kw-sum { font-size: 12px; padding: 4px 10px; border-radius: 20px; background: #fdf3df; color: #97720d;
             white-space: nowrap; margin-bottom: 6px; }
@@ -1381,23 +1399,31 @@ def _excl_kw_summary(keywords: list[str]) -> str:
 
 
 def _excl_kw_field(keywords: list[str], options: list[dict[str, Any]], label: str) -> str:
-    """칩 입력 위젯 — 칩 + 입력(✓/✕) + 기본목록 select + hidden(excl_kw/excl_kw_set)."""
+    """칩 입력 위젯 — 칩 + 입력(✓/✕) + 등록 목록 드롭다운 + hidden(excl_kw/excl_kw_set).
+
+    입력창과 목록을 한 박스로 합쳐 클릭 시 아래로 드롭다운이 열린다. 드롭다운 항목은
+    기본 적용 키워드=warning 색, 현재 적용 중(칩에 있는) 키워드=success 하이라이트로 구분한다.
+    """
     chips = "".join(
         f'<span class="kw-chip" data-kw="{_e(kw)}">{_e(kw)}'
         f'<button type="button" class="kw-chip-x" aria-label="{_e(kw)} 제외 해제">&times;</button>'
         f"</span>"
         for kw in keywords
     )
+    selected = {kw.lower() for kw in keywords}
     opts = "".join(
-        f'<option value="{_e(o["keyword"])}">{_e(o["keyword"])}'
-        f'{" (기본)" if o.get("is_default") else ""}</option>'
+        '<button type="button" class="kw-opt'
+        f'{" is-default" if o.get("is_default") else ""}'
+        f'{" is-selected" if str(o["keyword"]).lower() in selected else ""}'
+        f'" data-kw="{_e(o["keyword"])}" role="option">'
+        f'<span>{_e(o["keyword"])}</span><span class="kw-opt-mark">&#10003;</span>'
+        "</button>"
         for o in options
     )
-    select_html = (
-        f'<select class="kw-select" id="exclKwSelect" aria-label="등록된 제외 키워드 선택">'
-        f'<option value="">목록에서 선택…</option>{opts}</select>'
+    empty_msg = (
+        "일치하는 키워드가 없습니다."
         if options
-        else '<span class="kw-help">등록된 기본 목록이 없습니다 · [설정]에서 추가</span>'
+        else "등록된 키워드가 없습니다 · [설정]에서 추가하세요."
     )
     return f"""
       <div class="kw-field">
@@ -1407,15 +1433,19 @@ def _excl_kw_field(keywords: list[str], options: list[dict[str, Any]], label: st
             {chips}
             <input type="text" class="kw-input" id="exclKwInput" placeholder="제외할 단어 입력"
                    maxlength="{repository.EXCLUDE_KEYWORD_MAX_LEN}" autocomplete="off"
+                   role="combobox" aria-expanded="false" aria-controls="exclKwMenu"
                    aria-label="제외 키워드 입력">
             <span class="kw-confirm" id="exclKwConfirm" hidden>
               <button type="button" class="kw-ok" id="exclKwOk" title="추가" aria-label="제외 키워드 추가">&#10003;</button>
               <button type="button" class="kw-cancel" id="exclKwCancel" title="취소" aria-label="입력 취소">&#10005;</button>
             </span>
+            <div class="kw-menu" id="exclKwMenu" role="listbox" aria-label="등록된 제외 키워드" hidden>
+              {opts}
+              <div class="kw-menu-empty" id="exclKwMenuEmpty"{"" if not options else " hidden"}>{_e(empty_msg)}</div>
+            </div>
           </div>
-          {select_html}
         </div>
-        <span class="kw-help">입력 후 ✓(또는 Enter)로 추가 · 칩의 ×로 제거 · 기본 목록 관리는 [설정]</span>
+        <span class="kw-help">입력창을 누르면 등록 목록이 열립니다 · 목록 클릭으로 추가/해제 · 입력 후 ✓(또는 Enter)로 추가 · 목록 관리는 [설정]</span>
         <input type="hidden" name="excl_kw" id="exclKwHidden" value="{_e(",".join(keywords))}">
         <input type="hidden" name="excl_kw_set" value="1">
       </div>"""
@@ -1431,7 +1461,8 @@ _EXCL_KW_SCRIPT = """
     var confirmBox = document.getElementById('exclKwConfirm');
     var okBtn = document.getElementById('exclKwOk');
     var cancelBtn = document.getElementById('exclKwCancel');
-    var sel = document.getElementById('exclKwSelect');
+    var menu = document.getElementById('exclKwMenu');
+    var menuEmpty = document.getElementById('exclKwMenuEmpty');
     var badge = document.getElementById('exclKwCount');
     var MAX = %(max)d;
     var MAXLEN = %(maxlen)d;
@@ -1451,6 +1482,64 @@ _EXCL_KW_SCRIPT = """
         if (list.length) { badge.removeAttribute('hidden'); }
         else { badge.setAttribute('hidden', 'hidden'); }
       }
+      markSelected(list);
+    }
+
+    // 드롭다운 항목 하이라이트 — 현재 적용 중(칩에 있는) 키워드에 success 표시.
+    function markSelected(list) {
+      if (!menu) return;
+      var lower = list.map(function (w) { return w.toLowerCase(); });
+      Array.prototype.forEach.call(menu.querySelectorAll('.kw-opt'), function (opt) {
+        var kw = (opt.getAttribute('data-kw') || '').toLowerCase();
+        if (lower.indexOf(kw) >= 0) { opt.classList.add('is-selected'); }
+        else { opt.classList.remove('is-selected'); }
+      });
+    }
+
+    // 입력 중인 글자로 목록을 좁힌다(빈 입력이면 전체 노출).
+    function filterMenu() {
+      if (!menu) return;
+      var q = input.value.trim().toLowerCase();
+      var shown = 0;
+      Array.prototype.forEach.call(menu.querySelectorAll('.kw-opt'), function (opt) {
+        var kw = (opt.getAttribute('data-kw') || '').toLowerCase();
+        var hit = !q || kw.indexOf(q) >= 0;
+        if (hit) { opt.removeAttribute('hidden'); shown += 1; }
+        else { opt.setAttribute('hidden', 'hidden'); }
+      });
+      if (menuEmpty) {
+        if (shown) { menuEmpty.setAttribute('hidden', 'hidden'); }
+        else { menuEmpty.removeAttribute('hidden'); }
+      }
+    }
+
+    function openMenu() {
+      if (!menu) return;
+      filterMenu();
+      menu.removeAttribute('hidden');
+      box.classList.add('open');
+      input.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeMenu() {
+      if (!menu) return;
+      menu.setAttribute('hidden', 'hidden');
+      box.classList.remove('open');
+      input.setAttribute('aria-expanded', 'false');
+    }
+
+    function menuOpen() {
+      return !!menu && !menu.hasAttribute('hidden');
+    }
+
+    function removeWord(word) {
+      var target = String(word || '').toLowerCase();
+      Array.prototype.forEach.call(box.querySelectorAll('.kw-chip'), function (chip) {
+        if ((chip.getAttribute('data-kw') || '').toLowerCase() === target) {
+          chip.parentNode.removeChild(chip);
+        }
+      });
+      sync();
     }
 
     function addWord(raw) {
@@ -1491,7 +1580,8 @@ _EXCL_KW_SCRIPT = """
     input.addEventListener('compositionstart', function () { composing = true; });
     input.addEventListener('compositionend', function () { composing = false; toggleConfirm(); });
 
-    input.addEventListener('input', toggleConfirm);
+    input.addEventListener('input', function () { toggleConfirm(); filterMenu(); openMenu(); });
+    input.addEventListener('focus', openMenu);
     input.addEventListener('keydown', function (e) {
       if (composing || e.isComposing || e.keyCode === 229) return;  // IME 조합 중 키는 무시
       if (e.key === 'Enter') {
@@ -1499,13 +1589,17 @@ _EXCL_KW_SCRIPT = """
         e.preventDefault();
         addWord(input.value);
         clearInput();
+        filterMenu();
       } else if (e.key === 'Escape') {
         e.preventDefault();
-        clearInput();
+        if (menuOpen()) { closeMenu(); }
+        else { clearInput(); }
       }
     });
-    okBtn.addEventListener('click', function () { addWord(input.value); clearInput(); input.focus(); });
-    cancelBtn.addEventListener('click', function () { clearInput(); input.focus(); });
+    okBtn.addEventListener('click', function () {
+      addWord(input.value); clearInput(); filterMenu(); input.focus();
+    });
+    cancelBtn.addEventListener('click', function () { clearInput(); filterMenu(); input.focus(); });
 
     box.addEventListener('click', function (e) {
       var x = e.target.closest ? e.target.closest('.kw-chip-x') : null;
@@ -1514,15 +1608,22 @@ _EXCL_KW_SCRIPT = """
         if (chip) { chip.parentNode.removeChild(chip); sync(); }
         return;
       }
+      // 드롭다운 항목 클릭 = 적용/해제 토글(메뉴는 열어 둔다).
+      var opt = e.target.closest ? e.target.closest('.kw-opt') : null;
+      if (opt) {
+        var kw = opt.getAttribute('data-kw') || '';
+        if (opt.classList.contains('is-selected')) { removeWord(kw); }
+        else { addWord(kw); }
+        return;
+      }
+      if (!menuOpen()) openMenu();
       if (e.target === box) input.focus();
     });
 
-    if (sel) {
-      sel.addEventListener('change', function () {
-        if (sel.value) addWord(sel.value);
-        sel.value = '';
-      });
-    }
+    // 위젯 밖 클릭 시 닫기.
+    document.addEventListener('click', function (e) {
+      if (!box.contains(e.target)) closeMenu();
+    });
 
     sync();
   })();

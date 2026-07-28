@@ -255,11 +255,14 @@ def test_list_applies_default_keyword_on_first_visit(client):
     assert resp.status_code == 200
     assert "감리 용역 공고" not in resp.text          # 기본 적용 키워드로 제외
     assert "소프트웨어 개발 공고" in resp.text
-    # 칩·요약 배지·기본목록 select 노출.
+    # 칩·요약 배지·등록 목록 드롭다운 노출.
     assert 'data-kw="감리"' in resp.text
     assert "제외 키워드 1개" in resp.text
-    assert 'id="exclKwSelect"' in resp.text
-    assert '<option value="청소">' in resp.text
+    assert 'id="exclKwMenu"' in resp.text
+    # 드롭다운 항목: 기본 적용=warning(is-default), 현재 적용 중=success(is-selected).
+    assert 'class="kw-opt is-default is-selected" data-kw="감리"' in resp.text
+    assert 'class="kw-opt" data-kw="청소"' in resp.text
+    assert "(기본)" not in resp.text  # 혼동되는 텍스트 표기 대신 색상으로 구분
 
 
 def test_list_form_submit_overrides_default(client):
