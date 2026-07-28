@@ -1485,8 +1485,15 @@ _EXCL_KW_SCRIPT = """
       else { confirmBox.setAttribute('hidden', 'hidden'); }
     }
 
+    // 한글 등 IME 조합 상태 추적 — 조합 중 Enter 는 '조합 확정'용이라 칩 추가로 처리하면 안 된다
+    // (확정 전 글자로 칩이 하나 만들어지고, 확정된 잔여 글자가 다시 칩이 되어 중복 입력됨).
+    var composing = false;
+    input.addEventListener('compositionstart', function () { composing = true; });
+    input.addEventListener('compositionend', function () { composing = false; toggleConfirm(); });
+
     input.addEventListener('input', toggleConfirm);
     input.addEventListener('keydown', function (e) {
+      if (composing || e.isComposing || e.keyCode === 229) return;  // IME 조합 중 키는 무시
       if (e.key === 'Enter') {
         // 필터 폼 제출 대신 칩 추가로 처리.
         e.preventDefault();

@@ -287,6 +287,17 @@ def test_list_keyword_preserved_in_links(client):
     assert "excl_kw_set=1" in resp.text
 
 
+def test_list_script_guards_ime_composition(client):
+    """한글(IME) 조합 중 Enter 는 무시해야 한다 — 없으면 조합 확정 글자가 중복 칩으로 들어간다."""
+    from app import main
+
+    assert "compositionstart" in main._EXCL_KW_SCRIPT
+    assert "compositionend" in main._EXCL_KW_SCRIPT
+    assert "e.isComposing || e.keyCode === 229" in main._EXCL_KW_SCRIPT
+    # 실제 화면에도 그대로 실려야 한다.
+    assert "e.isComposing" in client.get("/list", params=_WIDE).text
+
+
 def test_pre_spec_applies_default_keyword(client):
     resp = client.get("/pre-spec", params=_WIDE)
     assert resp.status_code == 200
