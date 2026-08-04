@@ -864,6 +864,8 @@ def get_export_cart(session: Session) -> list[dict[str, Any]]:
                     "presmpt_prce": notice.presmpt_prce,
                     "start_dt": notice.bid_ntce_dt,
                     "close_dt": notice.openg_dt,
+                    "detail_url": notice.bid_ntce_dtl_url,
+                    "file_count": len(get_notice_files(session, item.item_id)),
                 })
         else:
             spec = session.get(PreSpec, item.item_id)
@@ -879,6 +881,8 @@ def get_export_cart(session: Session) -> list[dict[str, Any]]:
                     "presmpt_prce": None,
                     "start_dt": spec.rcpt_dt,
                     "close_dt": spec.opnin_rgst_clse_dt,
+                    "detail_url": None,
+                    "file_count": len(get_pre_spec_files(session, item.item_id)),
                 })
     return result
 

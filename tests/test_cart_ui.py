@@ -14,6 +14,7 @@ UI 동작(JS/CSS)은 pytest로 완전 검증 불가능하므로:
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, time, timedelta
 
 import pytest
@@ -316,3 +317,57 @@ class TestCartRenamePhase73:
         """id 'cart-modal'은 변경 없이 유지됨."""
         r = client.get("/list")
         assert 'id="cart-modal"' in r.text, "cart-modal id 유지 실패"
+
+
+class TestCartUsabilityPhase11:
+    def test_cart_selection_and_action_controls_present(self, client):
+        r = client.get("/list")
+        assert 'class="cart-select-chk"' in r.text
+        assert 'id="btn-cart-files"' in r.text
+        assert "파일다운로드" in r.text
+        assert 'id="btn-cart-del-selected"' in r.text
+        assert "선택삭제" in r.text
+        assert 'class="btn-cart-search"' in r.text
+        assert ">검색</button>" in r.text
+
+    def test_cart_file_download_and_selected_delete_scripts_present(self, client):
+        r = client.get("/pre-spec")
+        assert "downloadCartFiles" in r.text
+        assert "deleteSelectedCartItems" in r.text
+        assert "/files/single" in r.text
+        assert "/files.zip" in r.text
+        assert "cart-select-chk:checked" in r.text
+
+    def test_bid_title_detail_link_guard_present(self, client):
+        r = client.get("/list")
+        assert "item.detail_url" in r.text
+        assert "detailUrl.indexOf('http://') === 0" in r.text
+        assert "detailUrl.indexOf('https://') === 0" in r.text
+        assert 'target="_blank" rel="noopener"' in r.text
+
+    def test_cart_file_download_reentry_guard_present(self, client):
+        script = client.get("/list").text
+        assert "filesBtn.disabled = !hasSelection || cartFilesDownloading" in script
+        assert re.search(
+            r"async function downloadCartFiles\(\) \{\s*"
+            r"if \(cartFilesDownloading\) return;.*?"
+            r"cartFilesDownloading = true;.*?try \{.*?finally \{\s*"
+            r"cartFilesDownloading = false;\s*updateCartSelectionButtons\(\);",
+            script,
+            re.DOTALL,
+        )
+
+    def test_selected_delete_failure_and_reentry_guards_present(self, client):
+        script = client.get("/pre-spec").text
+        assert "deleteBtn.disabled = !hasSelection || cartSelectedDeleting" in script
+        assert re.search(
+            r"async function deleteSelectedCartItems\(\) \{\s*"
+            r"if \(cartSelectedDeleting\) return;.*?"
+            r"cartSelectedDeleting = true;.*?try \{.*?"
+            r"if \(resp\.ok\) succeeded \+= 1;\s*else failed \+= 1;.*?"
+            r"catch \(error\) \{\s*failed \+= 1;.*?finally \{\s*try \{\s*"
+            r"await loadCartItems\(\);.*?cartSelectedDeleting = false;.*?"
+            r"succeeded.*?failed",
+            script,
+            re.DOTALL,
+        )
