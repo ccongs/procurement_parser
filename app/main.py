@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -772,10 +772,17 @@ BASE_CSS = """
   .type-bid { background: #E3F2FD; color: #1565C0; }
   .type-pre { background: #F3E5F5; color: #6A1B9A; }
   .cart-item-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cart-select-chk { cursor: pointer; width: 16px; height: 16px; flex-shrink: 0; }
+  .btn-cart-search { flex-shrink: 0; background: #fff; color: #1565C0; border: 1px solid #1565C0; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .btn-cart-search:hover { background: #E3F2FD; }
   .btn-cart-del { flex-shrink: 0; background: #EF5350; color: #fff; border: none; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
   .btn-cart-del:hover { background: #C62828; }
   .cart-empty { text-align: center; color: #9E9E9E; padding: 24px; }
   .modal-footer { display: flex; gap: 8px; justify-content: flex-end; padding-top: 8px; border-top: 1px solid #eee; }
+  .cart-modal-footer { justify-content: initial; }
+  .cart-footer-left, .cart-footer-right { display: flex; gap: 8px; }
+  .cart-footer-left { margin-right: auto; }
+  .cart-modal-footer button:disabled { opacity: .5; cursor: default; }
   .btn-primary { background: #1565C0; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
   .btn-secondary { background: #757575; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; }
   /* 공고명 제외 키워드(Phase 10): 칩 입력 + 등록 목록 드롭다운(입력창 클릭 시 아래로) */
@@ -2257,9 +2264,15 @@ _CART_MODAL_HTML = """
         <div class="cart-modal-body">
           <div id="cart-items-list"></div>
         </div>
-        <div class="modal-footer">
-          <button onclick="clearCart()" class="btn-secondary">전체 삭제</button>
-          <button onclick="downloadCart()" class="btn-primary">엑셀 다운로드</button>
+        <div class="modal-footer cart-modal-footer">
+          <div class="cart-footer-left">
+            <button id="btn-cart-files" onclick="downloadCartFiles()" class="btn-primary" disabled>파일다운로드</button>
+            <button id="btn-cart-del-selected" onclick="deleteSelectedCartItems()" class="btn-secondary" disabled>선택삭제</button>
+          </div>
+          <div class="cart-footer-right">
+            <button onclick="clearCart()" class="btn-secondary">전체 삭제</button>
+            <button onclick="downloadCart()" class="btn-primary">엑셀 다운로드</button>
+          </div>
         </div>
       </div>
     </div>
@@ -2267,6 +2280,9 @@ _CART_MODAL_HTML = """
 
 # 장바구니 공통 JS (list·pre-spec 페이지 양쪽에 삽입, Phase 7.2)
 _CART_SCRIPT = """
+  var cartFilesDownloading = false;
+  var cartSelectedDeleting = false;
+
   function escapeHtml(str) {
     return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
@@ -2298,22 +2314,49 @@ _CART_SCRIPT = """
     }
   }
 
+  function updateCartSelectionButtons() {
+    var hasSelection = document.querySelectorAll('.cart-select-chk:checked').length > 0;
+    var filesBtn = document.getElementById('btn-cart-files');
+    var deleteBtn = document.getElementById('btn-cart-del-selected');
+    if (filesBtn) filesBtn.disabled = !hasSelection || cartFilesDownloading;
+    if (deleteBtn) deleteBtn.disabled = !hasSelection || cartSelectedDeleting;
+  }
+
   function renderCartItems(items) {
     var el = document.getElementById('cart-items-list');
     if (!el) return;
     if (!items.length) {
       el.innerHTML = '<p class="cart-empty">담긴 항목이 없습니다.</p>';
+      updateCartSelectionButtons();
       return;
     }
     el.innerHTML = items.map(function (item) {
       var typeLabel = item.item_type === 'bid' ? '입찰' : '사전규격';
       var typeCls = item.item_type === 'bid' ? 'type-bid' : 'type-pre';
+      var detailUrl = typeof item.detail_url === 'string' ? item.detail_url : '';
+      var titleHtml = escapeHtml(item.title);
+      if (item.item_type === 'bid'
+          && (detailUrl.indexOf('http://') === 0 || detailUrl.indexOf('https://') === 0)) {
+        titleHtml = '<a href="' + escapeHtml(detailUrl) + '" target="_blank" rel="noopener">' + titleHtml + '</a>';
+      }
       return '<div class="cart-item-row" data-cart-id="' + item.cart_id + '">'
+        + '<input type="checkbox" class="cart-select-chk"'
+        + ' data-cart-id="' + escapeHtml(String(item.cart_id)) + '"'
+        + ' data-item-type="' + escapeHtml(item.item_type) + '"'
+        + ' data-item-id="' + escapeHtml(item.item_id) + '"'
+        + ' data-file-count="' + escapeHtml(String(item.file_count || 0)) + '">'
         + '<span class="cart-item-type ' + typeCls + '">' + typeLabel + '</span>'
-        + '<span class="cart-item-title" title="' + escapeHtml(item.title) + '">' + escapeHtml(item.title) + '</span>'
+        + '<span class="cart-item-title" title="' + escapeHtml(item.title) + '">' + titleHtml + '</span>'
+        + '<button class="btn-cart-search" data-search-url="' + escapeHtml(item.search_url) + '"'
+        + ' onclick="openCartSearch(this)">검색</button>'
         + '<button class="btn-cart-del" onclick="deleteCartItem(' + item.cart_id + ')">삭제</button>'
         + '</div>';
     }).join('');
+    updateCartSelectionButtons();
+  }
+
+  function openCartSearch(button) {
+    window.open(button.dataset.searchUrl, '_blank', 'noopener');
   }
 
   async function loadCartItems() {
@@ -2334,6 +2377,78 @@ _CART_SCRIPT = """
   async function deleteCartItem(cartId) {
     await fetch('/api/export-cart/' + cartId, { method: 'DELETE' });
     await loadCartItems();
+  }
+
+  async function downloadCartFiles() {
+    if (cartFilesDownloading) return;
+    var selected = Array.from(document.querySelectorAll('.cart-select-chk:checked')).map(function (c) {
+      return {
+        itemType: c.dataset.itemType,
+        itemId: c.dataset.itemId,
+        fileCount: parseInt(c.dataset.fileCount || '0', 10),
+      };
+    });
+    var targets = selected.filter(function (item) { return item.fileCount > 0; });
+    var excluded = selected.length - targets.length;
+    if (!targets.length) {
+      showCartToast('선택한 항목에 첨부파일이 없습니다.');
+      return;
+    }
+    cartFilesDownloading = true;
+    updateCartSelectionButtons();
+    try {
+      for (var i = 0; i < targets.length; i++) {
+        var item = targets[i];
+        var base = item.itemType === 'bid'
+          ? '/list/' + encodeURIComponent(item.itemId)
+          : '/pre-spec/' + encodeURIComponent(item.itemId);
+        var link = document.createElement('a');
+        link.style.display = 'none';
+        link.href = base + (item.fileCount >= 2 ? '/files.zip' : '/files/single');
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        if (i < targets.length - 1) {
+          await new Promise(function (resolve) { setTimeout(resolve, 800); });
+        }
+      }
+      var message = targets.length + '건 다운로드를 시작했습니다.';
+      if (excluded) message += ' (첨부 없음 ' + excluded + '건 제외)';
+      showCartToast(message);
+    } finally {
+      cartFilesDownloading = false;
+      updateCartSelectionButtons();
+    }
+  }
+
+  async function deleteSelectedCartItems() {
+    if (cartSelectedDeleting) return;
+    var selected = Array.from(document.querySelectorAll('.cart-select-chk:checked'));
+    if (!selected.length) return;
+    if (!confirm('선택한 ' + selected.length + '건을 장바구니에서 삭제할까요?')) return;
+    var succeeded = 0;
+    var failed = 0;
+    cartSelectedDeleting = true;
+    updateCartSelectionButtons();
+    try {
+      for (var i = 0; i < selected.length; i++) {
+        try {
+          var resp = await fetch('/api/export-cart/' + selected[i].dataset.cartId, { method: 'DELETE' });
+          if (resp.ok) succeeded += 1;
+          else failed += 1;
+        } catch (error) {
+          failed += 1;
+        }
+      }
+    } finally {
+      try {
+        await loadCartItems();
+      } finally {
+        cartSelectedDeleting = false;
+        updateCartSelectionButtons();
+        showCartToast('선택삭제 완료: ' + succeeded + '건 성공, ' + failed + '건 실패');
+      }
+    }
   }
 
   async function clearCart() {
@@ -2374,6 +2489,8 @@ _CART_SCRIPT = """
       updateCartAddButton();
     } else if (e.target.classList.contains('row-select-chk')) {
       updateCartAddButton();
+    } else if (e.target.classList.contains('cart-select-chk')) {
+      updateCartSelectionButtons();
     }
   });
 
@@ -3083,6 +3200,48 @@ def _filename_from_cd(resp: httpx.Response, fallback: str) -> str:
     return fallback
 
 
+async def _single_file_response(item_id: str, file: dict[str, Any]) -> Response:
+    """DB 첨부 목록에서 고른 단일 파일을 원본 응답으로 반환."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT
+        ) as client:
+            async with client.stream("GET", file["url"]) as resp:
+                resp.raise_for_status()
+                content_length = resp.headers.get("content-length")
+                try:
+                    declared_size = int(content_length) if content_length is not None else None
+                except (TypeError, ValueError):
+                    declared_size = None
+                if declared_size is not None and declared_size > _ZIP_TOTAL_LIMIT_BYTES:
+                    logger.warning(
+                        "단일 첨부 크기 상한 초과: no=%s idx=%s size=%s",
+                        item_id, file["idx"], declared_size,
+                    )
+                    return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
+
+                chunks = []
+                total_bytes = 0
+                async for chunk in resp.aiter_bytes():
+                    total_bytes += len(chunk)
+                    if total_bytes > _ZIP_TOTAL_LIMIT_BYTES:
+                        logger.warning(
+                            "단일 첨부 크기 상한 초과: no=%s idx=%s size=%s",
+                            item_id, file["idx"], total_bytes,
+                        )
+                        return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                filename = _filename_from_cd(resp, file["name"] or f"첨부{file['idx']}")
+                media_type = resp.headers.get("content-type") or "application/octet-stream"
+    except Exception:  # noqa: BLE001 — 외부 첨부 다운로드 실패를 502로 변환.
+        logger.warning("단일 첨부 다운로드 실패: no=%s idx=%s", item_id, file["idx"])
+        return Response("첨부 다운로드에 실패했습니다.", status_code=502)
+
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
+    return Response(content=content, media_type=media_type, headers=headers)
+
+
 @app.get("/list/{bid_ntce_no}/files")
 def list_files(bid_ntce_no: str):
     """공고의 첨부 목록 JSON. drawer 가 fetch 한다. URL 은 DB 저장값만 노출(SSRF 방지)."""
@@ -3099,6 +3258,19 @@ def list_files(bid_ntce_no: str):
             "files": [{"name": f["name"], "url": f["url"]} for f in files],
         }
     )
+
+
+@app.get("/list/{bid_ntce_no}/files/single")
+async def list_file_single(bid_ntce_no: str):
+    """공고의 첫 번째 첨부를 원본 파일로 반환."""
+    with SessionLocal() as session:
+        notice = session.get(BidNotice, bid_ntce_no)
+        if notice is None:
+            return Response("공고를 찾을 수 없습니다.", status_code=404)
+        files = repository.get_notice_files(session, bid_ntce_no)
+    if not files:
+        return Response("첨부가 없습니다.", status_code=404)
+    return await _single_file_response(bid_ntce_no, files[0])
 
 
 @app.get("/list/{bid_ntce_no}/files.zip")
@@ -3174,6 +3346,19 @@ def pre_spec_files(bf_spec_rgst_no: str):
             "files": [{"name": f["name"], "url": f["url"]} for f in files],
         }
     )
+
+
+@app.get("/pre-spec/{bf_spec_rgst_no}/files/single")
+async def pre_spec_file_single(bf_spec_rgst_no: str):
+    """사전규격의 첫 번째 첨부를 원본 파일로 반환."""
+    with SessionLocal() as session:
+        spec = session.get(PreSpec, bf_spec_rgst_no)
+        if spec is None:
+            return Response("사전규격을 찾을 수 없습니다.", status_code=404)
+        files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
+    if not files:
+        return Response("첨부가 없습니다.", status_code=404)
+    return await _single_file_response(bf_spec_rgst_no, files[0])
 
 
 @app.get("/pre-spec/{bf_spec_rgst_no}/files.zip")
@@ -4371,10 +4556,39 @@ async def scheduler_stop():
 
 # --- Phase 7.1: 검토 목록 장바구니 ---
 
+def _cart_search_url(item_type: str, title: str) -> str:
+    """기본 숨김 필터를 해제하고 장바구니 항목 제목으로 검색하는 목록 URL."""
+    if item_type == "bid":
+        path = "/list"
+        params = [
+            ("q", title),
+            ("date_field", "bid_ntce_dt"),
+            ("dt_from", "2000-01-01"),
+            ("dt_to", "2099-12-31"),
+            ("include_past", "1"),
+            ("excl_privt", "0"),
+            ("excl_kw", ""),
+            ("excl_kw_set", "1"),
+        ]
+    else:
+        path = "/pre-spec"
+        params = [
+            ("q", title),
+            ("dt_from", "2000-01-01"),
+            ("dt_to", "2099-12-31"),
+            ("include_past", "1"),
+            ("excl_kw", ""),
+            ("excl_kw_set", "1"),
+        ]
+    # 가격/예산 필터는 넘기지 않음 — NULL 가격 공고가 SQL 비교에서 탈락하지 않게 한다.
+    return f"{path}?{urlencode(params)}"
+
 @app.get("/api/export-cart")
 def api_export_cart_list():
     with SessionLocal() as session:
         items = repository.get_export_cart(session)
+    for item in items:
+        item["search_url"] = _cart_search_url(item["item_type"], item["title"])
     return {"items": items, "count": len(items)}
 
 
