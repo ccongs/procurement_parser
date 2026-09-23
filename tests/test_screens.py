@@ -797,12 +797,12 @@ def test_parse_price():
 
 # --- 라우트 스모크: Phase 4.2 -----------------------------------------
 def test_list_header_sort_links_present(client):
-    """컬럼 헤더 정렬 링크가 존재(공고일/개찰일/추정가격)."""
+    """컬럼 헤더 정렬 링크가 존재(공고일/입찰마감/추정가격)."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     assert 'class="sortcol"' in resp.text
     assert "sort=bid_ntce_dt_asc" in resp.text  # 기본이 desc 이므로 헤더는 다음 클릭=asc
-    assert "sort=openg_dt_desc" in resp.text
+    assert "sort=bid_clse_dt_desc" in resp.text
     assert "sort=presmpt_prce_desc" in resp.text
     # 정렬 select 는 검색폼에서 제거됨(헤더 클릭으로 대체).
     assert '<select name="sort"' not in resp.text

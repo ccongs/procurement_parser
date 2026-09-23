@@ -620,6 +620,10 @@ BASE_CSS = """
   td.matchind { max-width: 240px; }
   td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
                         white-space: nowrap; }
+  /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
+  td.kindcell { max-width: 150px; }
+  td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
+                          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 공고기관/수요기관 통합 셀: 위=공고기관(옅은 회색), 아래=수요기관(기본색), 세로 간격 ≥4px */
   td.insttcell { max-width: 260px; }
   td.insttcell .ntcorg, td.insttcell .dmnorg { display: block; overflow: hidden;
@@ -930,14 +934,24 @@ _NTCE_KIND_BADGE: dict[str, str] = {
 }
 
 
-def _render_ntce_kind(value: Any) -> str:
-    """'구분' 셀: 공고종류명을 배지로 표시. 값 없으면 '-'."""
+def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
+    """'구분' 셀: 위=공고종류명(ntceKindNm) 배지, 아래=입찰방식명(bidMethdNm) 텍스트.
+
+    입찰방식명은 배지가 아니라 옅은 회색 텍스트 한 줄로만 표시한다.
+    한쪽만 있으면 그 줄만, 둘 다 없으면 '-'.
+    """
     s = "" if value is None else str(value).strip()
-    if not s:
+    m = "" if bid_methd is None else str(bid_methd).strip()
+    if not s and not m:
         return "<td>-</td>"
-    cls = _NTCE_KIND_BADGE.get(s, "")
-    cls_attr = f"badge {cls}".strip()
-    return f'<td><span class="{cls_attr}">{_e(s)}</span></td>'
+    lines = []
+    if s:
+        cls = _NTCE_KIND_BADGE.get(s, "")
+        cls_attr = f"badge {cls}".strip()
+        lines.append(f'<span class="{cls_attr}">{_e(s)}</span>')
+    if m:
+        lines.append(f'<span class="bidmethd" title="{_e(m)}">{_e(m)}</span>')
+    return f'<td class="kindcell">{"".join(lines)}</td>'
 
 
 # --- /list -----------------------------------------------------------
@@ -952,22 +966,25 @@ _LIST_COLUMNS: list[tuple[str, str, str]] = [
     ("asign_bdgt_amt", "amt", "배정예산"),
     ("presmpt_prce", "amt", "추정가격"),
     ("bid_ntce_dt", "dt", "공고일시"),
-    ("openg_dt", "dt", "개찰일시"),
+    ("bid_clse_dt", "dt", "입찰마감"),
     ("matched_indstryty_cds", "matchind", "매칭업종"),
 ]
 
 # 컬럼 헤더 클릭 정렬이 가능한 컬럼 → 정렬 sort 키 접두(asc/desc 토글에 사용).
 _SORTABLE_COLUMNS: dict[str, str] = {
     "bid_ntce_dt": "bid_ntce_dt",
-    "openg_dt": "openg_dt",
+    "bid_clse_dt": "bid_clse_dt",
     "presmpt_prce": "presmpt_prce",
 }
 
 # /list 정렬 허용값(repository._SORT_COLUMNS 와 동일). 미허용·빈값은 기본으로 폴백.
+# openg_dt 는 컬럼 표시가 입찰마감으로 바뀐 뒤에도 기존 북마크 링크 호환을 위해 허용값에 남긴다.
 _LIST_SORTS: frozenset[str] = frozenset(
     {
         "bid_ntce_dt_desc",
         "bid_ntce_dt_asc",
+        "bid_clse_dt_desc",
+        "bid_clse_dt_asc",
         "openg_dt_desc",
         "openg_dt_asc",
         "presmpt_prce_desc",
@@ -1214,7 +1231,7 @@ def _render_list_rows(
             elif kind == "matchind":
                 cells.append(_render_matched_inds(val))
             elif kind == "ntcekind":
-                cells.append(_render_ntce_kind(val))
+                cells.append(_render_ntce_kind(val, r.get("bid_methd_nm")))
             elif kind == "instt":
                 cells.append(_render_instt(val, r.get("dminstt_nm")))
             elif kind == "link":
@@ -3025,7 +3042,7 @@ def list_page(
         # 화면에는 개수만 전달한다(drawer 열 때 /files 로 상세 조회).
         cols = (
             [c for c, _, _ in _LIST_COLUMNS]
-            + ["dminstt_nm", "bid_ntce_dtl_url"]
+            + ["dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm"]
             + _SPEC_URL_COLUMNS
         )
         rows = []

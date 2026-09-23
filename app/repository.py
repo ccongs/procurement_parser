@@ -344,6 +344,8 @@ _SORT_COLUMNS: dict[str, tuple[str, bool]] = {
     "bid_ntce_dt_asc": ("bid_ntce_dt", False),
     "openg_dt_desc": ("openg_dt", True),
     "openg_dt_asc": ("openg_dt", False),
+    "bid_clse_dt_desc": ("bid_clse_dt", True),
+    "bid_clse_dt_asc": ("bid_clse_dt", False),
     "presmpt_prce_desc": ("presmpt_prce", True),
     "presmpt_prce_asc": ("presmpt_prce", False),
 }
@@ -446,8 +448,8 @@ def search_bid_notices(
       /list 화면의 "수의계약제외" 체크박스(기본 체크)가 이 플래그를 넘긴다.
     - exclude_keywords(Phase 10): 공고명(bid_ntce_nm)에 해당 단어가 포함된 공고를 숨긴다
       (부분일치·대소문자 무시, 여러 개면 모두 제외). 공고명 NULL 은 숨기지 않는다.
-    - sort(Phase 4.2 확장): _SORT_COLUMNS 의 6종 허용
-      (bid_ntce_dt/openg_dt/presmpt_prce × asc/desc). NULL 은 항상 뒤로.
+    - sort(Phase 4.2 확장): _SORT_COLUMNS 의 8종 허용
+      (bid_ntce_dt/openg_dt/bid_clse_dt/presmpt_prce × asc/desc). NULL 은 항상 뒤로.
       기본·미허용값은 "bid_ntce_dt_desc"(최신 공고순).
     - page/page_size: LIMIT/OFFSET 페이지네이션. 전체건수는 동일 필터로 count.
     """
@@ -498,7 +500,7 @@ def search_bid_notices(
     for cond in conditions:
         stmt = stmt.where(cond)
 
-    # 정렬: 허용 6종 → (컬럼, 내림차순). NULL 은 항상 뒤로(is-null 플래그를 1차 키로, 이식성↑).
+    # 정렬: 허용 8종 → (컬럼, 내림차순). NULL 은 항상 뒤로(is-null 플래그를 1차 키로, 이식성↑).
     sort_col_name, descending = _SORT_COLUMNS.get(
         sort, _SORT_COLUMNS["bid_ntce_dt_desc"]
     )
