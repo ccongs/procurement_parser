@@ -427,6 +427,7 @@ def search_bid_notices(
     include_past_openg: bool = True,
     exclude_privt_cntrct: bool = False,
     exclude_keywords: list[str] | None = None,
+    ntce_kinds: list[str] | None = None,
     sort: str = "bid_ntce_dt_desc",
     page: int = 1,
     page_size: int = 50,
@@ -451,6 +452,8 @@ def search_bid_notices(
       /list 화면의 "수의계약제외" 체크박스(기본 체크)가 이 플래그를 넘긴다.
     - exclude_keywords(Phase 10): 공고명(bid_ntce_nm)에 해당 단어가 포함된 공고를 숨긴다
       (부분일치·대소문자 무시, 여러 개면 모두 제외). 공고명 NULL 은 숨기지 않는다.
+    - ntce_kinds: 선택한 공고종류(ntce_kind_nm)만 표시하되 NULL 은 숨기지 않는다.
+      None/빈 목록이면 공고종류 조건을 적용하지 않는다(기존 호출부 호환).
     - sort(Phase 4.2 확장): _SORT_COLUMNS 의 10종 허용
       (bid_ntce_dt/openg_dt/bid_clse_dt/asign_bdgt_amt/presmpt_prce × asc/desc).
       NULL 은 항상 뒤로. 추정가격 정렬은 기존 북마크 URL 호환을 위해 유지.
@@ -494,6 +497,10 @@ def search_bid_notices(
         )
     # 공고명 제외 키워드(Phase 10) — 여러 개면 AND 로 모두 제외.
     conditions.extend(_exclude_keyword_conditions(BidNotice.bid_ntce_nm, exclude_keywords))
+    if ntce_kinds:
+        conditions.append(
+            or_(BidNotice.ntce_kind_nm.in_(ntce_kinds), BidNotice.ntce_kind_nm.is_(None))
+        )
 
     count_stmt = select(func.count()).select_from(BidNotice)
     for cond in conditions:

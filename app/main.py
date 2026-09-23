@@ -149,6 +149,22 @@ def _list_default_date_range(date_field: str, today: date | None = None) -> tupl
     return _months_ago(today, 1).isoformat(), today.isoformat()
 
 
+def _list_preset_date_range(
+    date_field: str, dt_range: str, today: date | None = None,
+) -> tuple[str, str]:
+    """/list 기간 프리셋(today/1m/3m/6m)만 처리합니다. custom 등은 호출부에서 걸러야 합니다.
+    공고일은 과거, 개찰일은 미래 방향(말일 보정).
+    """
+    if today is None:
+        today = date.today()
+    if dt_range == "today":
+        return today.isoformat(), today.isoformat()
+    months = {"1m": 1, "3m": 3, "6m": 6}[dt_range]
+    if date_field == "openg_dt":
+        return today.isoformat(), _months_after(today, months).isoformat()
+    return _months_ago(today, months).isoformat(), today.isoformat()
+
+
 def _render_field(p: ParamSpec, value: str = "") -> str:
     help_html = f'<span class="help">{_e(p.help)}</span>' if p.help else ""
     return f"""
@@ -616,13 +632,15 @@ BASE_CSS = """
   th a.sortcol:hover { color: #1f3a5f; }
   th a.sortcol .arrow { color: #1f3a5f; font-size: 11px; }
   th a.sortcol .arrow.neutral { color: #b9c0cc; font-size: 11px; }
-  /* 매칭업종 컬럼: 한글(코드) 세로 목록 + 너비 제한 + ellipsis(tooltip 으로 전체 확인) */
-  td.matchind { max-width: 240px; }
-  td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
-                        white-space: nowrap; }
+  /* /list 표: 데이터는 세로 가운데, 헤더는 왼쪽, 배정예산만 오른쪽 정렬 */
+  table.listtable > tbody > tr > td { vertical-align: middle; }
+  table.listtable > thead > tr > th:not(.col-chk) { text-align: left; vertical-align: middle; }
+  table.listtable > tbody > tr > td.budgetcell { text-align: right; }
+  /* 매칭업종은 코드만 표시하고 콤마 뒤에서 줄바꿈 허용 */
+  table.listtable td.matchind { max-width: 240px; }
+  table.listtable .indcode { white-space: nowrap; }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
   td.kindcell { max-width: 150px; text-align: center; vertical-align: middle; }
-  th.kindhead { text-align: center; }
   td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
                           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 공고번호/공고명 통합 셀: 기존 글꼴·링크 스타일을 유지하고 두 줄로 표시 */
@@ -666,6 +684,24 @@ BASE_CSS = """
   .filter-toggle { background: #f4f5f7; border: 1px solid #cbd2dc; color: #4a5568;
                    padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; white-space: nowrap; }
   .filter-toggle:hover { background: #e7ebf2; }
+  /* /list 전용 아웃라인 필드: 레이블이 입력 테두리 상단에 겹친다 */
+  .list-filter .field, .list-filter .kw-field { position: relative; padding-top: 7px; }
+  .list-filter .flabel { position: absolute; top: 0; left: 8px; z-index: 1;
+                         margin: 0; padding: 0 4px; background: #fff; font-size: 12px;
+                         line-height: 14px; }
+  .list-filter .list-date-group .flabel { background: #f8fafc; }
+  .list-filter .field input, .list-filter .field select { background: #fff; }
+  .list-filter .list-date-group { display: flex; gap: 10px; align-items: flex-end;
+                                  flex-wrap: wrap; margin: 0; padding: 8px 10px 10px;
+                                  background: #f8fafc; }
+  .list-filter .list-custom-dates { display: flex; gap: 10px; align-items: flex-end; }
+  .list-filter .list-custom-dates[hidden] { display: none; }
+  .list-filter .list-kind-group { margin: 0 0 12px; padding: 8px 10px; }
+  .list-filter .list-kind-group .chk { padding-bottom: 0; }
+  .list-card-heading { display: flex; justify-content: space-between; align-items: center;
+                        flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .list-card-heading h2 { margin: 0; }
+  .list-card-heading .rangeinfo { color: #8a93a2; font-size: 12px; margin-left: auto; }
   /* 파일 다운로드 drawer (Phase 4.1) */
   button.filebtn { border: 1px solid #b6c6df; background: #eef3fb; color: #1f3a5f; padding: 4px 10px;
                    border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
@@ -975,10 +1011,10 @@ def _sucsfbid_mthd_short(value: Any) -> str:
 # field_labels.py(camelCase 키)는 /list 의 snake_case 와 맞지 않아 미해석되므로,
 # 여기서 컬럼별 한글 헤더를 직접 큐레이션한다(field_labels.py 는 /api-test 전용으로 유지).
 _LIST_COLUMNS: list[tuple[str, str, str]] = [
-    ("bid_ntce_no", "ntce", "공고번호 / 공고명"),
     ("ntce_kind_nm", "ntcekind", "구분"),
     ("sucsfbid_mthd_nm", "sucsf", "낙찰방법"),
-    ("ntce_instt_nm", "instt", "공고기관/수요기관"),
+    ("bid_ntce_no", "ntce", "공고명"),
+    ("ntce_instt_nm", "instt", "공고/수요기관"),
     ("asign_bdgt_amt", "amt", "배정예산"),
     ("bid_times", "bidtimes", "입찰일시"),
     ("matched_indstryty_cds", "matchind", "매칭업종"),
@@ -1014,6 +1050,11 @@ _LIST_SORTS: frozenset[str] = frozenset(
     }
 )
 _DEFAULT_SORT = "bid_ntce_dt_desc"
+
+_LIST_KINDS = {"reg": "등록공고", "re": "재공고", "chg": "변경공고", "cncl": "취소공고"}
+_LIST_DEFAULT_KINDS = ("reg", "re", "chg")
+_LIST_DATE_RANGES = (("today", "오늘"), ("1m", "1개월"), ("3m", "3개월"),
+                     ("6m", "6개월"), ("custom", "날짜지정"))
 
 # 첨부 URL 컬럼명(파일 개수 계산·파일 목록 추출에 재사용).
 _SPEC_URL_COLUMNS: list[str] = [f"ntce_spec_doc_url{i}" for i in range(1, 11)]
@@ -1072,19 +1113,16 @@ def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
 
 
 def _render_matched_inds(csv: Any) -> str:
-    """매칭업종 CSV → '업무명 [코드]' 세로 목록 셀.
-
-    표시는 단축 라벨(`업무명 [코드]`), title(tooltip)은 전체명(`전체명 [코드]`).
-    셀은 너비 제한+ellipsis 로 줄이되 title 로 전체 확인 가능.
-    """
-    pairs = industry_codes.matched_label_pairs(str(csv) if csv is not None else None)
-    if not pairs:
-        return "<td></td>"
-    rows = "".join(
-        f'<span class="indrow" title="{_e(full)}">{_e(short)}</span>'
-        for short, full in pairs
-    )
-    return f'<td class="matchind">{rows}</td>'
+    """매칭업종 CSV → [코드,코드] 셀. 코드별 툴팁에 업종 전체명을 표시."""
+    codes = industry_codes.parse_matched_codes(str(csv) if csv is not None else None)
+    if not codes:
+        return '<td class="matchind">-</td>'
+    spans = []
+    for code in codes:
+        name = industry_codes.industry_name(code)
+        title = f' title="{_e(name)}"' if name else ""
+        spans.append(f'<span class="indcode"{title}>{_e(code)}</span>')
+    return f'<td class="matchind">[{",<wbr>".join(spans)}]</td>'
 
 
 def _render_ntce(no: Any, name: Any, url: Any) -> str:
@@ -1326,7 +1364,7 @@ def _render_list_rows(
             if kind == "bidtimes":
                 cells.append(_render_bid_times(r))
             elif kind == "amt":
-                cells.append(f"<td>{_e(_fmt_amt(val))}</td>")
+                cells.append(f'<td class="budgetcell">{_e(_fmt_amt(val))}</td>')
             elif kind == "dt":
                 cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
             elif kind == "matchind":
@@ -1367,7 +1405,7 @@ def _render_list_rows(
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
-      <table>
+      <table class="listtable">
         <thead><tr>{chk_head}<th>#</th>{head}</tr></thead>
         <tbody>{''.join(body_rows)}</tbody>
       </table>
@@ -1450,6 +1488,7 @@ def _filter_card(
     title: str = "검색",
     card_id: str = "filterCard",
     right_html: str = "",
+    extra_class: str = "",
 ) -> str:
     """플로팅 필터 카드 헬퍼 (Wave A 신설 — B-1/B-2 에서 list_page/pre_spec_page 에 적용).
 
@@ -1467,6 +1506,7 @@ def _filter_card(
         detail_html: 토글로 펼쳐지는 나머지 필터 영역.
         title: 카드 aria-label(기본 "검색").
         card_id: 카드 element id(기본 "filterCard").
+        extra_class: 화면 전용 클래스(기본값이면 기존 HTML 유지).
     """
     toggle_js = (
         f"var c=document.getElementById('{card_id}');"
@@ -1475,7 +1515,7 @@ def _filter_card(
         f"b.textContent=c.classList.contains('filter-collapsed')?'▾ 필터 펼침':'▴ 필터 접힘';"
     )
     return (
-        f'<div class="filter-card filter-collapsed" id="{_e(card_id)}" aria-label="{_e(title)}">'
+        f'<div class="filter-card filter-collapsed{(" " + _e(extra_class)) if extra_class else ""}" id="{_e(card_id)}" aria-label="{_e(title)}">'
         f'<form method="get" action="{_e(action)}">'
         f'<div class="filter-summary">'
         f'{summary_html}'
@@ -1754,7 +1794,7 @@ _EXCL_KW_SCRIPT = """
 """ % {"max": repository.EXCLUDE_KEYWORD_MAX, "maxlen": repository.EXCLUDE_KEYWORD_MAX_LEN}
 
 
-# /list 클라이언트 스크립트(setRecent + 입찰일시 정렬 select + 파일 drawer).
+# /list 클라이언트 스크립트(기간 select + 입찰일시 정렬 select + 파일 drawer).
 # 평문 상수라 중괄호 이스케이프 불필요.
 # 파일명은 서버 JSON에서 받아 textContent 로 삽입(XSS 방지). 파일 URL 은 DB 저장 URL 만 사용.
 _LIST_SCRIPT = """
@@ -1772,47 +1812,34 @@ _LIST_SCRIPT = """
     }
   });
 
-  function fmtDate(d) {
-    var m = ('0' + (d.getMonth() + 1)).slice(-2);
-    var day = ('0' + d.getDate()).slice(-2);
-    return d.getFullYear() + '-' + m + '-' + day;
-  }
-  function setRecent(n) {
-    var today = new Date();
-    var bgn = new Date(today.getFullYear(), today.getMonth() - n, today.getDate());
-    var f = document.getElementById('dt_from');
-    var t = document.getElementById('dt_to');
-    if (f) f.value = fmtDate(bgn);
-    if (t) t.value = fmtDate(today);
-  }
-  function setToday() {
-    var today = new Date();
-    var s = fmtDate(today);
-    var f = document.getElementById('dt_from');
-    var t = document.getElementById('dt_to');
-    if (f) f.value = s;
-    if (t) t.value = s;
-  }
-
-  // 날짜 기준(공고일/개찰일) 변경 시 날짜 입력 기본값을 해당 필드 기본 기간으로 갱신.
-  // 공고일: 오늘-1개월 ~ 오늘 / 개찰일: 오늘 ~ 오늘+1개월. (서버도 동일 기본 적용)
+  // 프리셋은 서버가 계산한 기간을 사용해 월말 보정과 날짜 기준별 방향을 일치시킨다.
   (function () {
     var sel = document.getElementById('date_field');
-    if (!sel) return;
-    sel.addEventListener('change', function () {
-      var today = new Date();
-      var f = document.getElementById('dt_from');
-      var t = document.getElementById('dt_to');
-      if (sel.value === 'openg_dt') {
-        var after = new Date(today.getFullYear(), today.getMonth() + 1, today.getDate());
-        if (f) f.value = fmtDate(today);
-        if (t) t.value = fmtDate(after);
-      } else {
-        var before = new Date(today.getFullYear(), today.getMonth() - 1, today.getDate());
-        if (f) f.value = fmtDate(before);
-        if (t) t.value = fmtDate(today);
-      }
+    var range = document.getElementById('dt_range');
+    var custom = document.getElementById('list-custom-dates');
+    if (!sel || !range || !custom) return;
+    var presets = JSON.parse(document.getElementById('list-date-group').dataset.presetRanges);
+    var f = document.getElementById('dt_from');
+    var t = document.getElementById('dt_to');
+
+    function fillDates(preset) {
+      var dates = presets[sel.value][preset];
+      f.value = dates[0];
+      t.value = dates[1];
+    }
+    function showCustom() {
+      custom.hidden = range.value !== 'custom';
+    }
+    range.addEventListener('change', function () {
+      showCustom();
+      if (range.value !== 'custom') fillDates(range.value);
     });
+    sel.addEventListener('change', function () {
+      // 날짜지정에서는 기준별 1개월 기본값, 프리셋에서는 선택 기간을 유지한다.
+      fillDates(range.value === 'custom' ? '1m' : range.value);
+    });
+    window.addEventListener('pageshow', showCustom);
+    showCustom();
   })();
 
   (function () {
@@ -3082,6 +3109,8 @@ def list_page(
     dt_from: str | None = None,
     dt_to: str | None = None,
     date_field: str = "bid_ntce_dt",
+    dt_range: str | None = None,
+    kind: list[str] | None = Query(None),
     price_min: str | None = None,
     price_max: str | None = None,
     include_past: str | None = None,
@@ -3108,10 +3137,27 @@ def list_page(
     except (TypeError, ValueError):
         page = 1
 
-    # 날짜 기본값: 쿼리에 값이 없을 때만 필드별 기본 기간을 채운다(사용자 입력 우선).
-    def_from, def_to = _list_default_date_range(date_field)
-    dt_from_eff = dt_from if (dt_from and dt_from.strip()) else def_from
-    dt_to_eff = dt_to if (dt_to and dt_to.strip()) else def_to
+    # 다중 파라미터와 CSV를 합쳐 유효 종류만 남긴다. 전체 해제는 기본 3종으로 복원.
+    requested_kinds = {code.strip() for value in (kind or []) for code in value.split(",")}
+    selected_kinds = [code for code in _LIST_KINDS if code in requested_kinds]
+    if not selected_kinds:
+        selected_kinds = list(_LIST_DEFAULT_KINDS)
+
+    # 기존 날짜 URL은 날짜지정으로 보존하고 명시한 프리셋은 요청 날짜보다 우선한다.
+    if dt_range not in dict(_LIST_DATE_RANGES):
+        dt_range = "custom" if dt_from or dt_to else "1m"
+    today = date.today()
+    date_presets = {
+        field: {preset: _list_preset_date_range(field, preset, today)
+                for preset, _label in _LIST_DATE_RANGES if preset != "custom"}
+        for field in ("bid_ntce_dt", "openg_dt")
+    }
+    if dt_range == "custom":
+        def_from, def_to = _list_default_date_range(date_field, today)
+        dt_from_eff = dt_from.strip() if (dt_from and dt_from.strip()) else def_from
+        dt_to_eff = dt_to.strip() if (dt_to and dt_to.strip()) else def_to
+    else:
+        dt_from_eff, dt_to_eff = date_presets[date_field][dt_range]
 
     df = _parse_date(dt_from_eff)
     dtto = _parse_date(dt_to_eff, end_of_day=True)
@@ -3148,6 +3194,7 @@ def list_page(
             include_past_openg=include_past_flag,
             exclude_privt_cntrct=excl_privt_flag,
             exclude_keywords=excl_kws,
+            ntce_kinds=[_LIST_KINDS[code] for code in selected_kinds],
             sort=sort,
             page=page,
             page_size=page_size,
@@ -3183,6 +3230,8 @@ def list_page(
         "dt_from": dt_from_eff or "",
         "dt_to": dt_to_eff or "",
         "date_field": date_field,
+        "dt_range": dt_range,
+        "kind": ",".join(selected_kinds),
         "price_min": price_min_field,
         "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
@@ -3196,6 +3245,15 @@ def list_page(
 
     nf_sel = " selected" if date_field == "bid_ntce_dt" else ""
     og_sel = " selected" if date_field == "openg_dt" else ""
+    range_opts = "".join(
+        f'<option value="{value}"{" selected" if value == dt_range else ""}>{label}</option>'
+        for value, label in _LIST_DATE_RANGES
+    )
+    kind_checks = "".join(
+        f'<label class="chk"><input type="checkbox" name="kind" value="{code}"'
+        f'{" checked" if code in selected_kinds else ""}>{label}</label>'
+        for code, label in _LIST_KINDS.items()
+    )
 
     # 표기개수 select 옵션
     ps_opts = "".join(
@@ -3203,21 +3261,14 @@ def list_page(
         for v in (10, 30, 50, 100)
     )
 
-    # summary_html: 접힘 상태에서도 항상 보이는 검색어 입력 + 검색 버튼
+    # summary_html: 핵심 필터는 접힘 상태에서도 항상 표시한다.
     summary_html = f"""
       <label class="field" style="min-width:260px;">
-        <span class="flabel">공고명 부분검색</span>
+        <span class="flabel">공고명</span>
         <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
       </label>
-      <button type="submit" class="submit">검색</button>
-      {_excl_kw_summary(excl_kws)}"""
-
-    # detail_html: 토글로 펼쳐지는 상세 필터
-    detail_html = f"""
-      <div class="row" style="margin-bottom:12px;">
-        {_excl_kw_field(excl_kws, kw_options, "공고명 제외 키워드")}
-      </div>
-      <div class="row">
+      <fieldset class="list-date-group" id="list-date-group" data-preset-ranges="{_e(json.dumps(date_presets))}">
+        <legend>날짜</legend>
         <label class="field">
           <span class="flabel">날짜 기준</span>
           <select name="date_field" id="date_field">
@@ -3226,33 +3277,45 @@ def list_page(
           </select>
         </label>
         <label class="field">
-          <span class="flabel">시작</span>
-          <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff or '')}">
+          <span class="flabel">기간</span>
+          <select name="dt_range" id="dt_range">{range_opts}</select>
         </label>
-        <span class="tilde">~</span>
-        <label class="field">
-          <span class="flabel">종료</span>
-          <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff or '')}">
-        </label>
-        <div class="quick">
-          <button type="button" onclick="setToday()">1일</button>
-          <button type="button" onclick="setRecent(1)">최근1개월</button>
-          <button type="button" onclick="setRecent(3)">최근3개월</button>
-          <button type="button" onclick="setRecent(6)">최근6개월</button>
+        <div class="list-custom-dates" id="list-custom-dates"{" hidden" if dt_range != "custom" else ""}>
+          <label class="field">
+            <span class="flabel">시작</span>
+            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff)}">
+          </label>
+          <span class="tilde">~</span>
+          <label class="field">
+            <span class="flabel">종료</span>
+            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff)}">
+          </label>
         </div>
+      </fieldset>
+      <label class="field">
+        <span class="flabel">추정가격 최대</span>
+        <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
+      </label>
+      <label class="field">
+        <span class="flabel">표기개수</span>
+        <select name="page_size" onchange="this.form.submit()">{ps_opts}</select>
+      </label>
+      <button type="submit" class="submit">검색</button>"""
+
+    # detail_html: 토글로 펼쳐지는 상세 필터(핵심 입력과 같은 form).
+    detail_html = f"""
+      <div class="row" style="margin-bottom:12px;">
+        {_excl_kw_field(excl_kws, kw_options, "공고명 제외 키워드")}
       </div>
-      <div class="row" style="margin-top:12px;">
+      <fieldset class="list-kind-group">
+        <legend>공고종류</legend>
+        <div class="row">{kind_checks}</div>
+      </fieldset>
+      <div class="row">
         <label class="field">
           <span class="flabel">추정가격 최소</span>
           <input type="number" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
         </label>
-        <span class="tilde">~</span>
-        <label class="field">
-          <span class="flabel">추정가격 최대</span>
-          <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
-        </label>
-      </div>
-      <div class="row" style="margin-top:12px;">
         <label class="chk">
           <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
           지난 개찰 포함
@@ -3262,21 +3325,20 @@ def list_page(
           <input type="checkbox" name="excl_privt" value="1"{' checked' if excl_privt_flag else ''}>
           수의계약제외
         </label>
-        <label class="field">
-          <span class="flabel">표기개수</span>
-          <select name="page_size" onchange="this.form.submit()">{ps_opts}</select>
-        </label>
         <input type="hidden" name="sort" value="{_e(sort)}">
       </div>"""
     analysis_ui_html = _ANALYSIS_MODAL_HTML if analysis_on else '    <div id="cartToast" role="alert"></div>'
     analysis_script_html = f"<script>{_ANALYSIS_SCRIPT}</script>" if analysis_on else ""
 
     body = f"""
-    {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard",
-        right_html='<button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>')}
+    {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard", extra_class="list-filter",
+        right_html=_excl_kw_summary(excl_kws) + '<button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>')}
 
     <div class="card">
-      <h2>수집된 공고</h2>
+      <div class="list-card-heading">
+        <h2>수집된 공고</h2>
+        <span class="rangeinfo">{'개찰일' if date_field == 'openg_dt' else '공고일'} {_e(dt_from_eff)} ~ {_e(dt_to_eff)}</span>
+      </div>
       {_render_list_rows(rows, sort, qs, status_map)}
       {_render_pager(total, page, page_size, qs)}
     </div>
@@ -4696,6 +4758,7 @@ def _cart_search_url(item_type: str, title: str) -> str:
         params = [
             ("q", title),
             ("date_field", "bid_ntce_dt"),
+            ("kind", "reg,re,chg,cncl"),
             ("dt_from", "2000-01-01"),
             ("dt_to", "2099-12-31"),
             ("include_past", "1"),

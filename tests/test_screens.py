@@ -492,9 +492,9 @@ def test_list_excl_privt_form_pair_checked(client):
 def test_list_korean_only_headers(client):
     resp = client.get("/list", params=_WIDE)
     # 한글 헤더 노출, 영문 컬럼명/병기 code 미노출.
-    assert "<th>공고번호 / 공고명</th>" in resp.text
+    assert "<th>공고명</th>" in resp.text
     assert "<th>공고번호</th>" not in resp.text
-    assert "<th>공고명</th>" not in resp.text
+    assert "공고번호 / 공고명" not in resp.text
     assert "<th>파일</th>" in resp.text
     assert "bid_ntce_no</code>" not in resp.text  # /list 표 헤더에 영문 병기 없음
 
@@ -1113,8 +1113,8 @@ def test_list_date_field_switch_openg(client):
     assert '<option value="openg_dt" selected>개찰일</option>' in resp.text
 
 
-def test_list_matched_industry_korean_vertical(client):
-    """매칭업종 한글(코드) 세로 표기 — 시드에 매칭코드 부여 후 한글명 노출 확인."""
+def test_list_matched_industry_codes_and_tooltips(client):
+    """매칭업종은 코드 목록으로 표시하고 각 코드의 툴팁에 전체 업종명을 담는다."""
     from app import main as _main
 
     # 매칭코드가 있는 공고를 임시로 추가(client 픽스처 DB 에).
@@ -1135,12 +1135,37 @@ def test_list_matched_industry_korean_vertical(client):
 
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    # 단축 라벨 `업무명 [코드]` 세로(span.indrow) 표기.
-    assert 'class="indrow"' in resp.text
-    assert "컴퓨터관련서비스사업 [1468]" in resp.text
-    assert "패키지소프트웨어개발·공급사업 [1426]" in resp.text
-    # tooltip(title)에는 전체명 유지.
-    assert 'title="소프트웨어사업자(컴퓨터관련서비스사업) [1468]"' in resp.text
+    cell = re.search(r'<td class="matchind">\[.*?</td>', resp.text).group(0)
+    assert re.sub(r"<[^>]+>", "", cell) == "[1426,1468]"
+    assert (
+        '<span class="indcode" title="소프트웨어사업자(패키지소프트웨어개발·공급사업)">1426</span>'
+        in cell
+    )
+    assert (
+        '<span class="indcode" title="소프트웨어사업자(컴퓨터관련서비스사업)">1468</span>'
+        in cell
+    )
+    assert 'class="indrow"' not in cell
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", ", ,"])
+def test_render_matched_industry_empty(value):
+    """코드가 없으면 매칭업종 셀에 대시를 표시한다."""
+    assert main._render_matched_inds(value) == '<td class="matchind">-</td>'
+
+
+def test_render_matched_industry_unknown_order_and_escape(monkeypatch):
+    """CSV 순서를 유지하며 모르는 코드·업종명·툴팁 모두 안전하게 이스케이프한다."""
+    monkeypatch.setitem(industry_codes.INDUSTRY_NAMES, "1468", '<업종&"명>')
+    cell = main._render_matched_inds(' 9999 ,1468,<code&"x>,1426')
+    assert '<span class="indcode">9999</span>' in cell
+    assert '<span class="indcode">&lt;code&amp;&quot;x&gt;</span>' in cell
+    assert (
+        '<span class="indcode" title="&lt;업종&amp;&quot;명&gt;">1468</span>' in cell
+    )
+    assert re.sub(r"<[^>]+>", "", cell) == '[9999,1468,&lt;code&amp;&quot;x&gt;,1426]'
+    assert '<업종&"명>' not in cell
+    assert '<code&"x>' not in cell
 
 
 def test_config_page_has_price_defaults(client):
@@ -1268,12 +1293,12 @@ def test_list_budget_column_and_won(client):
     # 추정가격 검색폼은 유지하되 목록 헤더·셀에서는 제거한다.
     thead = text[text.index("<thead>"):text.index("</thead>")]
     assert "배정예산" in thead
-    assert "공고기관/수요기관" in thead
+    assert "공고/수요기관" in thead
     assert "추정가격" not in thead
-    assert thead.index("공고기관/수요기관") < thead.index("배정예산")
+    assert thead.index("공고/수요기관") < thead.index("배정예산")
     assert thead.index("배정예산") < thead.index("입찰일시")
     # 금액 `원` 단위(배정예산).
-    assert "12,345,678 원" in text
+    assert '<td class="budgetcell">12,345,678 원</td>' in text
     assert "9,000,000 원" not in text
     # 기관 통합 셀 2줄.
     assert 'class="insttcell"' in text
@@ -1561,12 +1586,17 @@ def test_list_checkbox_no_parentheses(client):
     assert "기본은 개찰 지난 공고 숨김" not in resp.text
 
 
-def test_list_today_button_exists(client):
-    """/list 날짜 quick 버튼에 '1일' 버튼이 존재한다."""
+def test_list_date_range_select_replaces_quick_buttons(client):
+    """/list 기간 select는 다섯 옵션을 제공하고 이전 날짜 단축 버튼은 제거한다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    assert "setToday()" in resp.text
-    assert "1일" in resp.text
+    select = re.search(r'<select\b[^>]*name="dt_range"[^>]*>(.*?)</select>', resp.text, re.S).group(1)
+    assert re.findall(r'<option value="([^"]+)"(?: selected)?>([^<]+)</option>', select) == [
+        ("today", "오늘"), ("1m", "1개월"), ("3m", "3개월"),
+        ("6m", "6개월"), ("custom", "날짜지정"),
+    ]
+    assert "setToday" not in resp.text
+    assert "setRecent" not in resp.text
 
 
 def test_list_page_size_default_50(client):
@@ -1681,20 +1711,23 @@ def test_filter_summary_flex_end(client):
 
 # --- Phase 12.1: 목록 컬럼 재구성 --------------------------------------
 def test_list_column_order(client):
-    """복합 공고 셀부터 매칭업종까지 요청된 순서로만 헤더를 표시한다."""
+    """구분부터 매칭업종까지 새 순서와 문구를 쓰고 체크·파일 헤더는 유지한다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     thead = resp.text[resp.text.index("<thead>"):resp.text.index("</thead>")]
     headers = re.findall(r"<th\b[^>]*>(.*?)</th>", thead)
     expected = [
-        "공고번호 / 공고명", "구분", "낙찰방법", "공고기관/수요기관",
+        "구분", "낙찰방법", "공고명", "공고/수요기관",
         "배정예산", "입찰일시", "매칭업종",
     ]
     for header, label in zip(headers[2:9], expected, strict=True):
         assert label in header
     assert "추정가격" not in thead
     assert "<th>공고번호</th>" not in thead
-    assert "<th>공고명</th>" not in thead
+    assert "공고번호 / 공고명" not in thead
+    assert "공고기관/수요기관" not in thead
+    assert 'id="chk-all"' in headers[0]
+    assert headers[1] == "#"
     assert headers[9] == "파일"
 
 
@@ -1809,7 +1842,7 @@ def test_list_sucsfbid_method_cell(client, value, expected_cell):
 
 
 def test_list_kind_alignment(client):
-    """구분 헤더·빈 셀에도 가운데 정렬 클래스를 쓰고 다른 컬럼 정렬은 유지한다."""
+    """구분 데이터 셀은 가운데 정렬을 유지하고 헤더 가운데 정렬 규칙은 제거한다."""
     notice = _bn("S-KIND-EMPTY", "빈 구분 셀 공고", datetime(2026, 5, 8), datetime(2000, 1, 1))
     notice.ntce_kind_nm = None
     notice.bid_methd_nm = ""
@@ -1825,14 +1858,37 @@ def test_list_kind_alignment(client):
     assert '<th class="kindhead">구분</th>' in resp.text
     assert '<td class="kindcell">-</td>' in resp.text
     cell_css = re.search(r"td\.kindcell\s*\{([^}]+)\}", main.BASE_CSS).group(1)
-    head_css = re.search(r"th\.kindhead\s*\{([^}]+)\}", main.BASE_CSS).group(1)
-    base_css = re.search(r"th, td\s*\{([^}]+)\}", main.BASE_CSS).group(1)
     assert "text-align: center" in cell_css
     assert "vertical-align: middle" in cell_css
-    assert "text-align: center" in head_css
-    assert "vertical-align" not in head_css
-    assert "text-align: left" in base_css
-    assert "vertical-align: top" in base_css
+    assert not re.search(r"th\.kindhead\s*\{[^}]*text-align:\s*center", main.BASE_CSS)
+
+
+def test_list_table_alignment_scoped_css(client):
+    """목록 표의 정렬만 바꾸고 공용 표·파일 표에 쓰는 기본 CSS는 그대로 둔다."""
+    resp = client.get("/list", params=_WIDE)
+    assert resp.status_code == 200
+    assert '<table class="listtable">' in resp.text
+    td_selector = "table.listtable > tbody > tr > td"
+    th_selector = "table.listtable > thead > tr > th:not(.col-chk)"
+    budget_selector = "table.listtable > tbody > tr > td.budgetcell"
+    rules = {
+        selector: re.search(re.escape(selector) + r"\s*\{([^}]+)\}", main.BASE_CSS).group(1)
+        for selector in (td_selector, th_selector, budget_selector)
+    }
+    assert "vertical-align: middle" in rules[td_selector]
+    assert "text-align" not in rules[td_selector]
+    assert "text-align: left" in rules[th_selector]
+    assert "vertical-align: middle" in rules[th_selector]
+    chk_header = re.search(r"\.col-chk\s*\{([^}]+)\}", main.BASE_CSS).group(1)
+    assert "text-align: center" in chk_header
+    assert "text-align: right" in rules[budget_selector]
+    base_css = re.search(r"th, td\s*\{([^}]+)\}", main.BASE_CSS).group(1)
+    assert " ".join(base_css.split()) == (
+        "border: 1px solid #e2e5ea; padding: 6px 8px; text-align: left; vertical-align: top; "
+        "max-width: 360px; overflow: hidden; text-overflow: ellipsis;"
+    )
+    assert 'class="listtable"' not in client.get("/pre-spec", params=_WIDE).text
+    assert 'class="listtable"' not in client.get("/config").text
 
 
 def _seed_budgets(session):
