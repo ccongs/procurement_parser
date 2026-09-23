@@ -621,9 +621,14 @@ BASE_CSS = """
   td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
                         white-space: nowrap; }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
-  td.kindcell { max-width: 150px; }
+  td.kindcell { max-width: 150px; text-align: center; vertical-align: middle; }
+  th.kindhead { text-align: center; }
   td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
                           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 공고번호/공고명 통합 셀: 기존 글꼴·링크 스타일을 유지하고 두 줄로 표시 */
+  td.ntcecell .ntceno, td.ntcecell .ntcenm { display: block; }
+  td.ntcecell .ntceno { margin-bottom: 4px; }
+  td.ntcecell .ntcenm { width: fit-content; }
   /* 입찰일시 통합 셀·헤더: 개시/마감/개찰을 세로로 표시하고 정렬 기준을 헤더에서 선택 */
   td.bidtimes, th.bidtimes-head { white-space: nowrap; }
   td.bidtimes .bt-line { display: block; line-height: 1.45; }
@@ -948,7 +953,7 @@ def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
     s = "" if value is None else str(value).strip()
     m = "" if bid_methd is None else str(bid_methd).strip()
     if not s and not m:
-        return "<td>-</td>"
+        return '<td class="kindcell">-</td>'
     lines = []
     if s:
         cls = _NTCE_KIND_BADGE.get(s, "")
@@ -959,17 +964,22 @@ def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
     return f'<td class="kindcell">{"".join(lines)}</td>'
 
 
+def _sucsfbid_mthd_short(value: Any) -> str:
+    """낙찰방법의 첫 하이픈 앞을 표시하고, 앞이 비면 원문 전체로 폴백한다."""
+    full = "" if value is None else str(value).strip()
+    return full.split("-", 1)[0].strip() or full or "-"
+
+
 # --- /list -----------------------------------------------------------
 # (컬럼명, 표시 종류, 한글 헤더). /list 는 한글 헤더만 노출한다(영문 병기 없음).
 # field_labels.py(camelCase 키)는 /list 의 snake_case 와 맞지 않아 미해석되므로,
 # 여기서 컬럼별 한글 헤더를 직접 큐레이션한다(field_labels.py 는 /api-test 전용으로 유지).
 _LIST_COLUMNS: list[tuple[str, str, str]] = [
-    ("bid_ntce_no", "text", "공고번호"),
+    ("bid_ntce_no", "ntce", "공고번호 / 공고명"),
     ("ntce_kind_nm", "ntcekind", "구분"),
-    ("bid_ntce_nm", "link", "공고명"),
+    ("sucsfbid_mthd_nm", "sucsf", "낙찰방법"),
     ("ntce_instt_nm", "instt", "공고기관/수요기관"),
     ("asign_bdgt_amt", "amt", "배정예산"),
-    ("presmpt_prce", "amt", "추정가격"),
     ("bid_times", "bidtimes", "입찰일시"),
     ("matched_indstryty_cds", "matchind", "매칭업종"),
 ]
@@ -983,11 +993,12 @@ _BID_TIME_FIELDS: list[tuple[str, str]] = [
 
 # 컬럼 헤더 클릭 정렬이 가능한 컬럼 → 정렬 sort 키 접두(asc/desc 토글에 사용).
 _SORTABLE_COLUMNS: dict[str, str] = {
-    "presmpt_prce": "presmpt_prce",
+    "asign_bdgt_amt": "asign_bdgt_amt",
 }
 
 # /list 정렬 허용값(repository._SORT_COLUMNS 와 동일). 미허용·빈값은 기본으로 폴백.
 # 입찰일시 통합 헤더에서 개시/마감/개찰 세 필드의 방향을 선택한다.
+# 추정가격 정렬은 화면 헤더 없이 기존 북마크 URL 호환을 위해 유지한다.
 _LIST_SORTS: frozenset[str] = frozenset(
     {
         "bid_ntce_dt_desc",
@@ -996,6 +1007,8 @@ _LIST_SORTS: frozenset[str] = frozenset(
         "bid_clse_dt_asc",
         "openg_dt_desc",
         "openg_dt_asc",
+        "asign_bdgt_amt_desc",
+        "asign_bdgt_amt_asc",
         "presmpt_prce_desc",
         "presmpt_prce_asc",
     }
@@ -1074,6 +1087,24 @@ def _render_matched_inds(csv: Any) -> str:
     return f'<td class="matchind">{rows}</td>'
 
 
+def _render_ntce(no: Any, name: Any, url: Any) -> str:
+    """공고번호/공고명 통합 셀. 없는 값은 대시, 상세 URL이 있으면 공고명은 링크."""
+    number = "" if no is None else str(no).strip()
+    name = "" if name is None else str(name).strip()
+    text = _e(name or "-")
+    if url:
+        name_line = (
+            f'<a class="ntcenm" href="{_e(url)}" '
+            f'target="_blank" rel="noopener">{text}</a>'
+        )
+    else:
+        name_line = f'<span class="ntcenm">{text}</span>'
+    return (
+        f'<td class="ntcecell"><span class="ntceno">{_e(number or "-")}</span>'
+        f'{name_line}</td>'
+    )
+
+
 def _render_instt(ntce: Any, dmin: Any) -> str:
     """공고기관/수요기관 통합 셀. 위=공고기관(옅은 회색), 아래=수요기관(기본색).
 
@@ -1123,7 +1154,7 @@ def _sort_header(
     base = sortable[col]
     cur_desc = sort == f"{base}_desc"
     cur_asc = sort == f"{base}_asc"
-    # 현재 이 컬럼으로 정렬 중이면 반대 방향, 아니면 처음엔 desc(추정가격·일시 모두 큰 값/최신 먼저).
+    # 현재 이 컬럼으로 정렬 중이면 반대 방향, 아니면 처음엔 desc(금액·일시 모두 큰 값/최신 먼저).
     next_sort = f"{base}_asc" if cur_desc else f"{base}_desc"
     if cur_desc:
         arrow = ' <span class="arrow">▼</span>'
@@ -1267,6 +1298,8 @@ def _render_list_rows(
     for col, kind, header in _LIST_COLUMNS:
         if kind == "bidtimes":
             head_cells.append(_bid_times_header(header, sort, qs))
+        elif kind == "ntcekind":
+            head_cells.append(f'<th class="kindhead">{_e(header)}</th>')
         elif col in _SORTABLE_COLUMNS:
             head_cells.append(_sort_header(col, header, sort, qs))
         else:
@@ -1302,15 +1335,14 @@ def _render_list_rows(
                 cells.append(_render_ntce_kind(val, r.get("bid_methd_nm")))
             elif kind == "instt":
                 cells.append(_render_instt(val, r.get("dminstt_nm")))
-            elif kind == "link":
-                url = r.get("bid_ntce_dtl_url")
-                text = _e(val)
-                if url:
-                    cells.append(
-                        f'<td><a href="{_e(url)}" target="_blank" rel="noopener">{text}</a></td>'
-                    )
-                else:
-                    cells.append(f"<td>{text}</td>")
+            elif kind == "ntce":
+                cells.append(_render_ntce(val, r.get("bid_ntce_nm"), r.get("bid_ntce_dtl_url")))
+            elif kind == "sucsf":
+                full = "" if val is None else str(val)
+                title = f' title="{_e(full.strip())}"' if full.strip() else ""
+                cells.append(
+                    f'<td class="sucsfcell"{title}>{_e(_sucsfbid_mthd_short(val))}</td>'
+                )
             else:
                 cells.append(f"<td>{_e(val)}</td>")
         # 파일 컬럼: 첨부 개수>0 이면 drawer 호출 버튼, 없으면 '-'.
@@ -3067,7 +3099,7 @@ def list_page(
     # 수의계약 제외(기본 True). 체크 해제와 "파라미터 없음(첫 진입)"을 구분하기 위해
     # 폼은 hidden(0)+checkbox(1) 쌍으로 전송한다: 없음=기본(제외), "1" 포함=제외, 그 외=포함.
     excl_privt_flag = True if not excl_privt else ("1" in excl_privt)
-    # 정렬: 입찰일시 3개 필드와 추정가격의 asc/desc 8종. 미허용·빈값은 기본(최신 공고일).
+    # 정렬: 입찰일시 3개·배정예산·추정가격(북마크 호환)의 asc/desc 10종. 미허용·빈값은 기본.
     sort = sort if sort in _LIST_SORTS else _DEFAULT_SORT
     # 날짜 적용 컬럼: 공고일/개찰일.
     date_field = date_field if date_field in ("bid_ntce_dt", "openg_dt") else "bid_ntce_dt"
@@ -3126,7 +3158,7 @@ def list_page(
         cols = (
             [c for c, k, _ in _LIST_COLUMNS if k != "bidtimes"]
             + [field for field, _label in _BID_TIME_FIELDS]
-            + ["dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm"]
+            + ["bid_ntce_nm", "dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm"]
             + _SPEC_URL_COLUMNS
         )
         rows = []
