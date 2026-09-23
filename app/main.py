@@ -620,6 +620,15 @@ BASE_CSS = """
   td.matchind { max-width: 240px; }
   td.matchind .indrow { display: block; overflow: hidden; text-overflow: ellipsis;
                         white-space: nowrap; }
+  /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
+  td.kindcell { max-width: 150px; }
+  td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
+                          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 입찰일시 통합 셀·헤더: 개시/마감/개찰을 세로로 표시하고 정렬 기준을 헤더에서 선택 */
+  td.bidtimes, th.bidtimes-head { white-space: nowrap; }
+  td.bidtimes .bt-line { display: block; line-height: 1.45; }
+  th.bidtimes-head .bt-sortfield { margin-left: 4px; padding: 1px 2px; font-size: 12px; }
+  th.bidtimes-head .bt-dir { margin-left: 2px; }
   /* 공고기관/수요기관 통합 셀: 위=공고기관(옅은 회색), 아래=수요기관(기본색), 세로 간격 ≥4px */
   td.insttcell { max-width: 260px; }
   td.insttcell .ntcorg, td.insttcell .dmnorg { display: block; overflow: hidden;
@@ -930,14 +939,24 @@ _NTCE_KIND_BADGE: dict[str, str] = {
 }
 
 
-def _render_ntce_kind(value: Any) -> str:
-    """'구분' 셀: 공고종류명을 배지로 표시. 값 없으면 '-'."""
+def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
+    """'구분' 셀: 위=공고종류명(ntceKindNm) 배지, 아래=입찰방식명(bidMethdNm) 텍스트.
+
+    입찰방식명은 배지가 아니라 옅은 회색 텍스트 한 줄로만 표시한다.
+    한쪽만 있으면 그 줄만, 둘 다 없으면 '-'.
+    """
     s = "" if value is None else str(value).strip()
-    if not s:
+    m = "" if bid_methd is None else str(bid_methd).strip()
+    if not s and not m:
         return "<td>-</td>"
-    cls = _NTCE_KIND_BADGE.get(s, "")
-    cls_attr = f"badge {cls}".strip()
-    return f'<td><span class="{cls_attr}">{_e(s)}</span></td>'
+    lines = []
+    if s:
+        cls = _NTCE_KIND_BADGE.get(s, "")
+        cls_attr = f"badge {cls}".strip()
+        lines.append(f'<span class="{cls_attr}">{_e(s)}</span>')
+    if m:
+        lines.append(f'<span class="bidmethd" title="{_e(m)}">{_e(m)}</span>')
+    return f'<td class="kindcell">{"".join(lines)}</td>'
 
 
 # --- /list -----------------------------------------------------------
@@ -951,23 +970,30 @@ _LIST_COLUMNS: list[tuple[str, str, str]] = [
     ("ntce_instt_nm", "instt", "공고기관/수요기관"),
     ("asign_bdgt_amt", "amt", "배정예산"),
     ("presmpt_prce", "amt", "추정가격"),
-    ("bid_ntce_dt", "dt", "공고일시"),
-    ("openg_dt", "dt", "개찰일시"),
+    ("bid_times", "bidtimes", "입찰일시"),
     ("matched_indstryty_cds", "matchind", "매칭업종"),
+]
+
+# 입찰일시 통합 셀의 실제 컬럼과 표시 라벨. 셀·헤더 모두 이 순서를 공유한다.
+_BID_TIME_FIELDS: list[tuple[str, str]] = [
+    ("bid_ntce_dt", "개시"),
+    ("bid_clse_dt", "마감"),
+    ("openg_dt", "개찰"),
 ]
 
 # 컬럼 헤더 클릭 정렬이 가능한 컬럼 → 정렬 sort 키 접두(asc/desc 토글에 사용).
 _SORTABLE_COLUMNS: dict[str, str] = {
-    "bid_ntce_dt": "bid_ntce_dt",
-    "openg_dt": "openg_dt",
     "presmpt_prce": "presmpt_prce",
 }
 
 # /list 정렬 허용값(repository._SORT_COLUMNS 와 동일). 미허용·빈값은 기본으로 폴백.
+# 입찰일시 통합 헤더에서 개시/마감/개찰 세 필드의 방향을 선택한다.
 _LIST_SORTS: frozenset[str] = frozenset(
     {
         "bid_ntce_dt_desc",
         "bid_ntce_dt_asc",
+        "bid_clse_dt_desc",
+        "bid_clse_dt_asc",
         "openg_dt_desc",
         "openg_dt_asc",
         "presmpt_prce_desc",
@@ -1063,6 +1089,21 @@ def _render_instt(ntce: Any, dmin: Any) -> str:
     return f'<td class="insttcell">{"".join(lines)}</td>'
 
 
+def _render_bid_times(row: dict[str, Any]) -> str:
+    """입찰일시 통합 셀. 개시/마감/개찰 날짜를 고정 순서의 세 줄로 표시한다."""
+    lines = []
+    for field, label in _BID_TIME_FIELDS:
+        full = _fmt_dt(row.get(field))
+        if full:
+            lines.append(
+                f'<span class="bt-line" title="{_e(full)}">'
+                f'{_e(label)} : {_e(full[:10])}</span>'
+            )
+        else:
+            lines.append(f'<span class="bt-line">{_e(label)} : -</span>')
+    return f'<td class="bidtimes">{"".join(lines)}</td>'
+
+
 def _sort_header(
     col: str,
     header: str,
@@ -1095,6 +1136,46 @@ def _sort_header(
     query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
     return (
         f'<th><a class="sortcol" href="{base_path}?{query}">{_e(header)}{arrow}</a></th>'
+    )
+
+
+def _bid_times_header(header: str, sort: str, qs: dict[str, str]) -> str:
+    """입찰일시 정렬 기준 select와 현재 방향을 토글하는 링크를 렌더한다."""
+    active_field = next(
+        (field for field, _label in _BID_TIME_FIELDS if sort in (f"{field}_asc", f"{field}_desc")),
+        None,
+    )
+    selected_field = active_field or _BID_TIME_FIELDS[0][0]
+    direction = "asc" if active_field and sort.endswith("_asc") else "desc"
+
+    options = []
+    for field, label in _BID_TIME_FIELDS:
+        option_sort = f"{field}_{direction}"
+        params = {**qs, "sort": option_sort, "page": "1"}
+        query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+        selected = " selected" if field == selected_field else ""
+        options.append(
+            f'<option value="/list?{query}"{selected}>{_e(label)}</option>'
+        )
+
+    if active_field:
+        next_direction = "desc" if direction == "asc" else "asc"
+        next_sort = f"{active_field}_{next_direction}"
+        arrow = "▲" if direction == "asc" else "▼"
+        arrow_class = "arrow"
+    else:
+        next_sort = f"{selected_field}_desc"
+        arrow = "↕"
+        arrow_class = "arrow neutral"
+    params = {**qs, "sort": next_sort, "page": "1"}
+    query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+
+    return (
+        f'<th class="bidtimes-head">{_e(header)} '
+        '<select class="bt-sortfield" autocomplete="off" aria-label="입찰일시 정렬 기준">'
+        f'{"".join(options)}</select> '
+        f'<a class="sortcol bt-dir" href="/list?{query}" title="정렬 방향 전환">'
+        f'<span class="{arrow_class}">{arrow}</span></a></th>'
     )
 
 
@@ -1183,8 +1264,10 @@ def _render_list_rows(
     # 전체선택 체크박스 헤더
     chk_head = '<th class="col-chk"><input type="checkbox" id="chk-all" title="전체선택"></th>'
     head_cells = []
-    for col, _kind, header in _LIST_COLUMNS:
-        if col in _SORTABLE_COLUMNS:
+    for col, kind, header in _LIST_COLUMNS:
+        if kind == "bidtimes":
+            head_cells.append(_bid_times_header(header, sort, qs))
+        elif col in _SORTABLE_COLUMNS:
             head_cells.append(_sort_header(col, header, sort, qs))
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
@@ -1207,14 +1290,16 @@ def _render_list_rows(
         cells = [chk_cell, f"<td>{i}</td>"]
         for col, kind, _header in _LIST_COLUMNS:
             val = r.get(col)
-            if kind == "amt":
+            if kind == "bidtimes":
+                cells.append(_render_bid_times(r))
+            elif kind == "amt":
                 cells.append(f"<td>{_e(_fmt_amt(val))}</td>")
             elif kind == "dt":
                 cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
             elif kind == "matchind":
                 cells.append(_render_matched_inds(val))
             elif kind == "ntcekind":
-                cells.append(_render_ntce_kind(val))
+                cells.append(_render_ntce_kind(val, r.get("bid_methd_nm")))
             elif kind == "instt":
                 cells.append(_render_instt(val, r.get("dminstt_nm")))
             elif kind == "link":
@@ -1637,9 +1722,24 @@ _EXCL_KW_SCRIPT = """
 """ % {"max": repository.EXCLUDE_KEYWORD_MAX, "maxlen": repository.EXCLUDE_KEYWORD_MAX_LEN}
 
 
-# /list 클라이언트 스크립트(setRecent + 파일 drawer). 평문 상수라 중괄호 이스케이프 불필요.
+# /list 클라이언트 스크립트(setRecent + 입찰일시 정렬 select + 파일 drawer).
+# 평문 상수라 중괄호 이스케이프 불필요.
 # 파일명은 서버 JSON에서 받아 textContent 로 삽입(XSS 방지). 파일 URL 은 DB 저장 URL 만 사용.
 _LIST_SCRIPT = """
+  window.addEventListener('pageshow', function () {
+    document.querySelectorAll('select.bt-sortfield').forEach(function (select) {
+      Array.from(select.options).forEach(function (option) {
+        option.selected = option.defaultSelected;
+      });
+    });
+  });
+
+  document.addEventListener('change', function (e) {
+    if (e.target.matches('select.bt-sortfield') && e.target.value) {
+      location.href = e.target.value;
+    }
+  });
+
   function fmtDate(d) {
     var m = ('0' + (d.getMonth() + 1)).slice(-2);
     var day = ('0' + d.getDate()).slice(-2);
@@ -2967,7 +3067,7 @@ def list_page(
     # 수의계약 제외(기본 True). 체크 해제와 "파라미터 없음(첫 진입)"을 구분하기 위해
     # 폼은 hidden(0)+checkbox(1) 쌍으로 전송한다: 없음=기본(제외), "1" 포함=제외, 그 외=포함.
     excl_privt_flag = True if not excl_privt else ("1" in excl_privt)
-    # 정렬: 헤더 클릭 6종. 미허용·빈값은 기본(최신 공고일).
+    # 정렬: 입찰일시 3개 필드와 추정가격의 asc/desc 8종. 미허용·빈값은 기본(최신 공고일).
     sort = sort if sort in _LIST_SORTS else _DEFAULT_SORT
     # 날짜 적용 컬럼: 공고일/개찰일.
     date_field = date_field if date_field in ("bid_ntce_dt", "openg_dt") else "bid_ntce_dt"
@@ -3024,8 +3124,9 @@ def list_page(
         # 첨부 URL 컬럼은 파일 개수 계산용으로만 읽고(이미 조회한 ORM 행에서 → N+1 없음),
         # 화면에는 개수만 전달한다(drawer 열 때 /files 로 상세 조회).
         cols = (
-            [c for c, _, _ in _LIST_COLUMNS]
-            + ["dminstt_nm", "bid_ntce_dtl_url"]
+            [c for c, k, _ in _LIST_COLUMNS if k != "bidtimes"]
+            + [field for field, _label in _BID_TIME_FIELDS]
+            + ["dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm"]
             + _SPEC_URL_COLUMNS
         )
         rows = []
