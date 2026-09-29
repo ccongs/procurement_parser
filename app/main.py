@@ -656,13 +656,6 @@ BASE_CSS = """
   table.listtable > tbody > tr > td.file-col,
   table.listtable > tbody > tr > td.analysis-col { padding: 6px 4px; text-align: center; vertical-align: middle; }
   table.listtable button.filebtn { padding-left: 4px; padding-right: 4px; }
-  table.listtable .analysis-actions { gap: 2px; }
-  table.listtable .analysis-col .analysis-actions .btn-analyze.is-done:not(.analysis-menu-toggle) {
-    padding-left: 1px; padding-right: 1px;
-  }
-  table.listtable .analysis-col .analysis-actions .btn-analyze.is-done.analysis-menu-toggle {
-    padding-left: 3px; padding-right: 3px;
-  }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
   td.kindcell { text-align: center; vertical-align: middle; }
   td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
@@ -1414,10 +1407,8 @@ def _render_analysis_cell(
     if safe_status == "done":
         return (
             f'{td_open}<div class="analysis-actions" {attrs}>'
-            f'<button type="button" class="btn-analyze is-done" data-action="view" '
-            f'aria-label="분석 결과 보기">완료</button>'
             f'<button type="button" class="btn-analyze is-done analysis-menu-toggle" '
-            f'aria-label="분석 메뉴" aria-expanded="false">▾</button>'
+            f'aria-label="분석 완료, 분석 메뉴" aria-expanded="false">완료 ▾</button>'
             f'<div class="analysis-menu" role="menu">'
             f'<button type="button" data-action="view" role="menuitem">분석보기</button>'
             f'<button type="button" data-action="auto" role="menuitem">자동 재분석</button>'
@@ -1428,7 +1419,7 @@ def _render_analysis_cell(
         return (
             f'{td_open}<div class="analysis-actions" {attrs}>'
             f'<button type="button" class="btn-analyze analysis-menu-toggle" '
-            f'aria-label="분석 메뉴" aria-expanded="false">재분석 ▾</button>'
+            f'aria-label="분석 실패, 재분석 메뉴" aria-expanded="false">재분석 ▾</button>'
             f'<div class="analysis-menu" role="menu">'
             f'<button type="button" data-action="auto" role="menuitem">자동</button>'
             f'<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'
@@ -2214,8 +2205,7 @@ _ANALYSIS_SCRIPT = """
       }
       if (status === 'done') {
         return '<div class="analysis-actions" ' + attrs + '>'
-          + '<button type="button" class="btn-analyze is-done" data-action="view" aria-label="분석 결과 보기">완료</button>'
-          + '<button type="button" class="btn-analyze is-done analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">▾</button>'
+          + '<button type="button" class="btn-analyze is-done analysis-menu-toggle" aria-label="분석 완료, 분석 메뉴" aria-expanded="false">완료 ▾</button>'
           + '<div class="analysis-menu" role="menu">'
           + '<button type="button" data-action="view" role="menuitem">분석보기</button>'
           + '<button type="button" data-action="auto" role="menuitem">자동 재분석</button>'
@@ -2224,7 +2214,7 @@ _ANALYSIS_SCRIPT = """
       }
       if (status === 'error') {
         return '<div class="analysis-actions" ' + attrs + '>'
-          + '<button type="button" class="btn-analyze analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">재분석 ▾</button>'
+          + '<button type="button" class="btn-analyze analysis-menu-toggle" aria-label="분석 실패, 재분석 메뉴" aria-expanded="false">재분석 ▾</button>'
           + '<div class="analysis-menu" role="menu">'
           + '<button type="button" data-action="auto" role="menuitem">자동</button>'
           + '<button type="button" data-action="upload" role="menuitem">파일 업로드</button>'

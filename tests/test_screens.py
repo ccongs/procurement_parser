@@ -2258,20 +2258,14 @@ def test_list_fixed_column_widths_and_nowrap_content(client, monkeypatch):
     kind_rule = re.search(r"table\.listtable \.kind-col\s*\{([^}]+)\}", main.BASE_CSS)
     assert kind_rule is not None
     assert "padding-left" not in kind_rule.group(1)
-    done_label_rule = re.search(
-        r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\.is-done:"
-        r"not\(\.analysis-menu-toggle\)\s*\{([^}]+)\}", main.BASE_CSS,
+    assert not re.search(
+        r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\.is-done"
+        r"(?::not\(\.analysis-menu-toggle\)|\.analysis-menu-toggle)\s*\{",
+        main.BASE_CSS,
     )
-    assert done_label_rule is not None
-    assert "padding-left: 1px" in done_label_rule.group(1)
-    assert "padding-right: 1px" in done_label_rule.group(1)
-    done_toggle_rule = re.search(
-        r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\.is-done\."
-        r"analysis-menu-toggle\s*\{([^}]+)\}", main.BASE_CSS,
-    )
-    assert done_toggle_rule is not None
-    assert "padding-left: 3px" in done_toggle_rule.group(1)
-    assert "padding-right: 3px" in done_toggle_rule.group(1)
+    assert "table.listtable .analysis-actions { gap: 2px; }" not in main.BASE_CSS
+    actions_rule = re.search(r"(?m)^\s*\.analysis-actions\s*\{([^}]+)\}", main.BASE_CSS)
+    assert actions_rule is not None and "gap: 4px" in actions_rule.group(1)
     assert not re.search(
         r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\s*\{",
         main.BASE_CSS,

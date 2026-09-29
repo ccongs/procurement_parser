@@ -135,8 +135,8 @@ def test_list_page_analyze_button_data_type(client):
     [
         ("none", ['data-status="none"', "분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', '분석 결과 보기">완료</button>', 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
-        ("error", ['data-status="error"', "재분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
+        ("done", ['data-status="done"', 'class="btn-analyze is-done analysis-menu-toggle"', 'aria-label="분석 완료, 분석 메뉴" aria-expanded="false">완료 ▾</button>', 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
+        ("error", ['data-status="error"', 'aria-label="분석 실패, 재분석 메뉴" aria-expanded="false">재분석 ▾</button>', 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
     ],
 )
 def test_list_page_renders_analysis_button_by_status(client, status, expected):
@@ -165,9 +165,39 @@ def test_done_analysis_button_classes_match_server_and_client_renderers():
         status="done",
         cell_class="analysis-col",
     )
+    done_toggle = (
+        '<button type="button" class="btn-analyze is-done analysis-menu-toggle" '
+        'aria-label="분석 완료, 분석 메뉴" aria-expanded="false">완료 ▾</button>'
+    )
+    error_toggle = (
+        '<button type="button" class="btn-analyze analysis-menu-toggle" '
+        'aria-label="분석 실패, 재분석 메뉴" aria-expanded="false">재분석 ▾</button>'
+    )
+    none_toggle = (
+        '<button type="button" class="btn-analyze analysis-menu-toggle" '
+        'aria-label="분석 메뉴" aria-expanded="false">분석 ▾</button>'
+    )
+    assert server_html.count(done_toggle) == 1
+    assert server_html.count("analysis-menu-toggle") == 1
+    assert 'aria-label="분석 결과 보기"' not in server_html
+    assert done_toggle in main._ANALYSIS_SCRIPT
+    assert main._ANALYSIS_SCRIPT.count('>완료 ▾</button>') == 1
+    assert 'aria-label="분석 결과 보기"' not in main._ANALYSIS_SCRIPT
+    for status, toggle in (("error", error_toggle), ("none", none_toggle)):
+        server_status_html = main._render_analysis_cell(
+            source_type="bid",
+            source_id=f"BID-{status.upper()}-CHECK",
+            source_name="분석 버튼 상태 확인",
+            total_cols=12,
+            status=status,
+            cell_class="analysis-col",
+        )
+        assert toggle in server_status_html
+        assert toggle in main._ANALYSIS_SCRIPT
     for fragment in (
-        'class="btn-analyze is-done"',
-        'class="btn-analyze is-done analysis-menu-toggle"',
+        '<button type="button" data-action="view" role="menuitem">분석보기</button>',
+        '<button type="button" data-action="auto" role="menuitem">자동 재분석</button>',
+        '<button type="button" data-action="upload" role="menuitem">파일 업로드</button>',
     ):
         assert fragment in server_html
         assert fragment in main._ANALYSIS_SCRIPT
@@ -213,8 +243,8 @@ def test_pre_spec_page_analyze_button_data_type(client):
     [
         ("none", ['data-status="none"', "분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', '분석 결과 보기">완료</button>', 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
-        ("error", ['data-status="error"', "재분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
+        ("done", ['data-status="done"', 'class="btn-analyze is-done analysis-menu-toggle"', 'aria-label="분석 완료, 분석 메뉴" aria-expanded="false">완료 ▾</button>', 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
+        ("error", ['data-status="error"', 'aria-label="분석 실패, 재분석 메뉴" aria-expanded="false">재분석 ▾</button>', 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
     ],
 )
 def test_pre_spec_page_renders_analysis_button_by_status(client, status, expected):
