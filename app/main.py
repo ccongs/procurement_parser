@@ -1415,7 +1415,7 @@ def _render_analysis_cell(
         return (
             f'{td_open}<div class="analysis-actions" {attrs}>'
             f'<button type="button" class="btn-analyze is-done" data-action="view" '
-            f'aria-label="분석 결과 보기">분석완료</button>'
+            f'aria-label="분석 결과 보기">완료</button>'
             f'<button type="button" class="btn-analyze is-done analysis-menu-toggle" '
             f'aria-label="분석 메뉴" aria-expanded="false">▾</button>'
             f'<div class="analysis-menu" role="menu">'
@@ -2214,7 +2214,7 @@ _ANALYSIS_SCRIPT = """
       }
       if (status === 'done') {
         return '<div class="analysis-actions" ' + attrs + '>'
-          + '<button type="button" class="btn-analyze is-done" data-action="view" aria-label="분석 결과 보기">분석완료</button>'
+          + '<button type="button" class="btn-analyze is-done" data-action="view" aria-label="분석 결과 보기">완료</button>'
           + '<button type="button" class="btn-analyze is-done analysis-menu-toggle" aria-label="분석 메뉴" aria-expanded="false">▾</button>'
           + '<div class="analysis-menu" role="menu">'
           + '<button type="button" data-action="view" role="menuitem">분석보기</button>'

@@ -135,7 +135,7 @@ def test_list_page_analyze_button_data_type(client):
     [
         ("none", ['data-status="none"', "분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
+        ("done", ['data-status="done"', '분석 결과 보기">완료</button>', 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
         ("error", ['data-status="error"', "재분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
     ],
 )
@@ -213,7 +213,7 @@ def test_pre_spec_page_analyze_button_data_type(client):
     [
         ("none", ['data-status="none"', "분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
         ("analyzing", ['data-status="analyzing"', "disabled", ">분석중</button>"]),
-        ("done", ['data-status="done"', "분석완료", 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
+        ("done", ['data-status="done"', '분석 결과 보기">완료</button>', 'data-action="view"', 'data-action="auto"', "자동 재분석", 'data-action="upload"', "파일 업로드"]),
         ("error", ['data-status="error"', "재분석 ▾", 'data-action="auto"', 'data-action="upload"', "파일 업로드"]),
     ],
 )
