@@ -663,6 +663,7 @@ BASE_CSS = """
   /* 공고번호/공고명 통합 셀: 기존 글꼴·링크 스타일을 유지하고 두 줄로 표시 */
   td.ntcecell .ntceno, td.ntcecell .ntcenm { display: block; }
   td.ntcecell .ntceno { margin-bottom: 4px; }
+  td.ntcecell .ntcenum { white-space: nowrap; }
   td.ntcecell .relntce { color: #8a93a2; }
   td.ntcecell .ntcenm { width: fit-content; }
   /* 공고일시·제출일시는 각 두 줄이며 정렬 기준을 헤더에서 선택한다. */
@@ -714,6 +715,11 @@ BASE_CSS = """
   .list-filter .list-summary-main { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
   .list-filter .list-summary-main .field input,
   .list-filter .list-summary-main .field select { height: 31px; box-sizing: border-box; }
+  .list-filter .list-summary-main > button.submit,
+  .list-filter .list-summary-main > button.filter-toggle,
+  .list-filter .list-summary-main > button#btn-add-to-cart {
+    height: 31px; box-sizing: border-box; padding-top: 0; padding-bottom: 0; line-height: 29px;
+  }
   .list-filter .list-filter-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0 0; }
   .list-filter .list-group-label { flex: 0 0 96px; width: 96px; min-width: max-content;
                                    font-size: 13px; font-weight: 600; line-height: 1.35; white-space: nowrap; }
@@ -1046,10 +1052,10 @@ def _fmt_amt(value: Any) -> str:
         return str(value)
 
 
-# 공고종류명(ntceKindNm) 값별 배지 클래스. 등록공고=기본, 재공고/변경공고=warn, 취소공고=err.
+# 공고종류명(ntceKindNm) 값별 배지 클래스. 등록공고=기본, 재공고=warn, 변경공고=ok, 취소공고=err.
 _NTCE_KIND_BADGE: dict[str, str] = {
     "재공고": "warn",
-    "변경공고": "warn",
+    "변경공고": "ok",
     "취소공고": "err",
 }
 
@@ -1222,14 +1228,30 @@ def _related_ntce_no(kind: Any, raw_json: Any, bid_ntce_no: Any) -> str | None:
     return related_no
 
 
+def _display_ntce_no(kind: Any, bid_ntce_no: Any, bid_ntce_ord: Any = None) -> str:
+    """변경공고에 차수가 있으면 공고번호와 붙여 표시한다."""
+    number = "" if bid_ntce_no is None else str(bid_ntce_no).strip()
+    order = "" if bid_ntce_ord is None else str(bid_ntce_ord).strip()
+    notice_kind = "" if kind is None else str(kind).strip()
+    if notice_kind == "변경공고" and number and order:
+        return f"{number}-{order}"
+    return number
+
+
 def _render_ntce(
-    no: Any, name: Any, url: Any, *, kind: Any = None, raw_json: Any = None
+    no: Any,
+    name: Any,
+    url: Any,
+    *,
+    kind: Any = None,
+    raw_json: Any = None,
+    bid_ntce_ord: Any = None,
 ) -> str:
     """공고번호/공고명 통합 셀. 관련공고번호와 상세 링크를 조건에 따라 표시한다."""
-    number = "" if no is None else str(no).strip()
+    number = _display_ntce_no(kind, no, bid_ntce_ord)
     name = "" if name is None else str(name).strip()
     related = _related_ntce_no(kind, raw_json, no)
-    number_line = _e(number or "-")
+    number_line = f'<span class="ntcenum">{_e(number or "-")}</span>'
     if related:
         number_line += (
             f'<span class="relntce" title="관련공고(이전 공고번호)">'
@@ -1499,6 +1521,7 @@ def _render_list_rows(
                     r.get("bid_ntce_dtl_url"),
                     kind=r.get("ntce_kind_nm"),
                     raw_json=r.get("raw_json"),
+                    bid_ntce_ord=r.get("bid_ntce_ord"),
                 ))
             elif kind == "sucsf":
                 full = "" if val is None else str(val)
@@ -3433,7 +3456,10 @@ def list_page(
         cols = (
             [c for c, k, _ in _LIST_COLUMNS if k not in _LIST_TIME_FIELDS]
             + [field for fields in _LIST_TIME_FIELDS.values() for field, _label in fields]
-            + ["bid_ntce_nm", "dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm", "raw_json"]
+            + [
+                "bid_ntce_nm", "bid_ntce_ord", "dminstt_nm",
+                "bid_ntce_dtl_url", "bid_methd_nm", "raw_json",
+            ]
             + _SPEC_URL_COLUMNS
         )
         rows = []

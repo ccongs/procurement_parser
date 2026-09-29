@@ -1233,6 +1233,20 @@ def test_render_ntce_kind_with_kind_and_bid_method():
     assert '<span class="bidmethd" title="일반경쟁입찰">일반경쟁입찰</span>' in html
 
 
+@pytest.mark.parametrize(
+    ("kind", "badge_class"),
+    [
+        ("변경공고", "badge ok"),
+        ("재공고", "badge warn"),
+        ("취소공고", "badge err"),
+        ("등록공고", "badge"),
+    ],
+)
+def test_render_ntce_kind_uses_notice_kind_badge_colors(kind, badge_class):
+    html = main._render_ntce_kind(kind, None, cell_class="kindcell")
+    assert f'<span class="{badge_class}">{kind}</span>' in html
+
+
 def test_render_ntce_kind_with_kind_only():
     """공고종류만 있으면 배지만 렌더한다."""
     assert main._render_ntce_kind("등록공고", None, cell_class="kindcell") == (
@@ -1986,7 +2000,7 @@ def test_list_notice_cell_link_and_escape(client, url):
     resp = client.get("/list", params={**_WIDE, "q": "복합셀"})
     assert resp.status_code == 200
     cell = re.search(r'<td class="ntcecell">.*?</td>', resp.text).group(0)
-    number = '<span class="ntceno">S-NTCE-&lt;&amp;&quot;</span>'
+    number = '<span class="ntceno"><span class="ntcenum">S-NTCE-&lt;&amp;&quot;</span></span>'
     name = '복합셀 &lt;공고&amp;&quot;명&gt;'
     assert cell.index(number) < cell.index(name)
     if url:
@@ -2029,12 +2043,58 @@ def test_related_notice_number_is_escaped_in_notice_cell():
         raw_json=json.dumps({"befBidBbancNo": '<old&"no>'}),
     )
     assert (
-        'R26-NEW<span class="relntce" title="관련공고(이전 공고번호)"> '
+        '<span class="ntcenum">R26-NEW</span><span class="relntce" title="관련공고(이전 공고번호)"> '
         '- [&lt;old&amp;&quot;no&gt;]</span>' in cell
     )
     assert '<old&"no>' not in cell
     rel_rule = re.search(r"td\.ntcecell \.relntce\s*\{([^}]+)\}", main.BASE_CSS)
     assert rel_rule is not None and "color: #8a93a2" in rel_rule.group(1)
+
+
+@pytest.mark.parametrize(
+    ("kind", "order", "expected"),
+    [
+        ("변경공고", " 002 ", "R26BK01742580-002"),
+        ("변경공고", None, "R26BK01742580"),
+        ("변경공고", "   ", "R26BK01742580"),
+        ("재공고", "001", "R26BK01742580"),
+        ("등록공고", "001", "R26BK01742580"),
+        ("취소공고", "001", "R26BK01742580"),
+    ],
+)
+def test_render_ntce_shows_order_only_for_change_notices(kind, order, expected):
+    cell = main._render_ntce(
+        "R26BK01742580", "차수 표시", None, kind=kind, bid_ntce_ord=order
+    )
+    assert f'<span class="ntceno"><span class="ntcenum">{expected}</span></span>' in cell
+
+
+def test_render_changed_notice_order_escapes_in_nonbreaking_span():
+    cell = main._render_ntce(
+        "R26BK01742580", "차수 이스케이프", None,
+        kind="변경공고", bid_ntce_ord="<0&1>",
+    )
+    assert (
+        '<span class="ntceno"><span class="ntcenum">'
+        'R26BK01742580-&lt;0&amp;1&gt;</span></span>'
+    ) in cell
+    assert "R26BK01742580-<0&1>" not in cell
+
+
+def test_render_changed_notice_order_before_related_notice():
+    cell = main._render_ntce(
+        "R26BK01742580",
+        "변경공고 관련번호",
+        None,
+        kind="변경공고",
+        raw_json='{"befBidBbancNo":" R26BK01742000 "}',
+        bid_ntce_ord="001",
+    )
+    assert (
+        '<span class="ntcenum">R26BK01742580-001</span>'
+        '<span class="relntce" title="관련공고(이전 공고번호)"> '
+        '- [R26BK01742000]</span>' in cell
+    )
 
 
 def test_list_renders_related_notice_number_for_reannouncement(client):
@@ -2050,9 +2110,34 @@ def test_list_renders_related_notice_number_for_reannouncement(client):
     )
     assert response.status_code == 200
     assert (
-        'R26BK01743383<span class="relntce" title="관련공고(이전 공고번호)"> '
+        '<span class="ntcenum">R26BK01743383</span>'
+        '<span class="relntce" title="관련공고(이전 공고번호)"> '
         '- [R26BK01725789]</span>' in response.text
     )
+
+
+def test_list_renders_change_notice_order_but_keeps_checkbox_id(client):
+    notice = _bn(
+        "R26BK01742580", "변경공고 차수 라우트 검증", datetime(2026, 5, 8), None
+    )
+    notice.ntce_kind_nm = "변경공고"
+    notice.bid_ntce_ord = "002"
+    notice.raw_json = '{"befBidBbancNo":"R26BK01742000"}'
+    with main.SessionLocal() as session:
+        session.add(notice)
+        session.commit()
+
+    response = client.get(
+        "/list", params={**_WIDE, "q": "변경공고 차수 라우트", "include_past": "1"}
+    )
+    assert response.status_code == 200
+    assert (
+        '<span class="ntcenum">R26BK01742580-002</span>'
+        '<span class="relntce" title="관련공고(이전 공고번호)"> '
+        '- [R26BK01742000]</span>' in response.text
+    )
+    assert 'data-item-id="R26BK01742580"' in response.text
+    assert 'data-item-id="R26BK01742580-002"' not in response.text
 
 
 @pytest.mark.parametrize(
@@ -2066,7 +2151,7 @@ def test_list_notice_cell_normalizes_lines(value, expected):
         [{"bid_ntce_no": value, "bid_ntce_nm": value}], main._DEFAULT_SORT, {}
     )
     assert (
-        f'<td class="ntcecell"><span class="ntceno">{expected}</span>'
+        f'<td class="ntcecell"><span class="ntceno"><span class="ntcenum">{expected}</span></span>'
         f'<span class="ntcenm">{expected}</span></td>'
     ) in text
 
@@ -2077,11 +2162,13 @@ def test_list_notice_cell_line_spacing():
         r"td\.ntcecell \.ntceno, td\.ntcecell \.ntcenm\s*\{([^}]+)\}", main.BASE_CSS
     ).group(1)
     spacing = re.search(r"td\.ntcecell \.ntceno\s*\{([^}]+)\}", main.BASE_CSS).group(1)
+    number_css = re.search(r"td\.ntcecell \.ntcenum\s*\{([^}]+)\}", main.BASE_CSS).group(1)
     name_css = re.search(
         r"(?m)^\s*td\.ntcecell \.ntcenm\s*\{([^}]+)\}", main.BASE_CSS
     ).group(1)
     assert "display: block" in rules
     assert "margin-bottom: 4px" in spacing
+    assert "white-space: nowrap" in number_css
     assert "width: fit-content" in name_css
     assert "white-space: nowrap" not in rules + name_css
     assert "font" not in rules + spacing + name_css
