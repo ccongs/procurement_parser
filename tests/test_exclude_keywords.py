@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import html
+import re
 
 import pytest
 from sqlalchemy import create_engine
@@ -263,6 +265,47 @@ def test_list_applies_default_keyword_on_first_visit(client):
     assert 'class="kw-opt is-default is-selected" data-kw="감리"' in resp.text
     assert 'class="kw-opt" data-kw="청소"' in resp.text
     assert "(기본)" not in resp.text  # 혼동되는 텍스트 표기 대신 색상으로 구분
+
+
+def test_long_exclude_keyword_chip_markup_and_overflow_styles():
+    from app import main
+
+    keyword = '&<"' + "가" * 47
+    assert len(keyword) == repository.EXCLUDE_KEYWORD_MAX_LEN
+
+    rendered = main._excl_kw_field(
+        [keyword], [{"keyword": keyword, "is_default": False}], "제외 키워드"
+    )
+    escaped = html.escape(keyword)
+    assert (
+        f'<span class="kw-chip" data-kw="{escaped}" title="{escaped}">'
+        f'<span class="kw-chip-text">{escaped}</span>'
+    ) in rendered
+    assert f'data-kw="{escaped}" role="option"><span class="kw-opt-text">{escaped}</span>' in rendered
+
+    chip_css = re.search(r"(?m)^\s*\.kw-chip\s*\{([^}]+)\}", main.BASE_CSS)
+    assert chip_css
+    assert "max-width: 100%" in chip_css.group(1)
+    assert "min-width: 0" in chip_css.group(1)
+    chip_text_css = re.search(r"(?m)^\s*\.kw-chip-text\s*\{([^}]+)\}", main.BASE_CSS)
+    assert chip_text_css
+    assert "overflow: hidden" in chip_text_css.group(1)
+    assert "text-overflow: ellipsis" in chip_text_css.group(1)
+    assert "white-space: nowrap" in chip_text_css.group(1)
+    chip_remove_css = re.search(r"(?m)^\s*\.kw-chip-x\s*\{([^}]+)\}", main.BASE_CSS)
+    assert chip_remove_css and "flex-shrink: 0" in chip_remove_css.group(1)
+    opt_text_css = re.search(r"(?m)^\s*\.kw-opt-text\s*\{([^}]+)\}", main.BASE_CSS)
+    assert opt_text_css
+    assert "overflow: hidden" in opt_text_css.group(1)
+    assert "text-overflow: ellipsis" in opt_text_css.group(1)
+
+    script = main._EXCL_KW_SCRIPT
+    assert "return c.getAttribute('data-kw') || '';" in script
+    assert "chip.setAttribute('data-kw', w);" in script
+    assert "chip.setAttribute('title', w);" in script
+    assert "chipText.className = 'kw-chip-text';" in script
+    assert "chipText.textContent = w;" in script
+    assert "chip.appendChild(chipText);" in script
 
 
 def test_list_form_submit_overrides_default(client):

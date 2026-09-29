@@ -119,7 +119,7 @@ class TestAnalysisToggleFalse:
         client, mp = client_with_seed
         mp.setenv("USE_ANALYSIS_PROVIDER", "false")
         r = client.get("/list")
-        assert "<th>파일</th>" in r.text, "파일 컬럼이 사라지면 안 됨"
+        assert '<th class="file-col">파일</th>' in r.text, "파일 컬럼이 사라지면 안 됨"
 
     def test_list_cart_menu_exists(self, client_with_seed):
         """장바구니 버튼(btn-cart-menu)은 항상 유지."""
@@ -175,7 +175,7 @@ class TestAnalysisToggleTrue:
         client, mp = client_with_seed
         mp.setenv("USE_ANALYSIS_PROVIDER", "true")
         r = client.get("/list")
-        assert "<th>분석</th>" in r.text, "true일 때 분석 th가 없음"
+        assert '<th class="analysis-col">분석</th>' in r.text, "true일 때 분석 th가 없음"
 
     def test_pre_spec_analyze_button_present(self, client_with_seed):
         client, mp = client_with_seed

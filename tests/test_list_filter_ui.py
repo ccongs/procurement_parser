@@ -66,12 +66,14 @@ def _dates(html):
 
 def _range_state(html):
     form = _form(html)
-    select = re.search(r'<select\b[^>]*name="dt_range"[^>]*>(.*?)</select>', form, re.S)
-    assert select is not None
-    selected = [attrs["value"] for attrs in _attrs(select.group(1), "option") if "selected" in attrs]
-    assert len(selected) == 1
-    custom = next(attrs for _tag, attrs in _Tags(form).tags if attrs.get("id") == "list-custom-dates")
-    return selected[0], "hidden" in custom
+    range_input = _attrs(form, "input", name="dt_range", type="hidden")
+    assert len(range_input) == 1
+    active = next((
+        attrs["data-date-preset"]
+        for attrs in _attrs(form, "button")
+        if attrs.get("data-date-preset") and "is-active" in attrs.get("class", "").split()
+    ), None)
+    return range_input[0]["value"], active
 
 
 def _notice(no, kind, when=_META):
@@ -177,7 +179,7 @@ def test_cart_search_url_includes_cancelled_notices(client):
     assert response.status_code == 200
     assert _rows(response.text) == {"K-cncl"}
     assert _checked_kinds(response.text) == set(_KINDS)
-    assert _range_state(response.text) == ("custom", False)
+    assert _range_state(response.text) == ("custom", None)
 
 
 def test_pre_spec_cart_search_url_unchanged():
@@ -216,7 +218,7 @@ def test_list_preset_date_range_month_end(date_field, today, expected):
 
 
 def test_list_preset_ranges_data_matches_date_helper(client):
-    group = _attrs(client.get("/list").text, "fieldset", id="list-date-group")[0]
+    group = _attrs(client.get("/list").text, "div", id="list-date-group")[0]
     actual = json.loads(group["data-preset-ranges"])
     expected = {
         field: {
@@ -236,7 +238,7 @@ def test_list_preset_overrides_explicit_dates_and_filters_rows(client):
     response = client.get("/list", params={**_WIDE, "dt_range": "3m", "q": "RANGE-"})
     assert response.status_code == 200
     assert _dates(response.text) == ("2026-06-23", "2026-09-23")
-    assert _range_state(response.text) == ("3m", True)
+    assert _range_state(response.text) == ("3m", "3m")
     assert _rows(response.text) == {"RANGE-JULY"}
 
 
@@ -258,7 +260,9 @@ def test_list_date_range_defaults_legacy_urls_and_invalid_fallback(client, param
     response = client.get("/list", params=params)
     assert response.status_code == 200
     assert _dates(response.text) == expected
-    assert _range_state(response.text) == (selected, selected != "custom")
+    assert _range_state(response.text) == (
+        selected, selected if selected != "custom" else None
+    )
 
 
 def test_list_filter_summary_detail_order_and_single_form(client):
@@ -266,11 +270,24 @@ def test_list_filter_summary_detail_order_and_single_form(client):
     form = _form(html)
     summary, separator, detail = form.partition('<div class="filter-detail">')
     assert separator
-    fields = ["q", "date_field", "dt_range", "dt_from", "dt_to", "price_max", "page_size"]
-    positions = [summary.index(f'name="{name}"') for name in fields]
+    top_fields = ["q", "price_max", "page_size"]
+    positions = [summary.index(f'name="{name}"') for name in top_fields]
     assert positions == sorted(positions)
+    date_fields = ["date_field", "dt_from", "dt_to", "dt_range"]
+    date_positions = [summary.index(f'name="{name}"') for name in date_fields]
+    assert date_positions == sorted(date_positions)
     assert '<span class="flabel">공고명</span>' in summary
-    assert 'class="list-date-group"' in summary
+    assert "list-date-group" in summary
+    assert '<span class="list-group-label">공고/개찰일자</span>' in summary
+    assert _attrs(summary, "input", name="dt_from", type="date")
+    assert _attrs(summary, "input", name="dt_to", type="date")
+    assert [attrs["data-date-preset"] for attrs in _attrs(summary, "button") if attrs.get("data-date-preset")] == [
+        "today", "1m", "3m", "6m"
+    ]
+    assert _attrs(summary, "select", name="date_field")
+    assert not _attrs(summary, "select", name="dt_range")
+    assert "날짜지정" not in summary
+    assert not _attrs(summary, "fieldset", id="list-date-group")
     assert 'type="submit"' in summary
     assert "filter-toggle" in summary
     assert "btn-add-to-cart" in summary
@@ -280,11 +297,136 @@ def test_list_filter_summary_detail_order_and_single_form(client):
         assert f'name="{name}"' not in summary
     for label in ("공고명 제외 키워드", "공고종류", "배정예산 최소", "지난 개찰 포함", "수의계약제외"):
         assert label in detail
+    assert '<span class="list-group-label">공고종류</span>' in detail
+    assert '<span class="list-group-label">조회옵션</span>' in detail
+    assert not _attrs(detail, "fieldset")
+    kind_inputs = _attrs(detail, "input", name="kind")
+    assert [attrs["value"] for attrs in kind_inputs] == ["reg", "re", "chg", "cncl"]
+    assert [attrs["value"] for attrs in kind_inputs if "checked" in attrs] == ["reg", "re", "chg"]
+    assert _attrs(detail, "input", name="excl_privt", type="hidden", value="0")
     assert "배정예산 최대" in summary
     assert "추정가격 최대" not in summary
     assert "추정가격 최소" not in detail
     assert "<form" not in form
     assert html.count('action="/list"') == 1
+
+
+def test_list_price_inputs_format_commas_and_links_keep_numeric_values(client):
+    with main.SessionLocal() as session:
+        included = _notice("PRICE-COMMA-IN", "등록공고")
+        included.asign_bdgt_amt = 95_000_000
+        excluded = _notice("PRICE-COMMA-OUT", "등록공고")
+        excluded.asign_bdgt_amt = 110_000_000
+        more_included = [
+            _notice(f"PRICE-COMMA-{index:02d}", "등록공고") for index in range(1, 11)
+        ]
+        for notice in more_included:
+            notice.asign_bdgt_amt = 90_000_000
+        session.add_all([included, excluded, *more_included])
+        session.commit()
+
+    response = client.get(
+        "/list",
+        params={
+            **_WIDE,
+            "q": "PRICE-COMMA",
+            "price_min": "10,000,000",
+            "price_max": "100,000,000",
+            "sort": "asign_bdgt_amt_desc",
+        },
+    )
+    assert response.status_code == 200
+    assert "PRICE-COMMA-IN" in _rows(response.text)
+    assert "PRICE-COMMA-OUT" not in _rows(response.text)
+    form = _form(response.text)
+    for name, value in (("price_max", "100,000,000"), ("price_min", "10,000,000")):
+        attrs = _attrs(form, "input", name=name)[0]
+        assert attrs["type"] == "text"
+        assert attrs["inputmode"] == "numeric"
+        assert attrs["value"] == value
+        assert "price-comma" in attrs["class"].split()
+
+    sort_link = next(
+        attrs["href"] for attrs in _attrs(response.text, "a")
+        if "asign_bdgt_amt_asc" in attrs.get("href", "")
+    )
+    query = parse_qs(urlparse(sort_link).query)
+    assert query["price_min"] == ["10000000"]
+    assert query["price_max"] == ["100000000"]
+
+    paged = client.get(
+        "/list",
+        params={
+            **_WIDE,
+            "q": "PRICE-COMMA",
+            "price_min": "10,000,000",
+            "price_max": "100,000,000",
+            "page_size": 10,
+        },
+    )
+    assert paged.status_code == 200
+    page_two = next(
+        attrs["href"] for attrs in _attrs(paged.text, "a")
+        if parse_qs(urlparse(attrs.get("href", "")).query).get("page") == ["2"]
+    )
+    page_query = parse_qs(urlparse(page_two).query)
+    assert page_query["price_min"] == ["10000000"]
+    assert page_query["price_max"] == ["100000000"]
+
+
+def test_list_price_comma_script_targets_both_fields(client):
+    html = client.get("/list").text
+    assert html.count('class="price-comma"') == 2
+    assert "querySelectorAll('input.price-comma')" in html
+    assert "input.value.replace(/[^0-9]/g, '')" in html
+    assert r"rawDigits.replace(/^0+(?=\d)/, '')" in html
+    assert r"digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')" in html
+    assert "input.value !== formatted" in html
+    assert "input.setSelectionRange(caret, caret)" in html
+    assert "input.addEventListener('keydown'" in html
+    assert "function formatPrice(input, digitCount, forceCaret, stripLeadingZeros)" in html
+    assert "var digits = stripLeadingZeros ? rawDigits.replace(/^0+(?=\\d)/, '') : rawDigits;" in html
+    assert "formatPrice(input, digitCount);" in html
+    assert "formatPrice(input, digitCount, true)" in html
+    assert "input.addEventListener('change', function ()" in html
+    assert "formatPrice(input, digitCount, false, true)" in html
+    assert "document.querySelectorAll('.list-filter form')" in html
+    assert "form.addEventListener('submit', function ()" in html
+    assert "event.key !== 'Delete'" in html
+    assert "event.key === 'Delete' && input.value.charAt(cursor) === ','" in html
+    assert "digitCount = Math.max(0, digitCount - removedLeadingZeros)" in html
+
+
+@pytest.mark.parametrize(
+    "filter_params",
+    [{}, {"excl_kw": "{{filter_toggle}}", "excl_kw_set": "1"}],
+)
+def test_list_filter_toggle_marker_in_user_values_is_not_replaced(client, filter_params):
+    marker = "{{filter_toggle}}"
+    response = client.get(
+        "/list", params={**_WIDE, "q": marker, **filter_params}
+    )
+    assert response.status_code == 200
+    assert response.text.count('class="filter-toggle"') == 1
+    q_input = _attrs(_form(response.text), "input", name="q")[0]
+    assert q_input["value"] == marker
+
+
+def test_filter_toggle_button_attribute_is_escaped_once_on_both_routes(client):
+    expected = "document.getElementById(&#x27;filterCard&#x27;)"
+    for path in ("/list", "/pre-spec"):
+        html = client.get(path).text
+        assert expected in html
+        assert "&amp;#x27;filterCard" not in html
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "1e999", "-5"])
+def test_list_invalid_price_min_is_ignored_without_error(client, value):
+    response = client.get("/list", params={**_WIDE, "price_min": value})
+    assert response.status_code == 200
+    assert "K-reg" in _rows(response.text)
+    price_min = _attrs(_form(response.text), "input", name="price_min")[0]
+    assert price_min["value"] == ""
 
 
 def test_list_floating_labels_are_scoped_and_shared_field_css_unchanged(client):
@@ -296,11 +438,49 @@ def test_list_floating_labels_are_scoped_and_shared_field_css_unchanged(client):
     assert "font-size: 12px" in rule.group(1)
     assert "position: absolute" in rule.group(1)
     assert "background" in rule.group(1)
-    date_label = re.search(
-        r"\.list-filter \.list-date-group \.flabel\s*\{([^}]+)\}", main.BASE_CSS,
+    group_label = re.search(r"\.list-filter \.list-group-label\s*\{([^}]+)\}", main.BASE_CSS)
+    assert group_label is not None
+    assert "flex: 0 0 96px" in group_label.group(1)
+    assert "min-width: max-content" in group_label.group(1)
+    assert "font-weight: 600" in group_label.group(1)
+    assert "table.listtable > tbody > tr > td.budgetcell" in main.BASE_CSS
+    assert "white-space: nowrap" in re.search(
+        r"table\.listtable > tbody > tr > td\.budgetcell\s*\{([^}]+)\}", main.BASE_CSS
+    ).group(1)
+    assert ".list-filter .date-controls { flex: 1 1 100%; }" not in main.BASE_CSS
+    assert "clip-path: inset(50%)" in main.BASE_CSS
+    assert 'content: "✓"' in main.BASE_CSS
+    assert ":has(input:focus-visible)" in main.BASE_CSS
+    assert ".list-filter .list-filter-row.list-input-row { padding-left: 104px; box-sizing: border-box; }" in main.BASE_CSS
+    mobile_rules = re.search(
+        r"@media \(max-width: 700px\) \{(.*?)\n  \}", html, re.S
     )
-    assert date_label is not None
-    assert "background: #f8fafc" in date_label.group(1)
+    assert mobile_rules is not None
+    for rule in (
+        ".list-group-label { flex-basis: 80px; width: 80px; }",
+        ".list-row-controls { flex: 1 1 0; min-width: 0; }",
+        ".list-filter-row.list-input-row { padding-left: 0; }",
+        ".list-filter-row .kw-field { flex: 1 1 0; width: 100%; max-width: none; min-width: 0; }",
+        ".list-filter-row .field input { width: 100%; min-width: 0; box-sizing: border-box; }",
+    ):
+        assert rule in mobile_rules.group(1)
+    assert "@media (max-width: 480px)" in main.BASE_CSS
+    small_screen = re.search(
+        r"@media \(max-width: 480px\) \{(.*?)\n  \}", main.BASE_CSS, re.S
+    )
+    assert small_screen is not None
+    assert ".list-group-label { flex-basis: 80px; width: 80px; }" in small_screen.group(1)
+    assert "flex-basis: 72px" not in small_screen.group(1)
+    assert "min-width: 0; width: 100%" in small_screen.group(1)
+    list_html = client.get("/list").text
+    assert "<label class=\"field query-field\">" in list_html
+    assert "<label class=\"field price-max-field\">" in list_html
+    assert 'style="min-width:260px;"' not in list_html
+    assert 'style="min-width:190px;"' not in list_html
+    assert ".list-toggle-chip span { display: inline-flex; align-items: center; }" in main.BASE_CSS
+    assert ".list-toggle-chip span::before { content: \"✓\";" in main.BASE_CSS
+    assert ".list-filter .list-detail-rows .list-filter-row { margin: 0; }" in main.BASE_CSS
+    assert "table.listtable .col-chk input[type=checkbox] { padding: 0; margin: 0; }" in main.BASE_CSS
     check_header = re.search(
         r"table\.listtable > thead > tr > th:not\(\.col-chk\)\s*\{([^}]+)\}",
         main.BASE_CSS,
@@ -318,6 +498,18 @@ def test_list_floating_labels_are_scoped_and_shared_field_css_unchanged(client):
     for page in (pre_spec, client.get("/config").text):
         assert not any("list-filter" in attrs.get("class", "").split() for _tag, attrs in _Tags(page).tags)
         assert not _attrs(page, "select", name="dt_range")
+
+
+def test_list_detail_rows_render_single_shrinkable_grid_column(client):
+    html = client.get("/list").text
+
+    rows_rule = re.search(r"\.list-filter \.list-detail-rows\s*\{([^}]+)\}", html)
+    assert rows_rule is not None
+    assert "grid-template-columns: minmax(0, 1fr)" in rows_rule.group(1)
+
+    children_rule = re.search(r"\.list-filter \.list-detail-rows\s*>\s*\*\s*\{([^}]+)\}", html)
+    assert children_rule is not None
+    assert re.search(r"\bmin-width:\s*0\s*;", children_rule.group(1))
 
 
 @pytest.mark.parametrize(

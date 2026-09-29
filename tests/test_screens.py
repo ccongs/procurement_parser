@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+import json
 from datetime import datetime
 
 import pytest
@@ -301,10 +302,14 @@ def test_root_redirects_to_list(client):
 _WIDE = {"dt_from": "2000-01-01", "dt_to": "2099-12-31"}
 
 
-def _bid_times_header_parts(text: str) -> tuple[str, dict[str, tuple[str, bool]], tuple[str, str, str]]:
-    """목록 응답에서 입찰일시 헤더의 옵션과 방향 링크를 추출한다."""
+def _bid_time_header_parts(
+    text: str, heading: str = "공고일시"
+) -> tuple[str, dict[str, tuple[str, bool]], tuple[str, str, str]]:
+    """목록 응답에서 일시 헤더의 옵션과 방향 링크를 추출한다."""
     thead = text[text.index("<thead>"):text.index("</thead>")]
-    header_match = re.search(r'<th class="bidtimes-head">.*?</th>', thead)
+    header_match = re.search(
+        rf'<th class="bidtime-head bidtime-col [^"]+">{heading} .*?</th>', thead
+    )
     assert header_match is not None
     header = header_match.group(0)
     options = {
@@ -314,7 +319,7 @@ def _bid_times_header_parts(text: str) -> tuple[str, dict[str, tuple[str, bool]]
         )
     }
     direction_match = re.search(
-        r'<a class="sortcol bt-dir" href="([^"]+)" title="정렬 방향 전환">'
+        r'<a class="sortcol time-dir" href="([^"]+)" title="정렬 방향 전환">'
         r'<span class="([^"]+)">([^<]+)</span></a>',
         header,
     )
@@ -495,7 +500,7 @@ def test_list_korean_only_headers(client):
     assert "<th>공고명</th>" in resp.text
     assert "<th>공고번호</th>" not in resp.text
     assert "공고번호 / 공고명" not in resp.text
-    assert "<th>파일</th>" in resp.text
+    assert '<th class="file-col">파일</th>' in resp.text
     assert "bid_ntce_no</code>" not in resp.text  # /list 표 헤더에 영문 병기 없음
 
 
@@ -916,48 +921,96 @@ def test_parse_price():
     assert main._parse_price(None) is None
     assert main._parse_price("abc") is None
     assert main._parse_price("1234.0") == 1234
+    for invalid in ("inf", "-inf", "nan", "1e999", "-5", "9223372036854775808"):
+        assert main._parse_price(invalid) is None
+
+
+def test_new_database_seed_sets_default_budget_max(monkeypatch):
+    """신규 app_config 시드의 입찰 배정예산 상한은 1억이다."""
+    from app import db
+
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    local = sessionmaker(bind=engine, future=True)
+    monkeypatch.setattr(db, "SessionLocal", local)
+    try:
+        db._seed_app_config()
+        with local() as session:
+            cfg = session.get(AppConfig, 1)
+            assert cfg.presmpt_prce_bgn is None
+            assert cfg.presmpt_prce_end == "100000000"
+    finally:
+        engine.dispose()
 
 
 # --- 라우트 스모크: Phase 4.2 -----------------------------------------
 def test_list_header_sort_links_present(client):
-    """기본 정렬에서 입찰일시 기준 네 옵션과 공고 내림차순 방향을 표시한다."""
+    """기본 정렬에서 일시 헤더별 두 옵션과 방향 표시를 검증한다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    thead, options, (direction_url, arrow_class, arrow) = _bid_times_header_parts(resp.text)
-    assert "입찰일시" in thead
-    assert 'class="bt-sortfield"' in thead
+    thead, notice_options, (direction_url, arrow_class, arrow) = _bid_time_header_parts(resp.text)
+    assert "공고일시" in thead and "제출일시" in thead
+    assert "입찰일시" not in thead
+    assert 'class="bidtime-sortfield"' in thead
     assert 'autocomplete="off"' in thead
-    assert list(options) == ["공고", "개시", "마감", "개찰"]
-    assert options["공고"][1] is True
-    assert options["개시"][1] is False
-    assert options["마감"][1] is False
-    assert options["개찰"][1] is False
-    assert "sort=bid_ntce_dt_desc" in options["공고"][0]
-    assert "sort=bid_begin_dt_desc" in options["개시"][0]
-    assert "sort=bid_clse_dt_desc" in options["마감"][0]
-    assert "sort=openg_dt_desc" in options["개찰"][0]
+    assert list(notice_options) == ["게시", "개찰"]
+    assert notice_options["게시"][1] is True
+    assert notice_options["개찰"][1] is False
+    assert "sort=bid_ntce_dt_desc" in notice_options["게시"][0]
+    assert "sort=openg_dt_desc" in notice_options["개찰"][0]
     assert "sort=bid_ntce_dt_asc" in direction_url
     assert arrow_class == "arrow"
     assert arrow == "▼"
+    _, submit_options, (_submit_url, submit_arrow_class, submit_arrow) = _bid_time_header_parts(
+        resp.text, "제출일시"
+    )
+    assert list(submit_options) == ["시작", "마감"]
+    assert submit_options["시작"][1] is True
+    assert submit_options["마감"][1] is False
+    assert "sort=bid_begin_dt_desc" in submit_options["시작"][0]
+    assert "sort=bid_clse_dt_desc" in submit_options["마감"][0]
+    assert (submit_arrow_class, submit_arrow) == ("arrow neutral", "↕")
     assert "sort=asign_bdgt_amt_desc" in thead
     assert "sort=presmpt_prce_desc" not in thead
     # 정렬 select 는 검색폼에서 제거됨(헤더 클릭으로 대체).
     assert '<select name="sort"' not in resp.text
 
 
-def test_list_bid_times_header_openg_asc(client):
-    """개찰 오름차순이면 개찰 선택, ▲ 표시, 모든 옵션의 asc 방향을 유지한다."""
+def test_list_time_header_openg_asc(client):
+    """개찰 오름차순이면 공고일시 헤더가 개찰 선택과 ▲를 표시한다."""
     resp = client.get("/list", params={**_WIDE, "sort": "openg_dt_asc"})
     assert resp.status_code == 200
-    _thead, options, (direction_url, arrow_class, arrow) = _bid_times_header_parts(resp.text)
+    _thead, options, (direction_url, arrow_class, arrow) = _bid_time_header_parts(resp.text)
     assert options["개찰"][1] is True
-    assert "sort=bid_ntce_dt_asc" in options["공고"][0]
-    assert "sort=bid_begin_dt_asc" in options["개시"][0]
-    assert "sort=bid_clse_dt_asc" in options["마감"][0]
+    assert "sort=bid_ntce_dt_asc" in options["게시"][0]
     assert "sort=openg_dt_asc" in options["개찰"][0]
     assert "sort=openg_dt_desc" in direction_url
     assert arrow_class == "arrow"
     assert arrow == "▲"
+
+
+def test_list_bid_time_headers_keep_sort_state_within_each_column(client):
+    close = client.get("/list", params={**_WIDE, "sort": "bid_clse_dt_asc"})
+    assert close.status_code == 200
+    _, submit_options, (_url, submit_class, submit_arrow) = _bid_time_header_parts(
+        close.text, "제출일시"
+    )
+    _, notice_options, (_url, notice_class, notice_arrow) = _bid_time_header_parts(close.text)
+    assert submit_options["마감"][1] is True
+    assert (submit_class, submit_arrow) == ("arrow", "▲")
+    assert notice_options["게시"][1] is True
+    assert (notice_class, notice_arrow) == ("arrow neutral", "↕")
+
+    openg = client.get("/list", params={**_WIDE, "sort": "openg_dt_desc"})
+    assert openg.status_code == 200
+    _, notice_options, (_url, notice_class, notice_arrow) = _bid_time_header_parts(openg.text)
+    _, submit_options, (_url, submit_class, submit_arrow) = _bid_time_header_parts(
+        openg.text, "제출일시"
+    )
+    assert notice_options["개찰"][1] is True
+    assert (notice_class, notice_arrow) == ("arrow", "▼")
+    assert submit_options["시작"][1] is True
+    assert (submit_class, submit_arrow) == ("arrow neutral", "↕")
 
 
 def test_list_bid_begin_sort_nulls_last(client):
@@ -982,19 +1035,19 @@ def test_list_bid_begin_sort_nulls_last(client):
         )
         assert resp.status_code == 200
         assert re.findall(r'<tr data-row-id="([^"]+)">', resp.text) == expected
-        _thead, options, _direction = _bid_times_header_parts(resp.text)
-        assert options["개시"][1] is True
+        _thead, options, _direction = _bid_time_header_parts(resp.text, "제출일시")
+        assert options["시작"][1] is True
 
     for direction in ("desc", "asc"):
         assert client.get("/list", params={**_WIDE, "sort": f"bid_begin_dt_{direction}"}).status_code == 200
 
 
-def test_list_bid_times_header_neutral_on_price_sort(client):
-    """추정가격 정렬 중에는 공고 선택과 중립 화살표를 표시하고 옵션은 desc로 시작한다."""
+def test_list_time_header_neutral_on_price_sort(client):
+    """추정가격 정렬 중에는 게시 선택과 중립 화살표를 표시하고 옵션은 desc로 시작한다."""
     resp = client.get("/list", params={**_WIDE, "sort": "presmpt_prce_desc"})
     assert resp.status_code == 200
-    thead, options, (direction_url, arrow_class, arrow) = _bid_times_header_parts(resp.text)
-    assert options["공고"][1] is True
+    thead, options, (direction_url, arrow_class, arrow) = _bid_time_header_parts(resp.text)
+    assert options["게시"][1] is True
     assert all("_desc" in url for url, _selected in options.values())
     assert "sort=bid_ntce_dt_desc" in direction_url
     assert arrow_class == "arrow neutral"
@@ -1004,8 +1057,8 @@ def test_list_bid_times_header_neutral_on_price_sort(client):
     assert "추정가격" not in thead
 
 
-def test_list_bid_times_header_urls_preserve_filters_and_reset_page(client):
-    """입찰일시 옵션·방향 URL은 현재 필터를 보존하고 page=1로 초기화한다."""
+def test_list_time_header_urls_preserve_filters_and_reset_page(client):
+    """공고일시·제출일시 옵션과 방향 URL은 필터를 보존하고 page=1로 초기화한다."""
     from app import main as _main
 
     with _main.SessionLocal() as s:
@@ -1032,7 +1085,9 @@ def test_list_bid_times_header_urls_preserve_filters_and_reset_page(client):
     }
     resp = client.get("/list", params=params)
     assert resp.status_code == 200
-    _thead, options, (direction_url, _arrow_class, _arrow) = _bid_times_header_parts(resp.text)
+    _thead, options, (direction_url, _arrow_class, _arrow) = _bid_time_header_parts(
+        resp.text, "제출일시"
+    )
     for url, _selected in options.values():
         assert "q=필터보존" in url
         assert "dt_from=2000-01-01" in url
@@ -1047,19 +1102,18 @@ def test_list_bid_times_header_urls_preserve_filters_and_reset_page(client):
     assert "page=2" not in direction_url
 
 
-def test_list_bid_times_replaces_standalone_date_headers(client):
-    """목록 thead에는 통합 입찰일시만 있고 기존 날짜 단독 헤더는 없다."""
+def test_list_time_headers_are_split_into_notice_and_submission(client):
+    """목록 thead에는 공고일시·제출일시가 있고 예전 입찰일시 헤더는 없다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    thead, _options, _direction = _bid_times_header_parts(resp.text)
-    assert "입찰일시" in thead
-    assert "공고일시" not in thead
-    assert "입찰마감" not in thead
-    assert "개찰일시" not in thead
+    thead, _options, _direction = _bid_time_header_parts(resp.text)
+    assert "공고일시" in thead
+    assert "제출일시" in thead
+    assert "입찰일시" not in thead
 
 
-def test_list_bid_times_cell_four_lines_and_missing_close(client):
-    """입찰일시 셀은 공고→개시→마감→개찰 4줄과 시각 tooltip, NULL 대시를 표시한다."""
+def test_list_notice_and_submission_time_columns_show_two_fields_and_missing_values(client):
+    """공고일시와 제출일시를 각각 두 필드와 시각 툴팁으로 표시한다."""
     from app import main as _main
 
     base = datetime(2026, 6, 1, 12, 0)
@@ -1068,7 +1122,7 @@ def test_list_bid_times_cell_four_lines_and_missing_close(client):
             [
                 BidNotice(
                     bid_ntce_no="S-BT-FULL",
-                    bid_ntce_nm="입찰일시 렌더 전체",
+                    bid_ntce_nm="일시 분리 렌더 전체",
                     ntce_instt_nm="테스트기관",
                     bid_ntce_dt=datetime(2026, 9, 23, 10, 0),
                     bid_begin_dt=datetime(2026, 9, 24, 11, 30),
@@ -1079,7 +1133,7 @@ def test_list_bid_times_cell_four_lines_and_missing_close(client):
                 ),
                 BidNotice(
                     bid_ntce_no="S-BT-NULL",
-                    bid_ntce_nm="입찰일시 렌더 마감없음",
+                    bid_ntce_nm="일시 분리 렌더 NULL",
                     ntce_instt_nm="테스트기관",
                     bid_ntce_dt=datetime(2026, 9, 24, 9, 30),
                     bid_clse_dt=None,
@@ -1093,41 +1147,46 @@ def test_list_bid_times_cell_four_lines_and_missing_close(client):
 
     resp = client.get(
         "/list",
-        params={**_WIDE, "q": "입찰일시 렌더", "include_past": "1"},
+        params={**_WIDE, "q": "일시 분리 렌더", "include_past": "1"},
     )
     assert resp.status_code == 200
 
-    full_pos = resp.text.index("입찰일시 렌더 전체")
+    full_pos = resp.text.index("일시 분리 렌더 전체")
     full_row = resp.text[resp.text.rfind("<tr", 0, full_pos):resp.text.index("</tr>", full_pos)]
-    assert full_row.index("공고 : 2026-09-23") < full_row.index("개시 : 2026-09-24")
-    assert full_row.index("개시 : 2026-09-24") < full_row.index("마감 : 2026-10-03")
-    assert full_row.index("마감 : 2026-10-03") < full_row.index("개찰 : 2026-10-10")
+    assert full_row.index("게시 : 2026-09-23") < full_row.index("개찰 : 2026-10-10")
+    assert full_row.index("시작 : 2026-09-24") < full_row.index("마감 : 2026-10-03")
     assert 'title="2026-09-23 10:00"' in full_row
     assert 'title="2026-09-24 11:30"' in full_row
     assert 'title="2026-10-03 18:00"' in full_row
     assert 'title="2026-10-10 11:00"' in full_row
 
-    null_pos = resp.text.index("입찰일시 렌더 마감없음")
+    null_pos = resp.text.index("일시 분리 렌더 NULL")
     null_row = resp.text[resp.text.rfind("<tr", 0, null_pos):resp.text.index("</tr>", null_pos)]
-    assert '<span class="bt-line">개시 : -</span>' in null_row
+    assert '<span class="bt-line">게시 : -</span>' not in null_row
+    assert '<span class="bt-line">개찰 : -</span>' in null_row
+    assert '<span class="bt-line">시작 : -</span>' in null_row
     assert '<span class="bt-line">마감 : -</span>' in null_row
 
 
-def test_render_bid_times_string_fallback_and_escape():
+def test_render_list_time_cell_string_fallback_and_escape():
     """문자열 날짜는 앞 10자를 표시하고 title·본문의 HTML을 이스케이프한다."""
-    html = main._render_bid_times(
-        {
-            "bid_ntce_dt": "2026-09-23 10:00",
-            "bid_begin_dt": "2026-09-24 11:30",
-            "bid_clse_dt": None,
-            "openg_dt": '"><script>alert(1)</script>',
-        }
+    row = {
+        "bid_ntce_dt": "2026-09-23 10:00",
+        "bid_begin_dt": "2026-09-24 11:30",
+        "bid_clse_dt": None,
+        "openg_dt": '"><script>alert(1)</script>',
+    }
+    notice_html = main._render_list_time_cell(
+        row, main._LIST_TIME_FIELDS["notice_time"], "notice_times"
     )
-    assert 'title="2026-09-23 10:00">공고 : 2026-09-23</span>' in html
-    assert 'title="2026-09-24 11:30">개시 : 2026-09-24</span>' in html
-    assert '<span class="bt-line">마감 : -</span>' in html
-    assert "<script>" not in html
-    assert "&lt;script&gt;" in html
+    submit_html = main._render_list_time_cell(
+        row, main._LIST_TIME_FIELDS["submit_time"], "submit_times"
+    )
+    assert 'title="2026-09-23 10:00">게시 : 2026-09-23</span>' in notice_html
+    assert 'title="2026-09-24 11:30">시작 : 2026-09-24</span>' in submit_html
+    assert '<span class="bt-line">마감 : -</span>' in submit_html
+    assert "<script>" not in notice_html
+    assert "&lt;script&gt;" in notice_html
 
 
 def test_list_sort_bid_clse_dt_asc_nulls_last(client):
@@ -1154,21 +1213,21 @@ def test_list_sort_bid_clse_dt_asc_nulls_last(client):
     assert resp.text.index("마감정렬 둘째") < resp.text.index("마감정렬 미정")
 
 
-def test_list_bid_times_sort_change_uses_event_delegation():
-    """입찰일시 정렬 select는 복원값을 초기화하고 change 위임으로 이동한다."""
+def test_list_time_sort_change_uses_event_delegation():
+    """일시 정렬 select는 복원값을 초기화하고 change 위임으로 이동한다."""
     from app import main as _main
 
     assert "window.addEventListener('pageshow'" in _main._LIST_SCRIPT
-    assert "document.querySelectorAll('select.bt-sortfield')" in _main._LIST_SCRIPT
+    assert "document.querySelectorAll('select.bidtime-sortfield')" in _main._LIST_SCRIPT
     assert "option.selected = option.defaultSelected" in _main._LIST_SCRIPT
     assert "document.addEventListener('change'" in _main._LIST_SCRIPT
-    assert "e.target.matches('select.bt-sortfield')" in _main._LIST_SCRIPT
+    assert "e.target.matches('select.bidtime-sortfield')" in _main._LIST_SCRIPT
     assert "location.href = e.target.value" in _main._LIST_SCRIPT
 
 
 def test_render_ntce_kind_with_kind_and_bid_method():
     """공고종류와 입찰방식이 모두 있으면 kindcell 안에 두 줄을 렌더한다."""
-    html = main._render_ntce_kind("재공고", "일반경쟁입찰")
+    html = main._render_ntce_kind("재공고", "일반경쟁입찰", cell_class="kindcell")
     assert html.startswith('<td class="kindcell">')
     assert '<span class="badge warn">재공고</span>' in html
     assert '<span class="bidmethd" title="일반경쟁입찰">일반경쟁입찰</span>' in html
@@ -1176,14 +1235,14 @@ def test_render_ntce_kind_with_kind_and_bid_method():
 
 def test_render_ntce_kind_with_kind_only():
     """공고종류만 있으면 배지만 렌더한다."""
-    assert main._render_ntce_kind("등록공고", None) == (
+    assert main._render_ntce_kind("등록공고", None, cell_class="kindcell") == (
         '<td class="kindcell"><span class="badge">등록공고</span></td>'
     )
 
 
 def test_render_ntce_kind_with_bid_method_only():
     """입찰방식만 있으면 kindcell 안에 입찰방식 줄만 렌더한다."""
-    assert main._render_ntce_kind(None, "제한경쟁입찰") == (
+    assert main._render_ntce_kind(None, "제한경쟁입찰", cell_class="kindcell") == (
         '<td class="kindcell"><span class="bidmethd" title="제한경쟁입찰">'
         '제한경쟁입찰</span></td>'
     )
@@ -1191,12 +1250,12 @@ def test_render_ntce_kind_with_bid_method_only():
 
 def test_render_ntce_kind_empty():
     """공고종류와 입찰방식이 None·공백이면 대시 셀을 렌더한다."""
-    assert main._render_ntce_kind(None, "   ") == '<td class="kindcell">-</td>'
+    assert main._render_ntce_kind(None, "   ", cell_class="kindcell") == '<td class="kindcell">-</td>'
 
 
 def test_render_ntce_kind_escapes_bid_method():
     """입찰방식명의 title과 본문을 HTML 이스케이프한다."""
-    html = main._render_ntce_kind(None, '<일반&"경쟁>')
+    html = main._render_ntce_kind(None, '<일반&"경쟁>', cell_class="kindcell")
     escaped = "&lt;일반&amp;&quot;경쟁&gt;"
     assert f'title="{escaped}">{escaped}</span>' in html
     assert '<일반&"경쟁>' not in html
@@ -1228,9 +1287,9 @@ def test_list_renders_bid_method_name(client):
 
 
 def test_list_default_sort_is_latest(client):
-    """기본 정렬 = 최신 공고일(bid_ntce_dt_desc) — 입찰일시 공고에 ▼ 표시."""
+    """기본 정렬 = 최신 공고일(bid_ntce_dt_desc) — 공고일시 기준에 ▼ 표시."""
     resp = client.get("/list", params=_WIDE)
-    # 현재 정렬이 desc 이므로 입찰일시 공고 기준에 ▼ 화살표.
+    # 현재 정렬이 desc 이므로 공고일시 게시 기준에 ▼ 화살표.
     assert "▼" in resp.text
 
 
@@ -1407,8 +1466,8 @@ def test_list_price_default_from_config(client):
 
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    assert 'value="7000000"' in resp.text
-    assert 'value="8000000"' in resp.text
+    assert 'value="7,000,000"' in resp.text
+    assert 'value="8,000,000"' in resp.text
 
 
 # --- 라운드 2b: 배정예산·원 단위·기관 통합 셀 -------------------------
@@ -1469,7 +1528,9 @@ def test_list_budget_column_and_won(client):
     assert "공고/수요기관" in thead
     assert "추정가격" not in thead
     assert thead.index("공고/수요기관") < thead.index("배정예산")
-    assert thead.index("배정예산") < thead.index("입찰일시")
+    assert thead.index("배정예산") < thead.index("공고일시")
+    assert thead.index("공고일시") < thead.index("제출일시")
+    assert thead.index("제출일시") < thead.index("매칭업종")
     # 금액 `원` 단위(배정예산).
     assert '<td class="budgetcell">12,345,678 원</td>' in text
     assert "9,000,000 원" not in text
@@ -1670,7 +1731,7 @@ def test_sort_header_neutral_arrow_on_unsorted_column(client):
     """미정렬 컬럼에 ↕ 중립 화살표가, 현재 정렬 컬럼에 ▼/▲ 방향 화살표가 표시된다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    # 기본 정렬(bid_ntce_dt_desc) → 입찰일시 공고 ▼, 배정예산(미정렬) ↕
+    # 기본 정렬(bid_ntce_dt_desc) → 공고일시 게시 ▼, 배정예산(미정렬) ↕
     assert "▼" in resp.text
     assert "↕" in resp.text  # 미정렬 중립 화살표
 
@@ -1759,15 +1820,18 @@ def test_list_checkbox_no_parentheses(client):
     assert "기본은 개찰 지난 공고 숨김" not in resp.text
 
 
-def test_list_date_range_select_replaces_quick_buttons(client):
-    """/list 기간 select는 다섯 옵션을 제공하고 이전 날짜 단축 버튼은 제거한다."""
+def test_list_date_range_uses_hidden_value_and_quick_buttons(client):
+    """/list 날짜 프리셋 네 버튼과 상시 표시 날짜 입력을 확인한다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    select = re.search(r'<select\b[^>]*name="dt_range"[^>]*>(.*?)</select>', resp.text, re.S).group(1)
-    assert re.findall(r'<option value="([^"]+)"(?: selected)?>([^<]+)</option>', select) == [
-        ("today", "오늘"), ("1m", "1개월"), ("3m", "3개월"),
-        ("6m", "6개월"), ("custom", "날짜지정"),
-    ]
+    assert '<input type="hidden" name="dt_range" id="dt_range" value="custom">' in resp.text
+    assert not re.search(r'<select\b[^>]*name="dt_range"', resp.text)
+    assert re.findall(r'data-date-preset="([^"]+)"', resp.text) == ["today", "1m", "3m", "6m"]
+    assert 'class="is-active" data-date-preset="today"' not in resp.text
+    assert 'type="date" name="dt_from"' in resp.text
+    assert 'type="date" name="dt_to"' in resp.text
+    assert "날짜지정" not in resp.text
+    assert "list-custom-dates" not in resp.text
     assert "setToday" not in resp.text
     assert "setRecent" not in resp.text
 
@@ -1891,9 +1955,9 @@ def test_list_column_order(client):
     headers = re.findall(r"<th\b[^>]*>(.*?)</th>", thead)
     expected = [
         "구분", "낙찰방법", "공고명", "공고/수요기관",
-        "배정예산", "입찰일시", "매칭업종",
+        "배정예산", "공고일시", "제출일시", "매칭업종",
     ]
-    for header, label in zip(headers[2:9], expected, strict=True):
+    for header, label in zip(headers[2:10], expected, strict=True):
         assert label in header
     assert "추정가격" not in thead
     assert "<th>공고번호</th>" not in thead
@@ -1901,7 +1965,13 @@ def test_list_column_order(client):
     assert "공고기관/수요기관" not in thead
     assert 'id="chk-all"' in headers[0]
     assert headers[1] == "#"
-    assert headers[9] == "파일"
+    assert headers[10] == "파일"
+    assert '<th class="col-chk">' in thead
+    assert '<th class="rownum-col">#</th>' in thead
+    assert '<th class="kind-col kindhead">' in thead
+    assert 'class="bidtime-head bidtime-col notice_times"' in thead
+    assert 'class="bidtime-head bidtime-col submit_times"' in thead
+    assert '<th class="file-col">파일</th>' in thead
 
 
 @pytest.mark.parametrize("url", ['https://example.test/detail?a=1&b="2"', None])
@@ -1929,6 +1999,51 @@ def test_list_notice_cell_link_and_escape(client, url):
         assert "<a " not in cell
     assert '<공고&"명>' not in cell
     assert 'data-item-id="S-NTCE-&lt;&amp;&quot;"' in resp.text
+
+
+@pytest.mark.parametrize(
+    ("kind", "raw_json", "current", "expected"),
+    [
+        ("재공고", '{"befBidBbancNo":" R26-OLD "}', "R26-NEW", "R26-OLD"),
+        ("변경공고", '{"befBidBbancNo":"R26-OLD"}', "R26-NEW", "R26-OLD"),
+        ("등록공고", '{"befBidBbancNo":"R26-OLD"}', "R26-NEW", None),
+        ("재공고", '{"befBidBbancNo":"  "}', "R26-NEW", None),
+        ("재공고", '{bad json', "R26-NEW", None),
+        ("재공고", None, "R26-NEW", None),
+        ("재공고", "{}", "R26-NEW", None),
+        ("재공고", "[]", "R26-NEW", None),
+        ("재공고", '{"befBidBbancNo":"R26-NEW"}', "R26-NEW", None),
+    ],
+)
+def test_related_notice_number_helper(kind, raw_json, current, expected):
+    assert main._related_ntce_no(kind, raw_json, current) == expected
+
+
+def test_related_notice_number_is_escaped_in_notice_cell():
+    cell = main._render_ntce(
+        "R26-NEW",
+        "관련번호 이스케이프",
+        None,
+        kind="재공고",
+        raw_json=json.dumps({"befBidBbancNo": '<old&"no>'}),
+    )
+    assert 'R26-NEW - [&lt;old&amp;&quot;no&gt;]' in cell
+    assert '<old&"no>' not in cell
+
+
+def test_list_renders_related_notice_number_for_reannouncement(client):
+    notice = _bn("R26BK01743383", "관련공고 라우트 검증", datetime(2026, 5, 8), None)
+    notice.ntce_kind_nm = "재공고"
+    notice.raw_json = '{"befBidBbancNo":" R26BK01725789 "}'
+    with main.SessionLocal() as session:
+        session.add(notice)
+        session.commit()
+
+    response = client.get(
+        "/list", params={**_WIDE, "q": "관련공고 라우트", "include_past": "1"}
+    )
+    assert response.status_code == 200
+    assert "R26BK01743383 - [R26BK01725789]" in response.text
 
 
 @pytest.mark.parametrize(
@@ -2028,8 +2143,8 @@ def test_list_kind_alignment(client):
     )
     assert resp.status_code == 200
     assert 'data-row-id="S-KIND-EMPTY"' in resp.text
-    assert '<th class="kindhead">구분</th>' in resp.text
-    assert '<td class="kindcell">-</td>' in resp.text
+    assert '<th class="kind-col kindhead">구분</th>' in resp.text
+    assert '<td class="kind-col kindcell">-</td>' in resp.text
     cell_css = re.search(r"td\.kindcell\s*\{([^}]+)\}", main.BASE_CSS).group(1)
     assert "text-align: center" in cell_css
     assert "vertical-align: middle" in cell_css
@@ -2064,6 +2179,52 @@ def test_list_table_alignment_scoped_css(client):
     assert 'class="listtable"' not in client.get("/config").text
 
 
+def test_list_fixed_column_widths_and_nowrap_content(client, monkeypatch):
+    """정해진 값만 있는 목록 컬럼 폭과 배지·버튼 nowrap 규칙을 확인한다."""
+    monkeypatch.setattr(main, "analysis_enabled", lambda: True)
+    notice = _bn("S-FIXED-COLS", "고정폭 검증", datetime(2026, 5, 8), None)
+    notice.ntce_kind_nm = "변경공고"
+    notice.bid_methd_nm = "일반경쟁"
+    notice.ntce_spec_doc_url1 = "https://example.test/file"
+    with main.SessionLocal() as session:
+        session.add(notice)
+        session.commit()
+
+    response = client.get("/list", params={**_WIDE, "include_past": "1"})
+    assert response.status_code == 200
+    for cls, width in (
+        ("col-chk", 36),
+        ("rownum-col", 44),
+        ("kind-col", 96),
+        ("bidtime-col", 150),
+        ("file-col", 80),
+        ("analysis-col", 120),
+    ):
+        rule = re.search(rf"table\.listtable \.{cls}\s*\{{([^}}]+)\}}", main.BASE_CSS)
+        assert rule is not None
+        for property_name in ("width", "min-width", "max-width"):
+            assert f"{property_name}: {width}px" in rule.group(1)
+        class_sets = [
+            attrs.split() for attrs in re.findall(r'class="([^"]+)"', response.text)
+        ]
+        assert any(cls in classes for classes in class_sets)
+    badge_rule = re.search(r"(?m)^\s*\.badge\s*\{([^}]+)\}", main.BASE_CSS)
+    assert badge_rule is not None and "white-space: nowrap" in badge_rule.group(1)
+    for selector in (
+        "table.listtable .sucsfcell",
+        "table.listtable button.filebtn",
+        "table.listtable button.btn-analyze",
+        "table.listtable .analysis-actions button",
+    ):
+        assert selector in main.BASE_CSS
+    assert re.search(
+        r"table\.listtable \.sucsfcell, table\.listtable button\.filebtn,\s*"
+        r"table\.listtable button\.btn-analyze, table\.listtable \.analysis-actions button\s*"
+        r"\{[^}]*white-space: nowrap",
+        main.BASE_CSS,
+    )
+
+
 def _seed_budgets(session):
     """날짜·추정가격과 다른 배정예산 순서 및 NULL을 가진 공고를 생성한다."""
     for i, (suffix, budget, price) in enumerate(
@@ -2095,7 +2256,7 @@ def test_sort_budget_nulls_last(session, direction, expected):
      ("asc", ["LOW", "MID", "HIGH", "NULL"], "desc", "▲")],
 )
 def test_list_budget_sort_nulls_last_and_header(client, direction, expected, next_direction, arrow):
-    """라우트의 예산 정렬·NULL 후순위와 헤더 토글·입찰일시 비활성 상태를 검증한다."""
+    """라우트의 예산 정렬·NULL 후순위와 헤더 토글·일시 헤더 중립 상태를 검증한다."""
     with main.SessionLocal() as s:
         _seed_budgets(s)
     resp = client.get(
@@ -2105,18 +2266,18 @@ def test_list_budget_sort_nulls_last_and_header(client, direction, expected, nex
     assert re.findall(r'<tr data-row-id="([^"]+)">', resp.text) == [
         f"S-BUD-{suffix}" for suffix in expected
     ]
-    thead, options, (direction_url, arrow_class, time_arrow) = _bid_times_header_parts(resp.text)
+    thead, options, (direction_url, arrow_class, time_arrow) = _bid_time_header_parts(resp.text)
     budget_header = next(h for h in re.findall(r"<th\b[^>]*>.*?</th>", thead) if "배정예산" in h)
     assert f"sort=asign_bdgt_amt_{next_direction}" in budget_header
     assert f'<span class="arrow">{arrow}</span>' in budget_header
     assert "q=배정예산정렬" in budget_header
     assert "page=1" in budget_header
-    assert options["공고"][1] is True
+    assert options["게시"][1] is True
     assert "sort=bid_ntce_dt_desc" in direction_url
     assert (arrow_class, time_arrow) == ("arrow neutral", "↕")
 
 
-@pytest.mark.parametrize(("enabled", "column_count"), [(True, 11), (False, 10)])
+@pytest.mark.parametrize(("enabled", "column_count"), [(True, 12), (False, 11)])
 def test_list_column_count_with_analysis_toggle(client, monkeypatch, enabled, column_count):
     """분석 토글에 따른 실제 헤더·셀 수와 분석 버튼의 colspan이 일치한다."""
     monkeypatch.setattr(main, "analysis_enabled", lambda: enabled)

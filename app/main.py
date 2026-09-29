@@ -19,6 +19,7 @@ import html
 import io
 import json
 import logging
+import math
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime
@@ -611,7 +612,8 @@ BASE_CSS = """
   .muted { color: #8a93a2; font-size: 13px; }
   .note { font-size: 12px; color: #6b7280; background: #f0f3f8; border-left: 3px solid #9bb0cf;
           padding: 8px 12px; border-radius: 4px; margin: 8px 0; }
-  .badge { font-size: 12px; padding: 3px 9px; border-radius: 20px; background: #eef1f6; color: #4a5568; }
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 20px; background: #eef1f6; color: #4a5568;
+           white-space: nowrap; }
   .badge.ok { background: #e3f5e9; color: #1d7a43; }
   .badge.warn { background: #fdf3df; color: #97720d; }
   .badge.err { background: #fde3e1; color: #b02a25; }
@@ -635,23 +637,34 @@ BASE_CSS = """
   /* /list 표: 데이터는 세로 가운데, 헤더는 왼쪽, 배정예산만 오른쪽 정렬 */
   table.listtable > tbody > tr > td { vertical-align: middle; }
   table.listtable > thead > tr > th:not(.col-chk) { text-align: left; vertical-align: middle; }
-  table.listtable > tbody > tr > td.budgetcell { text-align: right; }
+  table.listtable > tbody > tr > td.budgetcell { text-align: right; white-space: nowrap; }
   /* 매칭업종은 코드만 표시하고 콤마 뒤에서 줄바꿈 허용 */
   table.listtable td.matchind { max-width: 240px; }
   table.listtable .indcode { white-space: nowrap; }
+  /* /list 내용 폭이 일정한 컬럼은 가로 스크롤 안에서 px 폭을 유지한다. */
+  table.listtable .col-chk { width: 36px; min-width: 36px; max-width: 36px; text-align: center; }
+  table.listtable .col-chk input[type=checkbox] { padding: 0; margin: 0; }
+  table:not(.listtable) .col-chk { width: 36px; }
+  table.listtable .rownum-col { width: 44px; min-width: 44px; max-width: 44px; }
+  table.listtable .kind-col { width: 96px; min-width: 96px; max-width: 96px; }
+  table.listtable .bidtime-col { width: 150px; min-width: 150px; max-width: 150px; }
+  table.listtable .file-col { width: 80px; min-width: 80px; max-width: 80px; }
+  table.listtable .analysis-col { width: 120px; min-width: 120px; max-width: 120px; }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
-  td.kindcell { max-width: 150px; text-align: center; vertical-align: middle; }
+  td.kindcell { text-align: center; vertical-align: middle; }
   td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
                           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* 공고번호/공고명 통합 셀: 기존 글꼴·링크 스타일을 유지하고 두 줄로 표시 */
   td.ntcecell .ntceno, td.ntcecell .ntcenm { display: block; }
   td.ntcecell .ntceno { margin-bottom: 4px; }
   td.ntcecell .ntcenm { width: fit-content; }
-  /* 입찰일시 통합 셀·헤더: 공고/개시/마감/개찰을 세로로 표시하고 정렬 기준을 헤더에서 선택 */
-  td.bidtimes, th.bidtimes-head { white-space: nowrap; }
-  td.bidtimes .bt-line { display: block; line-height: 1.45; }
-  th.bidtimes-head .bt-sortfield { margin-left: 4px; padding: 1px 2px; font-size: 12px; }
-  th.bidtimes-head .bt-dir { margin-left: 2px; }
+  /* 공고일시·제출일시는 각 두 줄이며 정렬 기준을 헤더에서 선택한다. */
+  td.bidtime-cell, th.bidtime-head { white-space: nowrap; }
+  td.bidtime-cell .bt-line { display: block; line-height: 1.45; }
+  th.bidtime-head .bidtime-sortfield { margin-left: 2px; padding: 1px 0; font-size: 12px; max-width: 58px; }
+  th.bidtime-head .time-dir { margin-left: 2px; }
+  table.listtable .sucsfcell, table.listtable button.filebtn,
+  table.listtable button.btn-analyze, table.listtable .analysis-actions button { white-space: nowrap; }
   /* 공고기관/수요기관 통합 셀: 위=공고기관(옅은 회색), 아래=수요기관(기본색), 세로 간격 ≥4px */
   td.insttcell { max-width: 260px; }
   td.insttcell .ntcorg, td.insttcell .dmnorg { display: block; overflow: hidden;
@@ -688,16 +701,66 @@ BASE_CSS = """
   .list-filter .field, .list-filter .kw-field { position: relative; padding-top: 7px; }
   .list-filter .flabel { position: absolute; top: 0; left: 8px; z-index: 1;
                          margin: 0; padding: 0 4px; background: #fff; font-size: 12px;
-                         line-height: 14px; }
-  .list-filter .list-date-group .flabel { background: #f8fafc; }
+                         line-height: 14px; white-space: nowrap; }
   .list-filter .field input, .list-filter .field select { background: #fff; }
-  .list-filter .list-date-group { display: flex; gap: 10px; align-items: flex-end;
-                                  flex-wrap: wrap; margin: 0; padding: 8px 10px 10px;
-                                  background: #f8fafc; }
-  .list-filter .list-custom-dates { display: flex; gap: 10px; align-items: flex-end; }
-  .list-filter .list-custom-dates[hidden] { display: none; }
-  .list-filter .list-kind-group { margin: 0 0 12px; padding: 8px 10px; }
-  .list-filter .list-kind-group .chk { padding-bottom: 0; }
+  .list-filter .filter-summary { display: block; padding: 10px 16px; }
+  .list-filter .list-summary-main { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .list-filter .list-filter-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0 0; }
+  .list-filter .list-group-label { flex: 0 0 96px; width: 96px; min-width: max-content;
+                                   font-size: 13px; font-weight: 600; line-height: 1.35; white-space: nowrap; }
+  .list-filter .list-summary-main .query-field { min-width: 260px; }
+  .list-filter .list-summary-main .price-max-field { min-width: 190px; }
+  .list-filter .list-row-controls { display: flex; flex: 1 1 320px; min-width: 0; gap: 8px;
+                                    align-items: center; flex-wrap: wrap; }
+  .list-filter .date-controls, .list-filter .preset-buttons { display: flex; gap: 6px; align-items: center;
+                                                               flex-wrap: wrap; }
+  .list-filter .date-controls input, .list-filter .date-controls select { min-width: 0; }
+  .list-filter .preset-buttons button { border: 1px solid #cbd2dc; background: #fff; color: #4a5568;
+                                       padding: 6px 10px; border-radius: 6px; font-size: 13px; cursor: pointer;
+                                       white-space: nowrap; }
+  .list-filter .preset-buttons button:hover { background: #eef1f6; }
+  .list-filter .preset-buttons button.is-active { background: #1f3a5f; border-color: #1f3a5f;
+                                                  color: #fff; font-weight: 600; }
+  .list-filter .list-toggle-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
+                                   border: 1px solid #cbd2dc; border-radius: 18px; background: #fff;
+                                   font-size: 13px; cursor: pointer; white-space: nowrap; position: relative; }
+  .list-filter .list-toggle-chip:has(input:checked) { border-color: #1f3a5f; background: #eaf0f8;
+                                                      color: #1f3a5f; font-weight: 600; }
+  .list-filter .list-toggle-chip input[type=checkbox] { position: absolute; width: 1px; height: 1px;
+      padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%);
+      white-space: nowrap; border: 0; }
+  .list-filter .list-toggle-chip span { display: inline-flex; align-items: center; }
+  .list-filter .list-toggle-chip span::before { content: "✓"; display: inline-flex; flex: 0 0 14px;
+      width: 14px; height: 14px;
+      margin-right: 6px; align-items: center; justify-content: center; border: 1px solid #9aa5b5;
+      border-radius: 3px; background: #fff; color: transparent; box-sizing: border-box;
+      font-size: 11px; line-height: 1; }
+  .list-filter .list-toggle-chip:has(input:checked) span::before { content: "✓"; border-color: #1f3a5f;
+      background: #1f3a5f; color: #fff; }
+  .list-filter .list-toggle-chip:has(input:focus-visible) { outline: 2px solid #2767b1; outline-offset: 2px; }
+  .list-filter .list-detail-rows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .list-filter .list-detail-rows > * { min-width: 0; }
+  .list-filter .list-detail-rows .list-filter-row { margin: 0; }
+  .list-filter .list-filter-row.list-input-row { padding-left: 104px; box-sizing: border-box; }
+  .list-filter .list-filter-row .kw-field { flex: 1 1 360px; min-width: 220px; }
+  .list-filter .list-filter-row .kw-box { background: #fff; }
+  .list-filter .kw-chip, .list-filter .kw-chip-x, .list-filter .kw-opt, .list-filter .filter-toggle,
+  .list-filter .kw-sum, .list-filter #btn-add-to-cart { white-space: nowrap; }
+  @media (max-width: 700px) {
+    .list-filter .list-group-label { flex-basis: 80px; width: 80px; }
+    .list-filter .list-row-controls { flex: 1 1 0; min-width: 0; }
+    .list-filter .list-filter-row.list-input-row { padding-left: 0; }
+    .list-filter .list-filter-row .kw-field { flex: 1 1 0; width: 100%; max-width: none; min-width: 0; }
+    .list-filter .list-filter-row .kw-box { width: 100%; min-width: 0; box-sizing: border-box; }
+    .list-filter .list-filter-row .kw-input { min-width: 0; }
+    .list-filter .list-filter-row .field { flex: 1 1 0; min-width: 0; }
+    .list-filter .list-filter-row .field input { width: 100%; min-width: 0; box-sizing: border-box; }
+  }
+  @media (max-width: 480px) {
+    .list-filter .list-group-label { flex-basis: 80px; width: 80px; }
+    .list-filter .list-summary-main .query-field,
+    .list-filter .list-summary-main .price-max-field { min-width: 0; width: 100%; }
+  }
   .list-card-heading { display: flex; justify-content: space-between; align-items: center;
                         flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
   .list-card-heading h2 { margin: 0; }
@@ -789,7 +852,7 @@ BASE_CSS = """
                background: #2E7D32; color: #fff; padding: 10px 20px; border-radius: 8px;
                font-size: 13px; display: none; z-index: 70; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
   /* 장바구니 체크박스 컬럼 */
-  .col-chk { width: 36px; text-align: center; }
+  .col-chk { text-align: center; }
   .col-chk input[type=checkbox] { cursor: pointer; width: 16px; height: 16px; }
   /* 담기 버튼 (필터 summary 우측) */
   .btn-cart-add {
@@ -849,22 +912,24 @@ BASE_CSS = """
              max-height: 220px; overflow-y: auto; padding: 4px; z-index: 40; }
   .kw-menu[hidden] { display: none; }
   .kw-opt { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
-            border: 0; background: transparent; color: #1f2430; text-align: left; font-size: 12px;
+            min-width: 0; border: 0; background: transparent; color: #1f2430; text-align: left; font-size: 12px;
             padding: 6px 8px; border-radius: 5px; cursor: pointer; }
+  .kw-opt-text { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .kw-opt:hover { background: #eef1f6; }
   .kw-opt[hidden] { display: none; }
   .kw-opt.is-default { color: #97720d; }                       /* 기본 적용 키워드 = warning */
   .kw-opt.is-selected { background: #e3f5e9; color: #1d7a43; font-weight: 600; }  /* 적용 중 = success */
   .kw-opt.is-selected:hover { background: #d8f0df; }
-  .kw-opt .kw-opt-mark { font-size: 11px; visibility: hidden; }
+  .kw-opt .kw-opt-mark { flex: 0 0 auto; font-size: 11px; visibility: hidden; }
   .kw-opt.is-selected .kw-opt-mark { visibility: visible; }
   .kw-menu-empty { font-size: 12px; color: #8a93a2; padding: 6px 8px; }
   .kw-menu-empty[hidden] { display: none; }
   .kw-chip { display: inline-flex; align-items: center; gap: 2px; background: #eef3fb; color: #1f3a5f;
              border: 1px solid #b6c6df; border-radius: 14px; padding: 2px 4px 2px 10px; font-size: 12px;
-             white-space: nowrap; }
+             max-width: 100%; min-width: 0; white-space: nowrap; }
+  .kw-chip-text { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .kw-chip-x { border: 0; background: transparent; color: #4a5568; cursor: pointer; font-size: 14px;
-               line-height: 1; padding: 0 4px; }
+               flex-shrink: 0; line-height: 1; padding: 0 4px; }
   .kw-chip-x:hover { color: #b02a25; }
   .kw-input { border: 0; outline: none; padding: 4px 2px; font-size: 13px; min-width: 110px; flex: 1 1 110px; }
   .kw-confirm { display: inline-flex; gap: 4px; }
@@ -980,7 +1045,9 @@ _NTCE_KIND_BADGE: dict[str, str] = {
 }
 
 
-def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
+def _render_ntce_kind(
+    value: Any, bid_methd: Any = None, *, cell_class: str
+) -> str:
     """'구분' 셀: 위=공고종류명(ntceKindNm) 배지, 아래=입찰방식명(bidMethdNm) 텍스트.
 
     입찰방식명은 배지가 아니라 옅은 회색 텍스트 한 줄로만 표시한다.
@@ -988,8 +1055,9 @@ def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
     """
     s = "" if value is None else str(value).strip()
     m = "" if bid_methd is None else str(bid_methd).strip()
+    td_class = _e(cell_class)
     if not s and not m:
-        return '<td class="kindcell">-</td>'
+        return f'<td class="{td_class}">-</td>'
     lines = []
     if s:
         cls = _NTCE_KIND_BADGE.get(s, "")
@@ -997,7 +1065,7 @@ def _render_ntce_kind(value: Any, bid_methd: Any = None) -> str:
         lines.append(f'<span class="{cls_attr}">{_e(s)}</span>')
     if m:
         lines.append(f'<span class="bidmethd" title="{_e(m)}">{_e(m)}</span>')
-    return f'<td class="kindcell">{"".join(lines)}</td>'
+    return f'<td class="{td_class}">{"".join(lines)}</td>'
 
 
 def _sucsfbid_mthd_short(value: Any) -> str:
@@ -1016,17 +1084,16 @@ _LIST_COLUMNS: list[tuple[str, str, str]] = [
     ("bid_ntce_no", "ntce", "공고명"),
     ("ntce_instt_nm", "instt", "공고/수요기관"),
     ("asign_bdgt_amt", "amt", "배정예산"),
-    ("bid_times", "bidtimes", "입찰일시"),
+    ("notice_times", "notice_time", "공고일시"),
+    ("submit_times", "submit_time", "제출일시"),
     ("matched_indstryty_cds", "matchind", "매칭업종"),
 ]
 
-# 입찰일시 통합 셀의 실제 컬럼과 표시 라벨. 셀·헤더 모두 이 순서를 공유한다.
-_BID_TIME_FIELDS: list[tuple[str, str]] = [
-    ("bid_ntce_dt", "공고"),
-    ("bid_begin_dt", "개시"),
-    ("bid_clse_dt", "마감"),
-    ("openg_dt", "개찰"),
-]
+# 공고일시·제출일시 셀의 필드와 표시 라벨. 셀·헤더별로 두 필드만 공유한다.
+_LIST_TIME_FIELDS: dict[str, list[tuple[str, str]]] = {
+    "notice_time": [("bid_ntce_dt", "게시"), ("openg_dt", "개찰")],
+    "submit_time": [("bid_begin_dt", "시작"), ("bid_clse_dt", "마감")],
+}
 
 # 컬럼 헤더 클릭 정렬이 가능한 컬럼 → 정렬 sort 키 접두(asc/desc 토글에 사용).
 _SORTABLE_COLUMNS: dict[str, str] = {
@@ -1034,7 +1101,7 @@ _SORTABLE_COLUMNS: dict[str, str] = {
 }
 
 # /list 정렬 허용값(repository._SORT_COLUMNS 와 동일). 미허용·빈값은 기본으로 폴백.
-# 입찰일시 통합 헤더에서 공고/개시/마감/개찰 네 필드의 방향을 선택한다.
+# 공고일시·제출일시 헤더에서 각 컬럼의 두 필드 방향을 선택한다.
 # 추정가격 정렬은 화면 헤더 없이 기존 북마크 URL 호환을 위해 유지한다.
 _LIST_SORTS: frozenset[str] = frozenset(
     {
@@ -1057,7 +1124,7 @@ _DEFAULT_SORT = "bid_ntce_dt_desc"
 _LIST_KINDS = {"reg": "등록공고", "re": "재공고", "chg": "변경공고", "cncl": "취소공고"}
 _LIST_DEFAULT_KINDS = ("reg", "re", "chg")
 _LIST_DATE_RANGES = (("today", "오늘"), ("1m", "1개월"), ("3m", "3개월"),
-                     ("6m", "6개월"), ("custom", "날짜지정"))
+                     ("6m", "6개월"), ("custom", "직접입력"))
 
 # 첨부 URL 컬럼명(파일 개수 계산·파일 목록 추출에 재사용).
 _SPEC_URL_COLUMNS: list[str] = [f"ntce_spec_doc_url{i}" for i in range(1, 11)]
@@ -1128,10 +1195,34 @@ def _render_matched_inds(csv: Any) -> str:
     return f'<td class="matchind">[{",<wbr>".join(spans)}]</td>'
 
 
-def _render_ntce(no: Any, name: Any, url: Any) -> str:
-    """공고번호/공고명 통합 셀. 없는 값은 대시, 상세 URL이 있으면 공고명은 링크."""
+def _related_ntce_no(kind: Any, raw_json: Any, bid_ntce_no: Any) -> str | None:
+    """재공고·변경공고 원문에서 공백·중복이 아닌 이전 공고번호를 읽는다."""
+    if kind not in {"재공고", "변경공고"} or not raw_json:
+        return None
+    try:
+        item = json.loads(str(raw_json))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(item, dict):
+        return None
+    related = item.get("befBidBbancNo")
+    related_no = "" if related is None else str(related).strip()
+    current_no = "" if bid_ntce_no is None else str(bid_ntce_no).strip()
+    if not related_no or related_no == current_no:
+        return None
+    return related_no
+
+
+def _render_ntce(
+    no: Any, name: Any, url: Any, *, kind: Any = None, raw_json: Any = None
+) -> str:
+    """공고번호/공고명 통합 셀. 관련공고번호와 상세 링크를 조건에 따라 표시한다."""
     number = "" if no is None else str(no).strip()
     name = "" if name is None else str(name).strip()
+    related = _related_ntce_no(kind, raw_json, no)
+    number_line = _e(number or "-")
+    if related:
+        number_line += f" - [{_e(related)}]"
     text = _e(name or "-")
     if url:
         name_line = (
@@ -1141,7 +1232,7 @@ def _render_ntce(no: Any, name: Any, url: Any) -> str:
     else:
         name_line = f'<span class="ntcenm">{text}</span>'
     return (
-        f'<td class="ntcecell"><span class="ntceno">{_e(number or "-")}</span>'
+        f'<td class="ntcecell"><span class="ntceno">{number_line}</span>'
         f'{name_line}</td>'
     )
 
@@ -1161,10 +1252,12 @@ def _render_instt(ntce: Any, dmin: Any) -> str:
     return f'<td class="insttcell">{"".join(lines)}</td>'
 
 
-def _render_bid_times(row: dict[str, Any]) -> str:
-    """입찰일시 통합 셀. 공고/개시/마감/개찰 날짜를 고정 순서의 네 줄로 표시한다."""
+def _render_list_time_cell(
+    row: dict[str, Any], fields: list[tuple[str, str]], column_class: str
+) -> str:
+    """공고일시 또는 제출일시를 날짜 두 줄로 표시하고 원문 시각을 툴팁에 둔다."""
     lines = []
-    for field, label in _BID_TIME_FIELDS:
+    for field, label in fields:
         full = _fmt_dt(row.get(field))
         if full:
             lines.append(
@@ -1173,7 +1266,7 @@ def _render_bid_times(row: dict[str, Any]) -> str:
             )
         else:
             lines.append(f'<span class="bt-line">{_e(label)} : -</span>')
-    return f'<td class="bidtimes">{"".join(lines)}</td>'
+    return f'<td class="bidtime-cell bidtime-col {_e(column_class)}">{"".join(lines)}</td>'
 
 
 def _sort_header(
@@ -1211,17 +1304,24 @@ def _sort_header(
     )
 
 
-def _bid_times_header(header: str, sort: str, qs: dict[str, str]) -> str:
-    """입찰일시 정렬 기준 select와 현재 방향을 토글하는 링크를 렌더한다."""
+def _bid_time_header(
+    header: str,
+    sort: str,
+    qs: dict[str, str],
+    fields: list[tuple[str, str]],
+    column_class: str,
+) -> str:
+    """일시 컬럼의 두 정렬 기준 select와 현재 방향을 토글하는 링크를 렌더한다."""
+    field_names = {field for field, _label in fields}
     active_field = next(
-        (field for field, _label in _BID_TIME_FIELDS if sort in (f"{field}_asc", f"{field}_desc")),
+        (field for field in field_names if sort in (f"{field}_asc", f"{field}_desc")),
         None,
     )
-    selected_field = active_field or _BID_TIME_FIELDS[0][0]
+    selected_field = active_field or fields[0][0]
     direction = "asc" if active_field and sort.endswith("_asc") else "desc"
 
     options = []
-    for field, label in _BID_TIME_FIELDS:
+    for field, label in fields:
         option_sort = f"{field}_{direction}"
         params = {**qs, "sort": option_sort, "page": "1"}
         query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
@@ -1243,10 +1343,10 @@ def _bid_times_header(header: str, sort: str, qs: dict[str, str]) -> str:
     query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
 
     return (
-        f'<th class="bidtimes-head">{_e(header)} '
-        '<select class="bt-sortfield" autocomplete="off" aria-label="입찰일시 정렬 기준">'
+        f'<th class="bidtime-head bidtime-col {_e(column_class)}">{_e(header)} '
+        f'<select class="bidtime-sortfield" autocomplete="off" aria-label="{_e(header)} 정렬 기준">'
         f'{"".join(options)}</select> '
-        f'<a class="sortcol bt-dir" href="/list?{query}" title="정렬 방향 전환">'
+        f'<a class="sortcol time-dir" href="/list?{query}" title="정렬 방향 전환">'
         f'<span class="{arrow_class}">{arrow}</span></a></th>'
     )
 
@@ -1275,6 +1375,7 @@ def _render_analysis_cell(
     source_name: str,
     total_cols: int,
     status: str,
+    cell_class: str = "",
 ) -> str:
     """분석 상태별 목록 셀을 렌더한다."""
     safe_status = status if status in {"none", "analyzing", "done", "error"} else "none"
@@ -1285,14 +1386,15 @@ def _render_analysis_cell(
         total_cols=total_cols,
         status=safe_status,
     )
+    td_open = f'<td class="{_e(cell_class)}">' if cell_class else "<td>"
     if safe_status == "analyzing":
         return (
-            f'<td><button type="button" class="btn-analyze is-analyzing" {attrs} '
+            f'{td_open}<button type="button" class="btn-analyze is-analyzing" {attrs} '
             f'disabled aria-label="제안요청서 분석">분석중</button></td>'
         )
     if safe_status == "done":
         return (
-            f'<td><div class="analysis-actions" {attrs}>'
+            f'{td_open}<div class="analysis-actions" {attrs}>'
             f'<button type="button" class="btn-analyze is-done" data-action="view" '
             f'aria-label="분석 결과 보기">분석완료</button>'
             f'<button type="button" class="btn-analyze is-done analysis-menu-toggle" '
@@ -1305,7 +1407,7 @@ def _render_analysis_cell(
         )
     if safe_status == "error":
         return (
-            f'<td><div class="analysis-actions" {attrs}>'
+            f'{td_open}<div class="analysis-actions" {attrs}>'
             f'<button type="button" class="btn-analyze analysis-menu-toggle" '
             f'aria-label="분석 메뉴" aria-expanded="false">재분석 ▾</button>'
             f'<div class="analysis-menu" role="menu">'
@@ -1314,7 +1416,7 @@ def _render_analysis_cell(
             f'</div></div></td>'
         )
     return (
-        f'<td><div class="analysis-actions" {attrs}>'
+        f'{td_open}<div class="analysis-actions" {attrs}>'
         f'<button type="button" class="btn-analyze analysis-menu-toggle" '
         f'aria-label="분석 메뉴" aria-expanded="false">분석 ▾</button>'
         f'<div class="analysis-menu" role="menu">'
@@ -1337,18 +1439,20 @@ def _render_list_rows(
     chk_head = '<th class="col-chk"><input type="checkbox" id="chk-all" title="전체선택"></th>'
     head_cells = []
     for col, kind, header in _LIST_COLUMNS:
-        if kind == "bidtimes":
-            head_cells.append(_bid_times_header(header, sort, qs))
+        if kind in _LIST_TIME_FIELDS:
+            head_cells.append(
+                _bid_time_header(header, sort, qs, _LIST_TIME_FIELDS[kind], col)
+            )
         elif kind == "ntcekind":
-            head_cells.append(f'<th class="kindhead">{_e(header)}</th>')
+            head_cells.append(f'<th class="kind-col kindhead">{_e(header)}</th>')
         elif col in _SORTABLE_COLUMNS:
             head_cells.append(_sort_header(col, header, sort, qs))
         else:
             head_cells.append(f"<th>{_e(header)}</th>")
     head = "".join(head_cells)
-    head += "<th>파일</th>"
+    head += '<th class="file-col">파일</th>'
     if analysis_on:
-        head += "<th>분석</th>"
+        head += '<th class="analysis-col">분석</th>'
     # 전체 컬럼 수 = 체크박스 + # + _LIST_COLUMNS + 파일 + 분석(토글)
     total_cols = 1 + 1 + len(_LIST_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
@@ -1361,11 +1465,11 @@ def _render_list_rows(
             f'data-item-type="bid" data-item-id="{row_id}">'
             f'</td>'
         )
-        cells = [chk_cell, f"<td>{i}</td>"]
+        cells = [chk_cell, f'<td class="rownum-col">{i}</td>']
         for col, kind, _header in _LIST_COLUMNS:
             val = r.get(col)
-            if kind == "bidtimes":
-                cells.append(_render_bid_times(r))
+            if kind in _LIST_TIME_FIELDS:
+                cells.append(_render_list_time_cell(r, _LIST_TIME_FIELDS[kind], col))
             elif kind == "amt":
                 cells.append(f'<td class="budgetcell">{_e(_fmt_amt(val))}</td>')
             elif kind == "dt":
@@ -1373,11 +1477,19 @@ def _render_list_rows(
             elif kind == "matchind":
                 cells.append(_render_matched_inds(val))
             elif kind == "ntcekind":
-                cells.append(_render_ntce_kind(val, r.get("bid_methd_nm")))
+                cells.append(_render_ntce_kind(
+                    val, r.get("bid_methd_nm"), cell_class="kind-col kindcell"
+                ))
             elif kind == "instt":
                 cells.append(_render_instt(val, r.get("dminstt_nm")))
             elif kind == "ntce":
-                cells.append(_render_ntce(val, r.get("bid_ntce_nm"), r.get("bid_ntce_dtl_url")))
+                cells.append(_render_ntce(
+                    val,
+                    r.get("bid_ntce_nm"),
+                    r.get("bid_ntce_dtl_url"),
+                    kind=r.get("ntce_kind_nm"),
+                    raw_json=r.get("raw_json"),
+                ))
             elif kind == "sucsf":
                 full = "" if val is None else str(val)
                 title = f' title="{_e(full.strip())}"' if full.strip() else ""
@@ -1390,11 +1502,11 @@ def _render_list_rows(
         cnt = r.get("_file_count", 0)
         if cnt:
             cells.append(
-                f'<td><button type="button" class="filebtn" '
+                f'<td class="file-col"><button type="button" class="filebtn" '
                 f'data-no="{row_id}">파일 {cnt}</button></td>'
             )
         else:
-            cells.append('<td>-</td>')
+            cells.append('<td class="file-col">-</td>')
         # 분석 버튼 컬럼 (Phase 8.2, USE_ANALYSIS_PROVIDER 토글)
         if analysis_on:
             status = (status_map or {}).get(raw_id, "none")
@@ -1404,12 +1516,13 @@ def _render_list_rows(
                 source_name=r.get("bid_ntce_nm") or "",
                 total_cols=total_cols,
                 status=status,
+                cell_class="analysis-col",
             ))
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
     <div class="table-wrap">
       <table class="listtable">
-        <thead><tr>{chk_head}<th>#</th>{head}</tr></thead>
+      <thead><tr>{chk_head}<th class="rownum-col">#</th>{head}</tr></thead>
         <tbody>{''.join(body_rows)}</tbody>
       </table>
     </div>"""
@@ -1483,6 +1596,20 @@ def _render_pager(
     </div>"""
 
 
+def _filter_toggle_button(card_id: str) -> str:
+    """검색 필터 카드의 펼침/접힘 토글 버튼 마크업을 만든다."""
+    toggle_js = (
+        f"var c=document.getElementById('{card_id}');"
+        f"c.classList.toggle('filter-collapsed');"
+        f"var b=c.querySelector('.filter-toggle');"
+        f"b.textContent=c.classList.contains('filter-collapsed')?'▾ 필터 펼침':'▴ 필터 접힘';"
+    )
+    return (
+        f'<button type="button" class="filter-toggle" onclick="{_e(toggle_js)}">'
+        "▾ 필터 펼침</button>"
+    )
+
+
 def _filter_card(
     *,
     action: str,
@@ -1492,6 +1619,7 @@ def _filter_card(
     card_id: str = "filterCard",
     right_html: str = "",
     extra_class: str = "",
+    toggle_inside_summary: bool = False,
 ) -> str:
     """플로팅 필터 카드 헬퍼 (Wave A 신설 — B-1/B-2 에서 list_page/pre_spec_page 에 적용).
 
@@ -1510,19 +1638,15 @@ def _filter_card(
         title: 카드 aria-label(기본 "검색").
         card_id: 카드 element id(기본 "filterCard").
         extra_class: 화면 전용 클래스(기본값이면 기존 HTML 유지).
+        toggle_inside_summary: True이면 토글 버튼을 summary_html 안에 직접 넣었음을 표시한다.
     """
-    toggle_js = (
-        f"var c=document.getElementById('{card_id}');"
-        f"c.classList.toggle('filter-collapsed');"
-        f"var b=c.querySelector('.filter-toggle');"
-        f"b.textContent=c.classList.contains('filter-collapsed')?'▾ 필터 펼침':'▴ 필터 접힘';"
-    )
+    toggle_button = "" if toggle_inside_summary else _filter_toggle_button(card_id)
     return (
         f'<div class="filter-card filter-collapsed{(" " + _e(extra_class)) if extra_class else ""}" id="{_e(card_id)}" aria-label="{_e(title)}">'
         f'<form method="get" action="{_e(action)}">'
         f'<div class="filter-summary">'
         f'{summary_html}'
-        f'<button type="button" class="filter-toggle" onclick="{_e(toggle_js)}">▾ 필터 펼침</button>'
+        f'{toggle_button}'
         f'{right_html}'
         f'</div>'
         f'<div class="filter-detail">{detail_html}</div>'
@@ -1572,7 +1696,8 @@ def _excl_kw_field(keywords: list[str], options: list[dict[str, Any]], label: st
     기본 적용 키워드=warning 색, 현재 적용 중(칩에 있는) 키워드=success 하이라이트로 구분한다.
     """
     chips = "".join(
-        f'<span class="kw-chip" data-kw="{_e(kw)}">{_e(kw)}'
+        f'<span class="kw-chip" data-kw="{_e(kw)}" title="{_e(kw)}">'
+        f'<span class="kw-chip-text">{_e(kw)}</span>'
         f'<button type="button" class="kw-chip-x" aria-label="{_e(kw)} 제외 해제">&times;</button>'
         f"</span>"
         for kw in keywords
@@ -1583,7 +1708,8 @@ def _excl_kw_field(keywords: list[str], options: list[dict[str, Any]], label: st
         f'{" is-default" if o.get("is_default") else ""}'
         f'{" is-selected" if str(o["keyword"]).lower() in selected else ""}'
         f'" data-kw="{_e(o["keyword"])}" role="option">'
-        f'<span>{_e(o["keyword"])}</span><span class="kw-opt-mark">&#10003;</span>'
+        f'<span class="kw-opt-text">{_e(o["keyword"])}</span>'
+        f'<span class="kw-opt-mark">&#10003;</span>'
         "</button>"
         for o in options
     )
@@ -1720,7 +1846,11 @@ _EXCL_KW_SCRIPT = """
       var chip = document.createElement('span');
       chip.className = 'kw-chip';
       chip.setAttribute('data-kw', w);
-      chip.appendChild(document.createTextNode(w));
+      chip.setAttribute('title', w);
+      var chipText = document.createElement('span');
+      chipText.className = 'kw-chip-text';
+      chipText.textContent = w;
+      chip.appendChild(chipText);
       var x = document.createElement('button');
       x.type = 'button';
       x.className = 'kw-chip-x';
@@ -1797,12 +1927,12 @@ _EXCL_KW_SCRIPT = """
 """ % {"max": repository.EXCLUDE_KEYWORD_MAX, "maxlen": repository.EXCLUDE_KEYWORD_MAX_LEN}
 
 
-# /list 클라이언트 스크립트(기간 select + 입찰일시 정렬 select + 파일 drawer).
+# /list 클라이언트 스크립트(날짜 프리셋·일시 정렬 select·가격 콤마·파일 drawer).
 # 평문 상수라 중괄호 이스케이프 불필요.
 # 파일명은 서버 JSON에서 받아 textContent 로 삽입(XSS 방지). 파일 URL 은 DB 저장 URL 만 사용.
 _LIST_SCRIPT = """
   window.addEventListener('pageshow', function () {
-    document.querySelectorAll('select.bt-sortfield').forEach(function (select) {
+    document.querySelectorAll('select.bidtime-sortfield').forEach(function (select) {
       Array.from(select.options).forEach(function (option) {
         option.selected = option.defaultSelected;
       });
@@ -1810,7 +1940,7 @@ _LIST_SCRIPT = """
   });
 
   document.addEventListener('change', function (e) {
-    if (e.target.matches('select.bt-sortfield') && e.target.value) {
+    if (e.target.matches('select.bidtime-sortfield') && e.target.value) {
       location.href = e.target.value;
     }
   });
@@ -1819,30 +1949,109 @@ _LIST_SCRIPT = """
   (function () {
     var sel = document.getElementById('date_field');
     var range = document.getElementById('dt_range');
-    var custom = document.getElementById('list-custom-dates');
-    if (!sel || !range || !custom) return;
-    var presets = JSON.parse(document.getElementById('list-date-group').dataset.presetRanges);
+    var group = document.getElementById('list-date-group');
+    if (!sel || !range || !group) return;
+    var presets = JSON.parse(group.dataset.presetRanges);
     var f = document.getElementById('dt_from');
     var t = document.getElementById('dt_to');
+    var buttons = Array.from(group.querySelectorAll('[data-date-preset]'));
 
     function fillDates(preset) {
       var dates = presets[sel.value][preset];
       f.value = dates[0];
       t.value = dates[1];
     }
-    function showCustom() {
-      custom.hidden = range.value !== 'custom';
+    function syncPreset() {
+      buttons.forEach(function (button) {
+        var active = button.dataset.datePreset === range.value;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
     }
-    range.addEventListener('change', function () {
-      showCustom();
-      if (range.value !== 'custom') fillDates(range.value);
+    buttons.forEach(function (button) {
+      button.addEventListener('click', function () {
+        range.value = button.dataset.datePreset;
+        fillDates(range.value);
+        syncPreset();
+      });
     });
     sel.addEventListener('change', function () {
-      // 날짜지정에서는 기준별 1개월 기본값, 프리셋에서는 선택 기간을 유지한다.
-      fillDates(range.value === 'custom' ? '1m' : range.value);
+      if (range.value !== 'custom') fillDates(range.value);
     });
-    window.addEventListener('pageshow', showCustom);
-    showCustom();
+    [f, t].forEach(function (input) {
+      input.addEventListener('change', function () {
+        range.value = 'custom';
+        syncPreset();
+      });
+    });
+    syncPreset();
+  })();
+
+  // 예산 입력은 숫자만 남기고 천 단위 콤마를 표시한다.
+  (function () {
+    function caretAfterDigits(value, count) {
+      if (count <= 0) return 0;
+      var seen = 0;
+      for (var i = 0; i < value.length; i++) {
+        if (/[0-9]/.test(value.charAt(i)) && ++seen === count) return i + 1;
+      }
+      return value.length;
+    }
+    function formatPrice(input, digitCount, forceCaret, stripLeadingZeros) {
+      var rawDigits = input.value.replace(/[^0-9]/g, '');
+      var digits = stripLeadingZeros ? rawDigits.replace(/^0+(?=\\d)/, '') : rawDigits;
+      var removedLeadingZeros = stripLeadingZeros ? rawDigits.length - digits.length : 0;
+      var formatted = digits.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+      var changed = input.value !== formatted;
+      if (changed) {
+        input.value = formatted;
+      }
+      if (changed || forceCaret) {
+        digitCount = Math.max(0, digitCount - removedLeadingZeros);
+        var caret = caretAfterDigits(formatted, digitCount);
+        input.setSelectionRange(caret, caret);
+      }
+    }
+    document.querySelectorAll('input.price-comma').forEach(function (input) {
+      input.addEventListener('input', function () {
+        var cursor = input.selectionStart === null ? input.value.length : input.selectionStart;
+        var digitCount = input.value.slice(0, cursor).replace(/[^0-9]/g, '').length;
+        formatPrice(input, digitCount);
+      });
+      // 편집 중에는 0 자리를 보존하고, 값 확정 시에만 선행 0 을 정리한다.
+      input.addEventListener('change', function () {
+        var cursor = input.selectionStart === null ? input.value.length : input.selectionStart;
+        var digitCount = input.value.slice(0, cursor).replace(/[^0-9]/g, '').length;
+        formatPrice(input, digitCount, false, true);
+      });
+      input.addEventListener('keydown', function (event) {
+        if ((event.key !== 'Backspace' && event.key !== 'Delete') || input.selectionStart !== input.selectionEnd) return;
+        var cursor = input.selectionStart;
+        var digit;
+        if (event.key === 'Backspace' && cursor && input.value.charAt(cursor - 1) === ',') {
+          digit = cursor - 2;
+        } else if (event.key === 'Delete' && input.value.charAt(cursor) === ',') {
+          digit = cursor + 1;
+        } else {
+          return;
+        }
+        while (digit >= 0 && !/[0-9]/.test(input.value.charAt(digit))) digit--;
+        if (digit < 0 || digit >= input.value.length || !/[0-9]/.test(input.value.charAt(digit))) return;
+        event.preventDefault();
+        var digitCount = input.value.slice(0, digit).replace(/[^0-9]/g, '').length;
+        input.value = input.value.slice(0, digit) + input.value.slice(digit + 1);
+        formatPrice(input, digitCount, true);
+      });
+    });
+    document.querySelectorAll('.list-filter form').forEach(function (form) {
+      form.addEventListener('submit', function () {
+        form.querySelectorAll('input.price-comma').forEach(function (input) {
+          var cursor = input.selectionStart === null ? input.value.length : input.selectionStart;
+          var digitCount = input.value.slice(0, cursor).replace(/[^0-9]/g, '').length;
+          formatPrice(input, digitCount, false, true);
+        });
+      });
+    });
   })();
 
   (function () {
@@ -3090,20 +3299,27 @@ def root() -> RedirectResponse:
 
 
 def _parse_price(s: str | None) -> int | None:
-    """가격 입력(문자열, 콤마 허용) → int. 빈값/형식오류는 None."""
+    """가격 입력(문자열, 콤마 허용) → 유한한 0 이상 정수. 빈값·오류는 None."""
     if not s:
         return None
     s = str(s).strip().replace(",", "")
     if not s:
         return None
     try:
-        return int(s)
+        value = int(s)
     except ValueError:
         try:
             # "1234.0" 같은 소수 표기 방어(설정값이 그렇게 저장될 수 있음).
-            return int(float(s))
-        except ValueError:
+            numeric = float(s)
+            if not math.isfinite(numeric):
+                return None
+            value = int(numeric)
+        except (ValueError, OverflowError):
             return None
+    # SQLite 정수 비교 범위를 벗어나는 값은 필터에서 무시한다.
+    if value < 0 or value > 9_223_372_036_854_775_807:
+        return None
+    return value
 
 
 @app.get("/list", response_class=HTMLResponse)
@@ -3131,7 +3347,7 @@ def list_page(
     # 수의계약 제외(기본 True). 체크 해제와 "파라미터 없음(첫 진입)"을 구분하기 위해
     # 폼은 hidden(0)+checkbox(1) 쌍으로 전송한다: 없음=기본(제외), "1" 포함=제외, 그 외=포함.
     excl_privt_flag = True if not excl_privt else ("1" in excl_privt)
-    # 정렬: 입찰일시 4개·배정예산·추정가격(북마크 호환)의 asc/desc 12종. 미허용·빈값은 기본.
+    # 정렬: 일시 필드 4종·배정예산·추정가격(북마크 호환)의 asc/desc 12종. 미허용·빈값은 기본.
     sort = sort if sort in _LIST_SORTS else _DEFAULT_SORT
     # 날짜 적용 컬럼: 공고일/개찰일.
     date_field = date_field if date_field in ("bid_ntce_dt", "openg_dt") else "bid_ntce_dt"
@@ -3146,7 +3362,7 @@ def list_page(
     if not selected_kinds:
         selected_kinds = list(_LIST_DEFAULT_KINDS)
 
-    # 기존 날짜 URL은 날짜지정으로 보존하고 명시한 프리셋은 요청 날짜보다 우선한다.
+    # 기존 직접 날짜 URL을 보존하고 명시한 프리셋은 요청 날짜보다 우선한다.
     if dt_range not in dict(_LIST_DATE_RANGES):
         dt_range = "custom" if dt_from or dt_to else "1m"
     today = date.today()
@@ -3206,9 +3422,9 @@ def list_page(
         # 첨부 URL 컬럼은 파일 개수 계산용으로만 읽고(이미 조회한 ORM 행에서 → N+1 없음),
         # 화면에는 개수만 전달한다(drawer 열 때 /files 로 상세 조회).
         cols = (
-            [c for c, k, _ in _LIST_COLUMNS if k != "bidtimes"]
-            + [field for field, _label in _BID_TIME_FIELDS]
-            + ["bid_ntce_nm", "dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm"]
+            [c for c, k, _ in _LIST_COLUMNS if k not in _LIST_TIME_FIELDS]
+            + [field for fields in _LIST_TIME_FIELDS.values() for field, _label in fields]
+            + ["bid_ntce_nm", "dminstt_nm", "bid_ntce_dtl_url", "bid_methd_nm", "raw_json"]
             + _SPEC_URL_COLUMNS
         )
         rows = []
@@ -3223,9 +3439,11 @@ def list_page(
                 [str(r.get("bid_ntce_no")) for r in rows if r.get("bid_ntce_no")],
             )
 
-    # 입력칸 표시값(문자열). 정규화된 정수를 그대로 보여준다(없으면 빈칸).
-    price_min_field = "" if price_min_disp is None else str(price_min_disp)
-    price_max_field = "" if price_max_disp is None else str(price_max_disp)
+    # 입력칸에는 천 단위 콤마, URL 필터값에는 숫자만 유지한다.
+    price_min_field = "" if price_min_disp is None else f"{price_min_disp:,}"
+    price_max_field = "" if price_max_disp is None else f"{price_max_disp:,}"
+    price_min_qs = "" if price_min_disp is None else str(price_min_disp)
+    price_max_qs = "" if price_max_disp is None else str(price_max_disp)
 
     # 쿼리스트링 보존(페이지 이동·헤더 정렬 시 다른 필터 유지). 유효 날짜(서버 기본 포함)를 싣는다.
     qs = {
@@ -3235,8 +3453,8 @@ def list_page(
         "date_field": date_field,
         "dt_range": dt_range,
         "kind": ",".join(selected_kinds),
-        "price_min": price_min_field,
-        "price_max": price_max_field,
+        "price_min": price_min_qs,
+        "price_max": price_max_qs,
         "include_past": "1" if include_past_flag else "",
         "excl_privt": "1" if excl_privt_flag else "0",
         # 제외 키워드는 한글·특수문자를 담을 수 있어 링크에는 URL 인코딩해서 싣는다.
@@ -3248,13 +3466,14 @@ def list_page(
 
     nf_sel = " selected" if date_field == "bid_ntce_dt" else ""
     og_sel = " selected" if date_field == "openg_dt" else ""
-    range_opts = "".join(
-        f'<option value="{value}"{" selected" if value == dt_range else ""}>{label}</option>'
-        for value, label in _LIST_DATE_RANGES
+    preset_buttons = "".join(
+        f'<button type="button" class="{"is-active" if value == dt_range else ""}" '
+        f'data-date-preset="{value}" aria-pressed="{"true" if value == dt_range else "false"}">{label}</button>'
+        for value, label in _LIST_DATE_RANGES if value != "custom"
     )
     kind_checks = "".join(
-        f'<label class="chk"><input type="checkbox" name="kind" value="{code}"'
-        f'{" checked" if code in selected_kinds else ""}>{label}</label>'
+        f'<label class="list-toggle-chip"><input type="checkbox" name="kind" value="{code}"'
+        f'{" checked" if code in selected_kinds else ""}><span>{label}</span></label>'
         for code, label in _LIST_KINDS.items()
     )
 
@@ -3264,70 +3483,69 @@ def list_page(
         for v in (10, 30, 50, 100)
     )
 
-    # summary_html: 핵심 필터는 접힘 상태에서도 항상 표시한다.
+    # 접힌 상태에는 상단 입력 한 줄과 날짜 기준·입력·프리셋 행을 항상 표시한다.
     summary_html = f"""
-      <label class="field" style="min-width:260px;">
-        <span class="flabel">공고명</span>
-        <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
-      </label>
-      <fieldset class="list-date-group" id="list-date-group" data-preset-ranges="{_e(json.dumps(date_presets))}">
-        <legend>날짜</legend>
+      <div class="list-summary-main">
+        <label class="field query-field">
+          <span class="flabel">공고명</span>
+          <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
+        </label>
+        <label class="field price-max-field">
+          <span class="flabel">배정예산 최대</span>
+          <input type="text" inputmode="numeric" class="price-comma" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 100,000,000">
+        </label>
         <label class="field">
-          <span class="flabel">날짜 기준</span>
-          <select name="date_field" id="date_field">
+          <span class="flabel">표기개수</span>
+          <select name="page_size" onchange="this.form.submit()">{ps_opts}</select>
+        </label>
+        <button type="submit" class="submit">검색</button>
+        {_filter_toggle_button("filterCard")}
+        {_excl_kw_summary(excl_kws)}
+        <button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>
+      </div>
+      <div class="list-filter-row list-date-group" id="list-date-group" data-preset-ranges="{_e(json.dumps(date_presets))}">
+        <span class="list-group-label">공고/개찰일자</span>
+        <div class="list-row-controls date-controls">
+          <select name="date_field" id="date_field" aria-label="날짜 기준">
             <option value="bid_ntce_dt"{nf_sel}>공고일</option>
             <option value="openg_dt"{og_sel}>개찰일</option>
           </select>
-        </label>
-        <label class="field">
-          <span class="flabel">기간</span>
-          <select name="dt_range" id="dt_range">{range_opts}</select>
-        </label>
-        <div class="list-custom-dates" id="list-custom-dates"{" hidden" if dt_range != "custom" else ""}>
-          <label class="field">
-            <span class="flabel">시작</span>
-            <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff)}">
-          </label>
+          <input type="date" name="dt_from" id="dt_from" value="{_e(dt_from_eff)}" aria-label="시작 날짜">
           <span class="tilde">~</span>
-          <label class="field">
-            <span class="flabel">종료</span>
-            <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff)}">
-          </label>
+          <input type="date" name="dt_to" id="dt_to" value="{_e(dt_to_eff)}" aria-label="종료 날짜">
+          <input type="hidden" name="dt_range" id="dt_range" value="{_e(dt_range)}">
+          <div class="preset-buttons" aria-label="날짜 기간 프리셋">{preset_buttons}</div>
         </div>
-      </fieldset>
-      <label class="field">
-        <span class="flabel">배정예산 최대</span>
-        <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
-      </label>
-      <label class="field">
-        <span class="flabel">표기개수</span>
-        <select name="page_size" onchange="this.form.submit()">{ps_opts}</select>
-      </label>
-      <button type="submit" class="submit">검색</button>"""
+      </div>"""
 
     # detail_html: 토글로 펼쳐지는 상세 필터(핵심 입력과 같은 form).
     detail_html = f"""
-      <div class="row" style="margin-bottom:12px;">
-        {_excl_kw_field(excl_kws, kw_options, "공고명 제외 키워드")}
-      </div>
-      <fieldset class="list-kind-group">
-        <legend>공고종류</legend>
-        <div class="row">{kind_checks}</div>
-      </fieldset>
-      <div class="row">
-        <label class="field">
-          <span class="flabel">배정예산 최소</span>
-          <input type="number" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
-        </label>
-        <label class="chk">
-          <input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}>
-          지난 개찰 포함
-        </label>
-        <label class="chk">
-          <input type="hidden" name="excl_privt" value="0">
-          <input type="checkbox" name="excl_privt" value="1"{' checked' if excl_privt_flag else ''}>
-          수의계약제외
-        </label>
+      <div class="list-detail-rows">
+        <div class="list-filter-row list-input-row">
+          <div class="list-row-controls">{_excl_kw_field(excl_kws, kw_options, "공고명 제외 키워드")}</div>
+        </div>
+        <div class="list-filter-row">
+          <span class="list-group-label">공고종류</span>
+          <div class="list-row-controls">{kind_checks}</div>
+        </div>
+        <div class="list-filter-row">
+          <span class="list-group-label">조회옵션</span>
+          <div class="list-row-controls">
+            <label class="list-toggle-chip"><input type="checkbox" name="include_past" value="1"{' checked' if include_past_flag else ''}><span>지난 개찰 포함</span></label>
+            <label class="list-toggle-chip">
+              <input type="hidden" name="excl_privt" value="0">
+              <input type="checkbox" name="excl_privt" value="1"{' checked' if excl_privt_flag else ''}><span>수의계약제외</span>
+            </label>
+          </div>
+        </div>
+        <div class="list-filter-row list-input-row">
+          <div class="list-row-controls">
+            <label class="field">
+              <span class="flabel">배정예산 최소</span>
+              <input type="text" inputmode="numeric" class="price-comma" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10,000,000">
+            </label>
+          </div>
+        </div>
         <input type="hidden" name="sort" value="{_e(sort)}">
       </div>"""
     analysis_ui_html = _ANALYSIS_MODAL_HTML if analysis_on else '    <div id="cartToast" role="alert"></div>'
@@ -3335,7 +3553,7 @@ def list_page(
 
     body = f"""
     {_filter_card(action="/list", summary_html=summary_html, detail_html=detail_html, title="공고 검색", card_id="filterCard", extra_class="list-filter",
-        right_html=_excl_kw_summary(excl_kws) + '<button id="btn-add-to-cart" class="btn-cart-add" style="display:none;margin-left:auto;" onclick="addToCart()">담기 <span id="cart-add-count">0</span>건</button>')}
+        toggle_inside_summary=True)}
 
     <div class="card">
       <div class="list-card-heading">
@@ -4829,7 +5047,7 @@ def api_export_cart_download():
     ws.title = "검토목록"
 
     HEADERS = ["구분", "공고번호", "제목", "발주기관", "수요기관",
-               "배정예산", "추정가격", "개시일시", "개찰/의견마감일시"]
+               "배정예산", "추정가격", "공고일시", "개찰/의견마감일시"]
     COL_WIDTHS = [10, 20, 50, 20, 20, 15, 15, 18, 18]
 
     # 헤더 행 스타일

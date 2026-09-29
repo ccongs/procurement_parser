@@ -178,7 +178,7 @@ def _seed_app_config() -> None:
                 indstryty_cds="1426,1468,1469,1470",
                 prtcpt_lmt_rgn_cd="00",  # 신규 설치 기본 = 전국(지역제한 없는 공고만)
                 presmpt_prce_bgn=None,
-                presmpt_prce_end=None,
+                presmpt_prce_end="100000000",
                 last_success_dt=None,
                 updated_at=datetime.now(),
                 pre_spec_enabled=True,  # 사전규격 잡 기본 on (Phase 5.4)
