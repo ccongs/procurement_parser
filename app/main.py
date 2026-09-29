@@ -967,6 +967,16 @@ BASE_CSS = """
   table.kwtable .kw-del:hover { background: #8f211d; }
 """
 
+# /list 매칭업종 코드 전용 힌트와 툴팁 스타일.
+_LIST_MATCHIND_TIP_CSS = """
+  .indcode[data-tip] { cursor: help; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+             clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+  .ind-tip { position: fixed; z-index: 90; padding: 4px 8px; border-radius: 4px;
+             background: #1f2430; color: #fff; font-size: 12px; white-space: nowrap;
+             pointer-events: none; }
+"""
+
 
 def _nav(active: str) -> str:
     """헤더 우측 설정 버튼. active in {'list','pre-spec','config','api-test'}.
@@ -1009,7 +1019,7 @@ _STICKY_STACK_SCRIPT = """(function () {
 })();"""
 
 
-def _shell(title: str, subtitle: str, active: str, body: str) -> str:
+def _shell(title: str, subtitle: str, active: str, body: str, *, extra_css: str = "") -> str:
     """공통 HTML 셸. subtitle 인자는 호환성 위해 유지하나 헤더에 렌더하지 않는다."""
     return f"""<!doctype html>
 <html lang="ko">
@@ -1017,7 +1027,7 @@ def _shell(title: str, subtitle: str, active: str, body: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_e(title)}</title>
-  <style>{BASE_CSS}</style>
+  <style>{BASE_CSS}{extra_css}</style>
 </head>
 <body>
   <header>
@@ -1205,8 +1215,13 @@ def _render_matched_inds(csv: Any) -> str:
     spans = []
     for code in codes:
         name = industry_codes.industry_name(code)
-        title = f' title="{_e(name)}"' if name else ""
-        spans.append(f'<span class="indcode"{title}>{_e(code)}</span>')
+        if name:
+            spans.append(
+                f'<span class="indcode" data-tip="{_e(name)}" tabindex="0">{_e(code)}'
+                f'<span class="sr-only">({_e(name)})</span></span>'
+            )
+        else:
+            spans.append(f'<span class="indcode">{_e(code)}</span>')
     return f'<td class="matchind">[{",<wbr>".join(spans)}]</td>'
 
 
@@ -1958,6 +1973,91 @@ _EXCL_KW_SCRIPT = """
     sync();
   })();
 """ % {"max": repository.EXCLUDE_KEYWORD_MAX, "maxlen": repository.EXCLUDE_KEYWORD_MAX_LEN}
+
+
+# /list 매칭업종 전용 툴팁. 이벤트 위임으로 표의 코드 span 을 처리한다.
+_LIST_MATCHIND_TIP_SCRIPT = """
+  (function () {
+    var tooltip = document.getElementById('indTip');
+    if (!tooltip) return;
+
+    var hovered = null;
+    var focused = null;
+
+    function matchedCode(target) {
+      return target && target.closest ? target.closest('.indcode[data-tip]') : null;
+    }
+
+    function hideTooltip() {
+      hovered = null;
+      focused = null;
+      tooltip.hidden = true;
+      tooltip.textContent = '';
+      tooltip.style.left = '';
+      tooltip.style.top = '';
+    }
+
+    function updateTooltip() {
+      var target = focused || hovered;
+      if (!target) {
+        tooltip.hidden = true;
+        tooltip.textContent = '';
+        tooltip.style.left = '';
+        tooltip.style.top = '';
+        return;
+      }
+
+      tooltip.textContent = target.getAttribute('data-tip') || '';
+      tooltip.hidden = false;
+      var rect = target.getBoundingClientRect();
+      var tipRect = tooltip.getBoundingClientRect();
+      var gap = 6;
+      var edge = 8;
+      var left = rect.left + (rect.width - tipRect.width) / 2;
+      left = Math.max(edge, Math.min(left, window.innerWidth - tipRect.width - edge));
+      var top = rect.top - tipRect.height - gap;
+      if (top < edge) top = rect.bottom + gap;
+      top = Math.max(edge, Math.min(top, window.innerHeight - tipRect.height - edge));
+      tooltip.style.left = left + 'px';
+      tooltip.style.top = top + 'px';
+    }
+
+    document.addEventListener('mouseover', function (event) {
+      var code = matchedCode(event.target);
+      if (code) {
+        hovered = code;
+        updateTooltip();
+      }
+    });
+    document.addEventListener('mouseout', function (event) {
+      var code = matchedCode(event.target);
+      if (!code || (event.relatedTarget && code.contains(event.relatedTarget))) return;
+      if (hovered === code) {
+        hovered = null;
+        updateTooltip();
+      }
+    });
+    document.addEventListener('focusin', function (event) {
+      var code = matchedCode(event.target);
+      if (code) {
+        focused = code;
+        updateTooltip();
+      }
+    });
+    document.addEventListener('focusout', function (event) {
+      var code = matchedCode(event.target);
+      if (!code || (event.relatedTarget && code.contains(event.relatedTarget))) return;
+      if (focused === code) {
+        focused = null;
+        updateTooltip();
+      }
+    });
+    document.addEventListener('scroll', hideTooltip, true);
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') hideTooltip();
+    });
+  })();
+"""
 
 
 # /list 클라이언트 스크립트(날짜 프리셋·일시 정렬 select·가격 콤마·파일 drawer).
@@ -3615,13 +3715,21 @@ def list_page(
 
     {analysis_ui_html}
     {_CART_MODAL_HTML}
+    <div id="indTip" class="ind-tip" role="tooltip" hidden></div>
+    <script>{_LIST_MATCHIND_TIP_SCRIPT}</script>
     <script>{_LIST_SCRIPT}</script>
     <script>{_EXCL_KW_SCRIPT}</script>
     {analysis_script_html}
     <script>{_CART_SCRIPT}</script>"""
 
     return HTMLResponse(
-        _shell("나라장터 입찰공고 목록", "수집·저장된 공고를 조회합니다.", "list", body)
+        _shell(
+            "나라장터 입찰공고 목록",
+            "수집·저장된 공고를 조회합니다.",
+            "list",
+            body,
+            extra_css=_LIST_MATCHIND_TIP_CSS,
+        )
     )
 
 

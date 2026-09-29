@@ -1356,7 +1356,7 @@ def test_list_date_field_switch_openg(client):
 
 
 def test_list_matched_industry_codes_and_tooltips(client):
-    """매칭업종은 코드 목록으로 표시하고 각 코드의 툴팁에 전체 업종명을 담는다."""
+    """매칭업종은 코드 목록과 접근 가능한 전용 툴팁 힌트를 표시한다."""
     from app import main as _main
 
     # 매칭코드가 있는 공고를 임시로 추가(client 픽스처 DB 에).
@@ -1378,15 +1378,21 @@ def test_list_matched_industry_codes_and_tooltips(client):
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     cell = re.search(r'<td class="matchind">\[.*?</td>', resp.text).group(0)
-    assert re.sub(r"<[^>]+>", "", cell) == "[1426,1468]"
+    without_sr_only = re.sub(r'<span class="sr-only">.*?</span>', "", cell)
+    assert re.sub(r"<[^>]+>", "", without_sr_only) == "[1426,1468]"
     assert (
-        '<span class="indcode" title="소프트웨어사업자(패키지소프트웨어개발·공급사업)">1426</span>'
+        '<span class="indcode" data-tip="소프트웨어사업자(패키지소프트웨어개발·공급사업)" '
+        'tabindex="0">1426<span class="sr-only">'
+        '(소프트웨어사업자(패키지소프트웨어개발·공급사업))</span></span>'
         in cell
     )
     assert (
-        '<span class="indcode" title="소프트웨어사업자(컴퓨터관련서비스사업)">1468</span>'
+        '<span class="indcode" data-tip="소프트웨어사업자(컴퓨터관련서비스사업)" '
+        'tabindex="0">1468<span class="sr-only">'
+        '(소프트웨어사업자(컴퓨터관련서비스사업))</span></span>'
         in cell
     )
+    assert "title=" not in cell
     assert 'class="indrow"' not in cell
 
 
@@ -1397,17 +1403,41 @@ def test_render_matched_industry_empty(value):
 
 
 def test_render_matched_industry_unknown_order_and_escape(monkeypatch):
-    """CSV 순서를 유지하며 모르는 코드·업종명·툴팁 모두 안전하게 이스케이프한다."""
+    """CSV 순서를 유지하며 모르는 코드와 업종명·전용 툴팁을 안전하게 이스케이프한다."""
     monkeypatch.setitem(industry_codes.INDUSTRY_NAMES, "1468", '<업종&"명>')
     cell = main._render_matched_inds(' 9999 ,1468,<code&"x>,1426')
     assert '<span class="indcode">9999</span>' in cell
+    assert re.search(r'<span class="indcode"[^>]*>9999</span>', cell).group(0) == (
+        '<span class="indcode">9999</span>'
+    )
     assert '<span class="indcode">&lt;code&amp;&quot;x&gt;</span>' in cell
     assert (
-        '<span class="indcode" title="&lt;업종&amp;&quot;명&gt;">1468</span>' in cell
+        '<span class="indcode" data-tip="&lt;업종&amp;&quot;명&gt;" tabindex="0">1468'
+        '<span class="sr-only">(&lt;업종&amp;&quot;명&gt;)</span></span>' in cell
     )
-    assert re.sub(r"<[^>]+>", "", cell) == '[9999,1468,&lt;code&amp;&quot;x&gt;,1426]'
+    without_sr_only = re.sub(r'<span class="sr-only">.*?</span>', "", cell)
+    assert re.sub(r"<[^>]+>", "", without_sr_only) == '[9999,1468,&lt;code&amp;&quot;x&gt;,1426]'
+    assert "title=" not in cell
     assert '<업종&"명>' not in cell
     assert '<code&"x>' not in cell
+
+
+def test_list_has_matchind_tooltip_ui_only(client):
+    """전용 툴팁 UI 와 이벤트는 /list 에만 포함한다."""
+    list_html = client.get("/list", params=_WIDE).text
+    assert '<div id="indTip" class="ind-tip" role="tooltip" hidden></div>' in list_html
+    assert "document.addEventListener('mouseover'" in list_html
+    assert "document.addEventListener('focusin'" in list_html
+    assert "document.addEventListener('scroll', hideTooltip, true)" in list_html
+    assert "event.key === 'Escape'" in list_html
+    assert ".indcode[data-tip] { cursor: help;" in list_html
+    assert "text-decoration: underline dotted;" in list_html
+    assert ".ind-tip { position: fixed;" in list_html
+    assert "pointer-events: none;" in list_html
+
+    pre_spec_html = client.get("/pre-spec", params=_WIDE).text
+    assert 'id="indTip"' not in pre_spec_html
+    assert 'class="ind-tip"' not in pre_spec_html
 
 
 def test_config_page_has_price_defaults(client):
