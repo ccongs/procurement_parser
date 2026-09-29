@@ -600,8 +600,13 @@ from decimal import Decimal  # noqa: E402
 from app import industry_codes, main  # noqa: E402
 
 
+def test_list_sort_allowlist_matches_repository_columns():
+    """목록 정렬 허용 키가 repository 정렬 컬럼과 같은지 확인합니다."""
+    assert main._LIST_SORTS == frozenset(repository._SORT_COLUMNS)
+
+
 def _bnp(no, nm, ntce_dt, openg_dt, price):
-    """가격(presmpt_prce) 포함 BidNotice. price=None 이면 NULL."""
+    """배정예산과 추정가격을 같은 값으로 채운 BidNotice. price=None 이면 NULL."""
     base = datetime(2026, 6, 1, 12, 0, 0)
     return BidNotice(
         bid_ntce_no=no,
@@ -610,6 +615,7 @@ def _bnp(no, nm, ntce_dt, openg_dt, price):
         bid_ntce_dt=ntce_dt,
         openg_dt=openg_dt,
         presmpt_prce=(None if price is None else Decimal(price)),
+        asign_bdgt_amt=(None if price is None else Decimal(price)),
         collected_at=base,
         updated_at=base,
     )
@@ -665,10 +671,10 @@ def test_search_date_field_invalid_falls_back(session):
     assert {r.bid_ntce_no for r in rows} == {"P-2", "P-3"}
 
 
-# --- price_min / price_max 경계 ---------------------------------------
+# --- price_min / price_max 배정예산 경계 -------------------------------
 def test_search_price_min(session):
     _seed_priced(session)
-    # >= 50,000,000 → P-2, P-3 (P-1 1천만 제외, P-4 NULL 제외).
+    # 배정예산 >= 50,000,000 → P-2, P-3 (P-1 1천만 제외, P-4 NULL 제외).
     rows, total = repository.search_bid_notices(session, price_min=50_000_000)
     assert total == 2
     assert {r.bid_ntce_no for r in rows} == {"P-2", "P-3"}
@@ -676,7 +682,7 @@ def test_search_price_min(session):
 
 def test_search_price_max(session):
     _seed_priced(session)
-    # <= 50,000,000 → P-1, P-2 (경계 포함, P-3 1억 제외, P-4 NULL 제외).
+    # 배정예산 <= 50,000,000 → P-1, P-2 (경계 포함, P-3 1억 제외, P-4 NULL 제외).
     rows, total = repository.search_bid_notices(session, price_max=50_000_000)
     assert total == 2
     assert {r.bid_ntce_no for r in rows} == {"P-1", "P-2"}
@@ -684,7 +690,7 @@ def test_search_price_max(session):
 
 def test_search_price_min_and_max(session):
     _seed_priced(session)
-    # 10,000,000 ~ 50,000,000 (경계 포함) → P-1, P-2.
+    # 배정예산 10,000,000 ~ 50,000,000 (경계 포함) → P-1, P-2.
     rows, total = repository.search_bid_notices(
         session, price_min=10_000_000, price_max=50_000_000
     )
@@ -694,18 +700,112 @@ def test_search_price_min_and_max(session):
 
 def test_search_price_none_keeps_null_rows(session):
     _seed_priced(session)
-    # 가격 필터 없으면 NULL 가격(P-4)도 포함.
+    # 배정예산 필터 없으면 NULL 배정예산(P-4)도 포함.
     rows, total = repository.search_bid_notices(session)
     assert total == 4
     assert "P-4" in {r.bid_ntce_no for r in rows}
 
 
-# --- 신규 sort 6종 (NULL 뒤로) ----------------------------------------
+def test_search_price_filters_use_budget_not_estimated_price(session):
+    base = datetime(2026, 6, 1, 12, 0)
+    session.add_all(
+        [
+            BidNotice(
+                bid_ntce_no="BUDGET-LOW-PRICE-HIGH-BUDGET",
+                bid_ntce_nm="예산 필터 낮은 추정가격 높은 예산",
+                bid_ntce_dt=datetime(2026, 5, 1),
+                presmpt_prce=Decimal("400"),
+                asign_bdgt_amt=Decimal("600"),
+                collected_at=base,
+                updated_at=base,
+            ),
+            BidNotice(
+                bid_ntce_no="BUDGET-HIGH-PRICE-LOW-BUDGET",
+                bid_ntce_nm="예산 필터 높은 추정가격 낮은 예산",
+                bid_ntce_dt=datetime(2026, 5, 2),
+                presmpt_prce=Decimal("600"),
+                asign_bdgt_amt=Decimal("400"),
+                collected_at=base,
+                updated_at=base,
+            ),
+            BidNotice(
+                bid_ntce_no="BUDGET-EXACT",
+                bid_ntce_nm="예산 필터 경계값",
+                bid_ntce_dt=datetime(2026, 5, 3),
+                presmpt_prce=Decimal("800"),
+                asign_bdgt_amt=Decimal("500"),
+                collected_at=base,
+                updated_at=base,
+            ),
+            BidNotice(
+                bid_ntce_no="BUDGET-NULL",
+                bid_ntce_nm="예산 필터 배정예산 NULL",
+                bid_ntce_dt=datetime(2026, 5, 4),
+                presmpt_prce=Decimal("100"),
+                asign_bdgt_amt=None,
+                collected_at=base,
+                updated_at=base,
+            ),
+        ]
+    )
+    session.commit()
+
+    rows_max, total_max = repository.search_bid_notices(session, price_max=500)
+    assert total_max == 2
+    assert {row.bid_ntce_no for row in rows_max} == {
+        "BUDGET-HIGH-PRICE-LOW-BUDGET",
+        "BUDGET-EXACT",
+    }
+
+    rows_min, total_min = repository.search_bid_notices(session, price_min=500)
+    assert total_min == 2
+    assert {row.bid_ntce_no for row in rows_min} == {
+        "BUDGET-LOW-PRICE-HIGH-BUDGET",
+        "BUDGET-EXACT",
+    }
+
+    rows_unfiltered, total_unfiltered = repository.search_bid_notices(session)
+    assert total_unfiltered == 4
+    assert "BUDGET-NULL" in {row.bid_ntce_no for row in rows_unfiltered}
+
+    rows_with_budget_condition, total_with_budget_condition = repository.search_bid_notices(
+        session, price_max=1000
+    )
+    assert total_with_budget_condition == 3
+    assert "BUDGET-NULL" not in {row.bid_ntce_no for row in rows_with_budget_condition}
+
+
+# --- 신규 sort (NULL 뒤로) --------------------------------------------
 def test_sort_bid_ntce_dt_asc(session):
     _seed_priced(session)
     rows, _ = repository.search_bid_notices(session, sort="bid_ntce_dt_asc")
     # 오름차순: 4/1(P-4) < 5/1(P-1) < 5/10(P-2) < 5/20(P-3)
     assert [r.bid_ntce_no for r in rows] == ["P-4", "P-1", "P-2", "P-3"]
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected"),
+    [("desc", ["BEGIN-2", "BEGIN-1", "BEGIN-NULL"]),
+     ("asc", ["BEGIN-1", "BEGIN-2", "BEGIN-NULL"])],
+)
+def test_sort_bid_begin_dt_nulls_last(session, direction, expected):
+    base = datetime(2026, 6, 1, 12, 0)
+    notices = [
+        _bn("BEGIN-1", "개시일시 정렬 첫째", datetime(2026, 5, 1), None),
+        _bn("BEGIN-2", "개시일시 정렬 둘째", datetime(2026, 5, 2), None),
+        _bn("BEGIN-NULL", "개시일시 정렬 미정", datetime(2026, 5, 3), None),
+    ]
+    notices[0].bid_begin_dt = datetime(2026, 6, 1, 9, 0)
+    notices[1].bid_begin_dt = datetime(2026, 6, 2, 9, 0)
+    for notice in notices:
+        notice.collected_at = base
+        notice.updated_at = base
+    session.add_all(notices)
+    session.commit()
+
+    rows, total = repository.search_bid_notices(session, sort=f"bid_begin_dt_{direction}")
+    assert total == 3
+    assert [row.bid_ntce_no for row in rows] == expected
 
 
 def test_sort_openg_dt_desc_nulls_last(session):
@@ -820,18 +920,20 @@ def test_parse_price():
 
 # --- 라우트 스모크: Phase 4.2 -----------------------------------------
 def test_list_header_sort_links_present(client):
-    """기본 정렬에서 입찰일시 기준 3개와 개시 내림차순 방향을 표시한다."""
+    """기본 정렬에서 입찰일시 기준 네 옵션과 공고 내림차순 방향을 표시한다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     thead, options, (direction_url, arrow_class, arrow) = _bid_times_header_parts(resp.text)
     assert "입찰일시" in thead
     assert 'class="bt-sortfield"' in thead
     assert 'autocomplete="off"' in thead
-    assert list(options) == ["개시", "마감", "개찰"]
-    assert options["개시"][1] is True
+    assert list(options) == ["공고", "개시", "마감", "개찰"]
+    assert options["공고"][1] is True
+    assert options["개시"][1] is False
     assert options["마감"][1] is False
     assert options["개찰"][1] is False
-    assert "sort=bid_ntce_dt_desc" in options["개시"][0]
+    assert "sort=bid_ntce_dt_desc" in options["공고"][0]
+    assert "sort=bid_begin_dt_desc" in options["개시"][0]
     assert "sort=bid_clse_dt_desc" in options["마감"][0]
     assert "sort=openg_dt_desc" in options["개찰"][0]
     assert "sort=bid_ntce_dt_asc" in direction_url
@@ -849,7 +951,8 @@ def test_list_bid_times_header_openg_asc(client):
     assert resp.status_code == 200
     _thead, options, (direction_url, arrow_class, arrow) = _bid_times_header_parts(resp.text)
     assert options["개찰"][1] is True
-    assert "sort=bid_ntce_dt_asc" in options["개시"][0]
+    assert "sort=bid_ntce_dt_asc" in options["공고"][0]
+    assert "sort=bid_begin_dt_asc" in options["개시"][0]
     assert "sort=bid_clse_dt_asc" in options["마감"][0]
     assert "sort=openg_dt_asc" in options["개찰"][0]
     assert "sort=openg_dt_desc" in direction_url
@@ -857,12 +960,41 @@ def test_list_bid_times_header_openg_asc(client):
     assert arrow == "▲"
 
 
+def test_list_bid_begin_sort_nulls_last(client):
+    notices = [
+        _bn("S-BEGIN-1", "개시일시 라우트 첫째", datetime(2026, 5, 1), None),
+        _bn("S-BEGIN-2", "개시일시 라우트 둘째", datetime(2026, 5, 2), None),
+        _bn("S-BEGIN-NULL", "개시일시 라우트 미정", datetime(2026, 5, 3), None),
+    ]
+    notices[0].bid_begin_dt = datetime(2026, 6, 1, 9, 0)
+    notices[1].bid_begin_dt = datetime(2026, 6, 2, 9, 0)
+    with main.SessionLocal() as s:
+        s.add_all(notices)
+        s.commit()
+
+    for direction, expected in (
+        ("desc", ["S-BEGIN-2", "S-BEGIN-1", "S-BEGIN-NULL"]),
+        ("asc", ["S-BEGIN-1", "S-BEGIN-2", "S-BEGIN-NULL"]),
+    ):
+        resp = client.get(
+            "/list",
+            params={**_WIDE, "q": "개시일시 라우트", "sort": f"bid_begin_dt_{direction}"},
+        )
+        assert resp.status_code == 200
+        assert re.findall(r'<tr data-row-id="([^"]+)">', resp.text) == expected
+        _thead, options, _direction = _bid_times_header_parts(resp.text)
+        assert options["개시"][1] is True
+
+    for direction in ("desc", "asc"):
+        assert client.get("/list", params={**_WIDE, "sort": f"bid_begin_dt_{direction}"}).status_code == 200
+
+
 def test_list_bid_times_header_neutral_on_price_sort(client):
-    """추정가격 정렬 중에는 개시 선택과 중립 화살표를 표시하고 옵션은 desc로 시작한다."""
+    """추정가격 정렬 중에는 공고 선택과 중립 화살표를 표시하고 옵션은 desc로 시작한다."""
     resp = client.get("/list", params={**_WIDE, "sort": "presmpt_prce_desc"})
     assert resp.status_code == 200
     thead, options, (direction_url, arrow_class, arrow) = _bid_times_header_parts(resp.text)
-    assert options["개시"][1] is True
+    assert options["공고"][1] is True
     assert all("_desc" in url for url, _selected in options.values())
     assert "sort=bid_ntce_dt_desc" in direction_url
     assert arrow_class == "arrow neutral"
@@ -926,8 +1058,8 @@ def test_list_bid_times_replaces_standalone_date_headers(client):
     assert "개찰일시" not in thead
 
 
-def test_list_bid_times_cell_three_lines_and_missing_close(client):
-    """입찰일시 셀은 개시→마감→개찰 3줄과 시각 tooltip, NULL 대시를 표시한다."""
+def test_list_bid_times_cell_four_lines_and_missing_close(client):
+    """입찰일시 셀은 공고→개시→마감→개찰 4줄과 시각 tooltip, NULL 대시를 표시한다."""
     from app import main as _main
 
     base = datetime(2026, 6, 1, 12, 0)
@@ -939,6 +1071,7 @@ def test_list_bid_times_cell_three_lines_and_missing_close(client):
                     bid_ntce_nm="입찰일시 렌더 전체",
                     ntce_instt_nm="테스트기관",
                     bid_ntce_dt=datetime(2026, 9, 23, 10, 0),
+                    bid_begin_dt=datetime(2026, 9, 24, 11, 30),
                     bid_clse_dt=datetime(2026, 10, 3, 18, 0),
                     openg_dt=datetime(2026, 10, 10, 11, 0),
                     collected_at=base,
@@ -966,14 +1099,17 @@ def test_list_bid_times_cell_three_lines_and_missing_close(client):
 
     full_pos = resp.text.index("입찰일시 렌더 전체")
     full_row = resp.text[resp.text.rfind("<tr", 0, full_pos):resp.text.index("</tr>", full_pos)]
-    assert full_row.index("개시 : 2026-09-23") < full_row.index("마감 : 2026-10-03")
+    assert full_row.index("공고 : 2026-09-23") < full_row.index("개시 : 2026-09-24")
+    assert full_row.index("개시 : 2026-09-24") < full_row.index("마감 : 2026-10-03")
     assert full_row.index("마감 : 2026-10-03") < full_row.index("개찰 : 2026-10-10")
     assert 'title="2026-09-23 10:00"' in full_row
+    assert 'title="2026-09-24 11:30"' in full_row
     assert 'title="2026-10-03 18:00"' in full_row
     assert 'title="2026-10-10 11:00"' in full_row
 
     null_pos = resp.text.index("입찰일시 렌더 마감없음")
     null_row = resp.text[resp.text.rfind("<tr", 0, null_pos):resp.text.index("</tr>", null_pos)]
+    assert '<span class="bt-line">개시 : -</span>' in null_row
     assert '<span class="bt-line">마감 : -</span>' in null_row
 
 
@@ -982,11 +1118,13 @@ def test_render_bid_times_string_fallback_and_escape():
     html = main._render_bid_times(
         {
             "bid_ntce_dt": "2026-09-23 10:00",
+            "bid_begin_dt": "2026-09-24 11:30",
             "bid_clse_dt": None,
             "openg_dt": '"><script>alert(1)</script>',
         }
     )
-    assert 'title="2026-09-23 10:00">개시 : 2026-09-23</span>' in html
+    assert 'title="2026-09-23 10:00">공고 : 2026-09-23</span>' in html
+    assert 'title="2026-09-24 11:30">개시 : 2026-09-24</span>' in html
     assert '<span class="bt-line">마감 : -</span>' in html
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
@@ -1090,19 +1228,50 @@ def test_list_renders_bid_method_name(client):
 
 
 def test_list_default_sort_is_latest(client):
-    """기본 정렬 = 최신 공고일(bid_ntce_dt_desc) — 입찰일시 개시에 ▼ 표시."""
+    """기본 정렬 = 최신 공고일(bid_ntce_dt_desc) — 입찰일시 공고에 ▼ 표시."""
     resp = client.get("/list", params=_WIDE)
-    # 현재 정렬이 desc 이므로 입찰일시 개시 기준에 ▼ 화살표.
+    # 현재 정렬이 desc 이므로 입찰일시 공고 기준에 ▼ 화살표.
     assert "▼" in resp.text
 
 
 def test_list_price_filter_query(client):
-    """가격 필터 쿼리 — price_max 로 좁히면 결과·입력값 반영."""
-    resp = client.get("/list", params={**_WIDE, "price_min": "1", "price_max": "999999999999"})
-    assert resp.status_code == 200
-    # 입력칸에 값 반영
-    assert 'name="price_min"' in resp.text
-    assert 'name="price_max"' in resp.text
+    """price_max 쿼리와 설정 기본 상한을 배정예산 기준으로 적용한다."""
+    with main.SessionLocal() as s:
+        repository.update_config(s, presmpt_prce_end="550")
+        notices = [
+            _bn("S-PRICE-LOW-BUDGET", "배정예산 라우트 낮은 예산", datetime(2026, 5, 1), None),
+            _bn("S-PRICE-HIGH-BUDGET", "배정예산 라우트 높은 예산", datetime(2026, 5, 2), None),
+            _bn("S-PRICE-CONFIG-IN", "배정예산 라우트 기본값 포함", datetime(2026, 5, 3), None),
+        ]
+        notices[0].asign_bdgt_amt, notices[0].presmpt_prce = 400, 600
+        notices[1].asign_bdgt_amt, notices[1].presmpt_prce = 600, 400
+        notices[2].asign_bdgt_amt, notices[2].presmpt_prce = 500, 900
+        s.add_all(notices)
+        s.commit()
+
+    query_resp = client.get(
+        "/list",
+        params={**_WIDE, "q": "배정예산 라우트", "price_max": "450"},
+    )
+    assert query_resp.status_code == 200
+    assert re.findall(r'<tr data-row-id="([^"]+)">', query_resp.text) == [
+        "S-PRICE-LOW-BUDGET"
+    ]
+    assert 'name="price_min"' in query_resp.text
+    assert 'name="price_max"' in query_resp.text
+    assert 'value="450"' in query_resp.text
+
+    default_resp = client.get("/list", params={**_WIDE, "q": "배정예산 라우트"})
+    assert default_resp.status_code == 200
+    assert re.findall(r'<tr data-row-id="([^"]+)">', default_resp.text) == [
+        "S-PRICE-CONFIG-IN",
+        "S-PRICE-LOW-BUDGET",
+    ]
+    assert 'value="550"' in default_resp.text
+    assert "배정예산 최대" in default_resp.text
+    assert "배정예산 최소" in default_resp.text
+    assert "추정가격 최대" not in default_resp.text
+    assert "추정가격 최소" not in default_resp.text
 
 
 def test_list_date_field_switch_openg(client):
@@ -1169,9 +1338,13 @@ def test_render_matched_industry_unknown_order_and_escape(monkeypatch):
 
 
 def test_config_page_has_price_defaults(client):
-    """/config 에 추정가격 기본 하한/상한 입력 노출."""
+    """/config 에 입찰공고 배정예산 기본 하한/상한을 표시한다."""
     resp = client.get("/config")
     assert resp.status_code == 200
+    assert "입찰공고 검색 기본값(배정예산)" in resp.text
+    assert "배정예산 기본 하한" in resp.text
+    assert "배정예산 기본 상한" in resp.text
+    assert "목록(/list)·사전규격(/pre-spec) 배정예산 검색" in resp.text
     assert 'name="presmpt_prce_bgn"' in resp.text
     assert 'name="presmpt_prce_end"' in resp.text
 
@@ -1222,7 +1395,7 @@ def test_config_save_price_invalid_returns_400(client):
         follow_redirects=False,
     )
     assert resp.status_code == 400
-    assert "추정가격" in resp.text
+    assert "입찰공고 배정예산 기본 하한" in resp.text
 
 
 def test_list_price_default_from_config(client):
@@ -1290,7 +1463,7 @@ def test_list_budget_column_and_won(client):
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
     text = resp.text
-    # 추정가격 검색폼은 유지하되 목록 헤더·셀에서는 제거한다.
+    # 가격 검색폼(배정예산 기준)은 유지하되 추정가격은 목록 헤더·셀에서 제거한다.
     thead = text[text.index("<thead>"):text.index("</thead>")]
     assert "배정예산" in thead
     assert "공고/수요기관" in thead
@@ -1497,7 +1670,7 @@ def test_sort_header_neutral_arrow_on_unsorted_column(client):
     """미정렬 컬럼에 ↕ 중립 화살표가, 현재 정렬 컬럼에 ▼/▲ 방향 화살표가 표시된다."""
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
-    # 기본 정렬(bid_ntce_dt_desc) → 입찰일시 개시 ▼, 배정예산(미정렬) ↕
+    # 기본 정렬(bid_ntce_dt_desc) → 입찰일시 공고 ▼, 배정예산(미정렬) ↕
     assert "▼" in resp.text
     assert "↕" in resp.text  # 미정렬 중립 화살표
 
@@ -1938,7 +2111,7 @@ def test_list_budget_sort_nulls_last_and_header(client, direction, expected, nex
     assert f'<span class="arrow">{arrow}</span>' in budget_header
     assert "q=배정예산정렬" in budget_header
     assert "page=1" in budget_header
-    assert options["개시"][1] is True
+    assert options["공고"][1] is True
     assert "sort=bid_ntce_dt_desc" in direction_url
     assert (arrow_class, time_arrow) == ("arrow neutral", "↕")
 

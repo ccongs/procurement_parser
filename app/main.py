@@ -647,7 +647,7 @@ BASE_CSS = """
   td.ntcecell .ntceno, td.ntcecell .ntcenm { display: block; }
   td.ntcecell .ntceno { margin-bottom: 4px; }
   td.ntcecell .ntcenm { width: fit-content; }
-  /* 입찰일시 통합 셀·헤더: 개시/마감/개찰을 세로로 표시하고 정렬 기준을 헤더에서 선택 */
+  /* 입찰일시 통합 셀·헤더: 공고/개시/마감/개찰을 세로로 표시하고 정렬 기준을 헤더에서 선택 */
   td.bidtimes, th.bidtimes-head { white-space: nowrap; }
   td.bidtimes .bt-line { display: block; line-height: 1.45; }
   th.bidtimes-head .bt-sortfield { margin-left: 4px; padding: 1px 2px; font-size: 12px; }
@@ -1022,7 +1022,8 @@ _LIST_COLUMNS: list[tuple[str, str, str]] = [
 
 # 입찰일시 통합 셀의 실제 컬럼과 표시 라벨. 셀·헤더 모두 이 순서를 공유한다.
 _BID_TIME_FIELDS: list[tuple[str, str]] = [
-    ("bid_ntce_dt", "개시"),
+    ("bid_ntce_dt", "공고"),
+    ("bid_begin_dt", "개시"),
     ("bid_clse_dt", "마감"),
     ("openg_dt", "개찰"),
 ]
@@ -1033,12 +1034,14 @@ _SORTABLE_COLUMNS: dict[str, str] = {
 }
 
 # /list 정렬 허용값(repository._SORT_COLUMNS 와 동일). 미허용·빈값은 기본으로 폴백.
-# 입찰일시 통합 헤더에서 개시/마감/개찰 세 필드의 방향을 선택한다.
+# 입찰일시 통합 헤더에서 공고/개시/마감/개찰 네 필드의 방향을 선택한다.
 # 추정가격 정렬은 화면 헤더 없이 기존 북마크 URL 호환을 위해 유지한다.
 _LIST_SORTS: frozenset[str] = frozenset(
     {
         "bid_ntce_dt_desc",
         "bid_ntce_dt_asc",
+        "bid_begin_dt_desc",
+        "bid_begin_dt_asc",
         "bid_clse_dt_desc",
         "bid_clse_dt_asc",
         "openg_dt_desc",
@@ -1159,7 +1162,7 @@ def _render_instt(ntce: Any, dmin: Any) -> str:
 
 
 def _render_bid_times(row: dict[str, Any]) -> str:
-    """입찰일시 통합 셀. 개시/마감/개찰 날짜를 고정 순서의 세 줄로 표시한다."""
+    """입찰일시 통합 셀. 공고/개시/마감/개찰 날짜를 고정 순서의 네 줄로 표시한다."""
     lines = []
     for field, label in _BID_TIME_FIELDS:
         full = _fmt_dt(row.get(field))
@@ -3128,7 +3131,7 @@ def list_page(
     # 수의계약 제외(기본 True). 체크 해제와 "파라미터 없음(첫 진입)"을 구분하기 위해
     # 폼은 hidden(0)+checkbox(1) 쌍으로 전송한다: 없음=기본(제외), "1" 포함=제외, 그 외=포함.
     excl_privt_flag = True if not excl_privt else ("1" in excl_privt)
-    # 정렬: 입찰일시 3개·배정예산·추정가격(북마크 호환)의 asc/desc 10종. 미허용·빈값은 기본.
+    # 정렬: 입찰일시 4개·배정예산·추정가격(북마크 호환)의 asc/desc 12종. 미허용·빈값은 기본.
     sort = sort if sort in _LIST_SORTS else _DEFAULT_SORT
     # 날짜 적용 컬럼: 공고일/개찰일.
     date_field = date_field if date_field in ("bid_ntce_dt", "openg_dt") else "bid_ntce_dt"
@@ -3164,7 +3167,7 @@ def list_page(
 
     analysis_on = analysis_enabled()
     status_map: dict[str, str] = {}
-    # 가격: 화면 입력값 우선, 비었으면 설정 기본값(presmpt_prce_bgn/end).
+    # 배정예산: 화면 입력값 우선, 비었으면 입찰공고 설정 기본값(presmpt_prce_bgn/end).
     with SessionLocal() as session:
         cfg = repository.get_config(session)
         cfg_price_bgn = cfg.presmpt_prce_bgn
@@ -3293,7 +3296,7 @@ def list_page(
         </div>
       </fieldset>
       <label class="field">
-        <span class="flabel">추정가격 최대</span>
+        <span class="flabel">배정예산 최대</span>
         <input type="number" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 500000000" min="0">
       </label>
       <label class="field">
@@ -3313,7 +3316,7 @@ def list_page(
       </fieldset>
       <div class="row">
         <label class="field">
-          <span class="flabel">추정가격 최소</span>
+          <span class="flabel">배정예산 최소</span>
           <input type="number" name="price_min" id="price_min" value="{_e(price_min_field)}" placeholder="예: 10000000" min="0">
         </label>
         <label class="chk">
@@ -4462,14 +4465,14 @@ def _render_config_page(
               <input type="text" name="indstryty_cds" value="{_e(cfg.get('indstryty_cds'))}" placeholder="예: 1426,1468,1469,1470">
             </label>
           </div>
-          <div class="note" style="margin-top:8px;">입찰공고 검색 기본값(추정가격)</div>
+          <div class="note" style="margin-top:8px;">입찰공고 검색 기본값(배정예산)</div>
           <div class="grid" style="margin-top:4px;">
             <label class="field">
-              <span class="flabel">추정가격 기본 하한 <code>presmpt_prce_bgn</code></span>
+              <span class="flabel">배정예산 기본 하한 <code>presmpt_prce_bgn</code></span>
               <input type="number" name="presmpt_prce_bgn" value="{_e(cfg.get('presmpt_prce_bgn'))}" placeholder="비우면 미적용" min="0">
             </label>
             <label class="field">
-              <span class="flabel">추정가격 기본 상한 <code>presmpt_prce_end</code></span>
+              <span class="flabel">배정예산 기본 상한 <code>presmpt_prce_end</code></span>
               <input type="number" name="presmpt_prce_end" value="{_e(cfg.get('presmpt_prce_end'))}" placeholder="비우면 미적용" min="0">
             </label>
           </div>
@@ -4484,7 +4487,7 @@ def _render_config_page(
               <input type="number" name="pre_spec_amt_end" value="{_e(cfg.get('pre_spec_amt_end'))}" placeholder="비우면 미적용" min="0">
             </label>
           </div>
-          <div class="note">목록(/list) 추정가격·(/pre-spec) 배정예산액 검색의 기본값으로 쓰입니다(비우면 기본 미적용).</div>
+          <div class="note">목록(/list)·사전규격(/pre-spec) 배정예산 검색의 기본값으로 쓰입니다(비우면 기본 미적용).</div>
         </fieldset>
         <label class="chk" style="margin-bottom:8px;">
           <input type="checkbox" name="enabled" value="1"{enabled_checked}>
@@ -4634,11 +4637,11 @@ async def config_save(request: Request):
             f"참가제한지역(prtcpt_lmt_rgn_cd)이 허용 코드가 아닙니다('{rgn}')."
         )
 
-    # 추정가격 기본 하한/상한 + 사전규격 배정예산액 기본 하한/상한 —
+    # 입찰공고 배정예산 기본 하한/상한 + 사전규격 배정예산액 기본 하한/상한 —
     # 숫자(콤마 허용) 또는 빈값. 빈값은 None(미적용)으로 저장.
     for name, lbl in (
-        ("presmpt_prce_bgn", "추정가격 기본 하한"),
-        ("presmpt_prce_end", "추정가격 기본 상한"),
+        ("presmpt_prce_bgn", "입찰공고 배정예산 기본 하한"),
+        ("presmpt_prce_end", "입찰공고 배정예산 기본 상한"),
         ("pre_spec_amt_bgn", "배정예산액 기본 하한"),
         ("pre_spec_amt_end", "배정예산액 기본 상한"),
     ):

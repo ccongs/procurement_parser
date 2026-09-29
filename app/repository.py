@@ -329,7 +329,7 @@ _CONFIG_UPDATABLE: frozenset[str] = frozenset(
         "indstryty_cds",
         # Phase 4.3: 참가제한지역코드(수집 request 필터). ""=전체 / "00"=전국 / 그 외 특정 지역.
         "prtcpt_lmt_rgn_cd",
-        # Phase 4.2: 추정가격 기본 하한/상한(/list 가격 입력의 기본값으로 사용).
+        # 입찰공고 배정예산 기본 하한/상한(/list 가격 입력의 기본값으로 사용).
         "presmpt_prce_bgn",
         "presmpt_prce_end",
         # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위(/pre-spec 가격 기본값).
@@ -342,6 +342,8 @@ _CONFIG_UPDATABLE: frozenset[str] = frozenset(
 _SORT_COLUMNS: dict[str, tuple[str, bool]] = {
     "bid_ntce_dt_desc": ("bid_ntce_dt", True),
     "bid_ntce_dt_asc": ("bid_ntce_dt", False),
+    "bid_begin_dt_desc": ("bid_begin_dt", True),
+    "bid_begin_dt_asc": ("bid_begin_dt", False),
     "openg_dt_desc": ("openg_dt", True),
     "openg_dt_asc": ("openg_dt", False),
     "bid_clse_dt_desc": ("bid_clse_dt", True),
@@ -440,8 +442,8 @@ def search_bid_notices(
       그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
     - date_field(Phase 4.2): 날짜 범위를 적용할 컬럼. "bid_ntce_dt"(공고일, 기본) 또는
       "openg_dt"(개찰일). 허용값 외는 기본(bid_ntce_dt)으로 폴백.
-    - price_min/price_max(Phase 4.2): 추정가격(presmpt_prce) 범위. 있는 쪽만 적용
-      (>= min / <= max). presmpt_prce 는 Numeric — 정수로 비교.
+    - price_min/price_max: 배정예산(asign_bdgt_amt) 범위. 있는 쪽만 적용
+      (>= min / <= max). asign_bdgt_amt 는 Numeric — 정수로 비교.
     - openg_only_future=True: openg_dt >= now(개찰 임박/미래만, NULL 제외). now 는 테스트
       결정성을 위해 주입 가능(기본 None → datetime.now()).
     - include_past_openg(기본 True=하위호환): False 면 개찰 지난 공고를 숨긴다 —
@@ -454,8 +456,8 @@ def search_bid_notices(
       (부분일치·대소문자 무시, 여러 개면 모두 제외). 공고명 NULL 은 숨기지 않는다.
     - ntce_kinds: 선택한 공고종류(ntce_kind_nm)만 표시하되 NULL 은 숨기지 않는다.
       None/빈 목록이면 공고종류 조건을 적용하지 않는다(기존 호출부 호환).
-    - sort(Phase 4.2 확장): _SORT_COLUMNS 의 10종 허용
-      (bid_ntce_dt/openg_dt/bid_clse_dt/asign_bdgt_amt/presmpt_prce × asc/desc).
+    - sort: _SORT_COLUMNS 의 12종 허용
+      (bid_ntce_dt/bid_begin_dt/bid_clse_dt/openg_dt/asign_bdgt_amt/presmpt_prce × asc/desc).
       NULL 은 항상 뒤로. 추정가격 정렬은 기존 북마크 URL 호환을 위해 유지.
       기본·미허용값은 "bid_ntce_dt_desc"(최신 공고순).
     - page/page_size: LIMIT/OFFSET 페이지네이션. 전체건수는 동일 필터로 count.
@@ -473,9 +475,9 @@ def search_bid_notices(
     if dt_to is not None:
         conditions.append(date_col <= dt_to)
     if price_min is not None:
-        conditions.append(BidNotice.presmpt_prce >= price_min)
+        conditions.append(BidNotice.asign_bdgt_amt >= price_min)
     if price_max is not None:
-        conditions.append(BidNotice.presmpt_prce <= price_max)
+        conditions.append(BidNotice.asign_bdgt_amt <= price_max)
     if openg_only_future:
         if now is None:
             now = datetime.now()
@@ -511,7 +513,7 @@ def search_bid_notices(
     for cond in conditions:
         stmt = stmt.where(cond)
 
-    # 정렬: 허용 10종 → (컬럼, 내림차순). NULL 은 항상 뒤로(is-null 플래그를 1차 키로, 이식성↑).
+    # 정렬: 허용 12종 → (컬럼, 내림차순). NULL 은 항상 뒤로(is-null 플래그를 1차 키로, 이식성↑).
     sort_col_name, descending = _SORT_COLUMNS.get(
         sort, _SORT_COLUMNS["bid_ntce_dt_desc"]
     )

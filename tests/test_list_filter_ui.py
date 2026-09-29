@@ -278,8 +278,11 @@ def test_list_filter_summary_detail_order_and_single_form(client):
     for name in ("excl_kw", "kind", "price_min", "include_past", "excl_privt"):
         assert f'name="{name}"' in detail
         assert f'name="{name}"' not in summary
-    for label in ("공고명 제외 키워드", "공고종류", "추정가격 최소", "지난 개찰 포함", "수의계약제외"):
+    for label in ("공고명 제외 키워드", "공고종류", "배정예산 최소", "지난 개찰 포함", "수의계약제외"):
         assert label in detail
+    assert "배정예산 최대" in summary
+    assert "추정가격 최대" not in summary
+    assert "추정가격 최소" not in detail
     assert "<form" not in form
     assert html.count('action="/list"') == 1
 
