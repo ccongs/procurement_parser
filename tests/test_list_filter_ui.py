@@ -291,7 +291,14 @@ def test_list_filter_summary_detail_order_and_single_form(client):
     assert 'type="submit"' in summary
     assert "filter-toggle" in summary
     assert "btn-add-to-cart" in summary
-    assert _attrs(summary, "select", name="page_size")[0]["onchange"] == "this.form.submit()"
+    page_size = _attrs(summary, "select", name="page_size")[0]
+    assert page_size["onchange"] == "this.form.submit()"
+    assert page_size["aria-label"] == "표기개수"
+    assert '<span class="flabel">표기개수</span>' not in summary
+    assert re.findall(r'<option value="(\d+)"(?: selected)?>(\d+)건</option>', summary) == [
+        ("10", "10"), ("30", "30"), ("50", "50"), ("100", "100")
+    ]
+    assert '<option value="50" selected>50건</option>' in summary
     for name in ("excl_kw", "kind", "price_min", "include_past", "excl_privt"):
         assert f'name="{name}"' in detail
         assert f'name="{name}"' not in summary
@@ -309,6 +316,19 @@ def test_list_filter_summary_detail_order_and_single_form(client):
     assert "추정가격 최소" not in detail
     assert "<form" not in form
     assert html.count('action="/list"') == 1
+    pre_spec = client.get("/pre-spec").text
+    assert '<span class="flabel">표기개수</span>' in pre_spec
+
+
+def test_list_summary_inputs_and_page_size_select_have_equal_explicit_height():
+    rule = re.search(
+        r"\.list-filter \.list-summary-main \.field input,\s*"
+        r"\.list-filter \.list-summary-main \.field select\s*\{([^}]+)\}",
+        main.BASE_CSS,
+    )
+    assert rule is not None
+    assert "height: 31px" in rule.group(1)
+    assert "box-sizing: border-box" in rule.group(1)
 
 
 def test_list_price_inputs_format_commas_and_links_keep_numeric_values(client):
