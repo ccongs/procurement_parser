@@ -330,6 +330,16 @@ def test_list_summary_inputs_and_page_size_select_have_equal_explicit_height():
     assert "height: 31px" in rule.group(1)
     assert "box-sizing: border-box" in rule.group(1)
 
+    button_rule = re.search(
+        r"\.list-filter \.list-summary-main > button\.submit,\s*"
+        r"\.list-filter \.list-summary-main > button\.filter-toggle,\s*"
+        r"\.list-filter \.list-summary-main > button#btn-add-to-cart\s*\{([^}]+)\}",
+        main.BASE_CSS,
+    )
+    assert button_rule is not None
+    assert "height: 31px" in button_rule.group(1)
+    assert "box-sizing: border-box" in button_rule.group(1)
+
 
 def test_list_price_inputs_format_commas_and_links_keep_numeric_values(client):
     with main.SessionLocal() as session:
