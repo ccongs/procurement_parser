@@ -156,6 +156,23 @@ def test_list_page_renders_analysis_button_by_status(client, status, expected):
     assert 'data-name="소프트웨어 유지보수 용역"' in resp.text
 
 
+def test_done_analysis_button_classes_match_server_and_client_renderers():
+    server_html = main._render_analysis_cell(
+        source_type="bid",
+        source_id="BID-CLASS-CHECK",
+        source_name="분석 버튼 클래스 확인",
+        total_cols=12,
+        status="done",
+        cell_class="analysis-col",
+    )
+    for fragment in (
+        'class="btn-analyze is-done"',
+        'class="btn-analyze is-done analysis-menu-toggle"',
+    ):
+        assert fragment in server_html
+        assert fragment in main._ANALYSIS_SCRIPT
+
+
 def test_list_page_has_upload_modal(client):
     """입찰공고 목록 페이지에 업로드 모달 HTML이 포함된다."""
     resp = client.get("/list")

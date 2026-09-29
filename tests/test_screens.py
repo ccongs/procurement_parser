@@ -1997,6 +1997,7 @@ def test_list_notice_cell_link_and_escape(client, url):
     else:
         assert f'<span class="ntcenm">{name}</span>' in cell
         assert "<a " not in cell
+    assert 'class="relntce"' not in cell
     assert '<공고&"명>' not in cell
     assert 'data-item-id="S-NTCE-&lt;&amp;&quot;"' in resp.text
 
@@ -2027,8 +2028,13 @@ def test_related_notice_number_is_escaped_in_notice_cell():
         kind="재공고",
         raw_json=json.dumps({"befBidBbancNo": '<old&"no>'}),
     )
-    assert 'R26-NEW - [&lt;old&amp;&quot;no&gt;]' in cell
+    assert (
+        'R26-NEW<span class="relntce" title="관련공고(이전 공고번호)"> '
+        '- [&lt;old&amp;&quot;no&gt;]</span>' in cell
+    )
     assert '<old&"no>' not in cell
+    rel_rule = re.search(r"td\.ntcecell \.relntce\s*\{([^}]+)\}", main.BASE_CSS)
+    assert rel_rule is not None and "color: #8a93a2" in rel_rule.group(1)
 
 
 def test_list_renders_related_notice_number_for_reannouncement(client):
@@ -2043,7 +2049,10 @@ def test_list_renders_related_notice_number_for_reannouncement(client):
         "/list", params={**_WIDE, "q": "관련공고 라우트", "include_past": "1"}
     )
     assert response.status_code == 200
-    assert "R26BK01743383 - [R26BK01725789]" in response.text
+    assert (
+        'R26BK01743383<span class="relntce" title="관련공고(이전 공고번호)"> '
+        '- [R26BK01725789]</span>' in response.text
+    )
 
 
 @pytest.mark.parametrize(
@@ -2130,7 +2139,7 @@ def test_list_sucsfbid_method_cell(client, value, expected_cell):
 
 
 def test_list_kind_alignment(client):
-    """구분 데이터 셀은 가운데 정렬을 유지하고 헤더 가운데 정렬 규칙은 제거한다."""
+    """구분 데이터 셀은 가운데, 헤더는 왼쪽 정렬하고 축소 여백은 셀에만 적용한다."""
     notice = _bn("S-KIND-EMPTY", "빈 구분 셀 공고", datetime(2026, 5, 8), datetime(2000, 1, 1))
     notice.ntce_kind_nm = None
     notice.bid_methd_nm = ""
@@ -2149,6 +2158,15 @@ def test_list_kind_alignment(client):
     assert "text-align: center" in cell_css
     assert "vertical-align: middle" in cell_css
     assert not re.search(r"th\.kindhead\s*\{[^}]*text-align:\s*center", main.BASE_CSS)
+    kind_width_rule = re.search(r"table\.listtable \.kind-col\s*\{([^}]+)\}", main.BASE_CSS)
+    assert kind_width_rule is not None
+    assert "padding-left" not in kind_width_rule.group(1)
+    kind_cell_rule = re.search(
+        r"table\.listtable > tbody > tr > td\.kind-col\s*\{([^}]+)\}", main.BASE_CSS
+    )
+    assert kind_cell_rule is not None
+    assert "padding-left: 4px" in kind_cell_rule.group(1)
+    assert "padding-right: 4px" in kind_cell_rule.group(1)
 
 
 def test_list_table_alignment_scoped_css(client):
@@ -2195,10 +2213,10 @@ def test_list_fixed_column_widths_and_nowrap_content(client, monkeypatch):
     for cls, width in (
         ("col-chk", 36),
         ("rownum-col", 44),
-        ("kind-col", 96),
+        ("kind-col", 82),
         ("bidtime-col", 150),
         ("file-col", 80),
-        ("analysis-col", 120),
+        ("analysis-col", 80),
     ):
         rule = re.search(rf"table\.listtable \.{cls}\s*\{{([^}}]+)\}}", main.BASE_CSS)
         assert rule is not None
@@ -2208,6 +2226,57 @@ def test_list_fixed_column_widths_and_nowrap_content(client, monkeypatch):
             attrs.split() for attrs in re.findall(r'class="([^"]+)"', response.text)
         ]
         assert any(cls in classes for classes in class_sets)
+    rownum_rule = re.search(r"table\.listtable \.rownum-col\s*\{([^}]+)\}", main.BASE_CSS)
+    assert rownum_rule is not None and "text-align: center" in rownum_rule.group(1)
+    rownum_head_rule = re.search(
+        r"table\.listtable > thead > tr > th\.rownum-col\s*\{([^}]+)\}", main.BASE_CSS
+    )
+    assert rownum_head_rule is not None
+    assert re.search(r"\btext-align:\s*center\s*;", rownum_head_rule.group(1))
+    generic_head_rule = re.search(
+        r"table\.listtable > thead > tr > th:not\(\.col-chk\)\s*\{([^}]+)\}",
+        main.BASE_CSS,
+    )
+    assert generic_head_rule is not None and "text-align: left" in generic_head_rule.group(1)
+    assert not re.search(
+        r"table\.listtable > thead > tr > th\.(?:file-col|analysis-col)\s*\{[^}]*"
+        r"text-align:\s*center",
+        main.BASE_CSS,
+    )
+    cell_rule = re.search(
+        r"table\.listtable > tbody > tr > td\.file-col,\s*"
+        r"table\.listtable > tbody > tr > td\.analysis-col\s*\{([^}]+)\}",
+        main.BASE_CSS,
+    )
+    assert cell_rule is not None
+    assert "text-align: center" in cell_rule.group(1)
+    assert "vertical-align: middle" in cell_rule.group(1)
+    header_nowrap = re.search(
+        r"table\.listtable > thead > tr > th\s*\{([^}]+)\}", main.BASE_CSS
+    )
+    assert header_nowrap is not None and "white-space: nowrap" in header_nowrap.group(1)
+    kind_rule = re.search(r"table\.listtable \.kind-col\s*\{([^}]+)\}", main.BASE_CSS)
+    assert kind_rule is not None
+    assert "padding-left" not in kind_rule.group(1)
+    done_label_rule = re.search(
+        r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\.is-done:"
+        r"not\(\.analysis-menu-toggle\)\s*\{([^}]+)\}", main.BASE_CSS,
+    )
+    assert done_label_rule is not None
+    assert "padding-left: 1px" in done_label_rule.group(1)
+    assert "padding-right: 1px" in done_label_rule.group(1)
+    done_toggle_rule = re.search(
+        r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\.is-done\."
+        r"analysis-menu-toggle\s*\{([^}]+)\}", main.BASE_CSS,
+    )
+    assert done_toggle_rule is not None
+    assert "padding-left: 3px" in done_toggle_rule.group(1)
+    assert "padding-right: 3px" in done_toggle_rule.group(1)
+    assert not re.search(
+        r"table\.listtable \.analysis-col \.analysis-actions \.btn-analyze\s*\{",
+        main.BASE_CSS,
+    )
+    assert ".analysis-actions .analysis-menu-toggle { padding: 4px 7px; }" in main.BASE_CSS
     badge_rule = re.search(r"(?m)^\s*\.badge\s*\{([^}]+)\}", main.BASE_CSS)
     assert badge_rule is not None and "white-space: nowrap" in badge_rule.group(1)
     for selector in (
@@ -2286,8 +2355,12 @@ def test_list_column_count_with_analysis_toggle(client, monkeypatch, enabled, co
     thead = resp.text[resp.text.index("<thead>"):resp.text.index("</thead>")]
     tbody = resp.text[resp.text.index("<tbody>"):resp.text.index("</tbody>")]
     assert len(re.findall(r"<th\b", thead)) == column_count
+    assert '<th class="file-col">파일</th>' in thead
+    assert ('<th class="analysis-col">분석</th>' in thead) is enabled
     for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", tbody):
         assert len(re.findall(r"<td\b", row)) == column_count
+        assert 'class="file-col"' in row
+        assert ('class="analysis-col"' in row) is enabled
     spans = re.findall(r'data-colspan="(\d+)"', tbody)
     if enabled:
         assert spans and set(spans) == {str(column_count)}

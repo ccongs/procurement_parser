@@ -637,6 +637,7 @@ BASE_CSS = """
   /* /list 표: 데이터는 세로 가운데, 헤더는 왼쪽, 배정예산만 오른쪽 정렬 */
   table.listtable > tbody > tr > td { vertical-align: middle; }
   table.listtable > thead > tr > th:not(.col-chk) { text-align: left; vertical-align: middle; }
+  table.listtable > thead > tr > th { white-space: nowrap; }
   table.listtable > tbody > tr > td.budgetcell { text-align: right; white-space: nowrap; }
   /* 매칭업종은 코드만 표시하고 콤마 뒤에서 줄바꿈 허용 */
   table.listtable td.matchind { max-width: 240px; }
@@ -645,11 +646,23 @@ BASE_CSS = """
   table.listtable .col-chk { width: 36px; min-width: 36px; max-width: 36px; text-align: center; }
   table.listtable .col-chk input[type=checkbox] { padding: 0; margin: 0; }
   table:not(.listtable) .col-chk { width: 36px; }
-  table.listtable .rownum-col { width: 44px; min-width: 44px; max-width: 44px; }
-  table.listtable .kind-col { width: 96px; min-width: 96px; max-width: 96px; }
+  table.listtable .rownum-col { width: 44px; min-width: 44px; max-width: 44px; text-align: center; }
+  table.listtable .kind-col { width: 82px; min-width: 82px; max-width: 82px; }
+  table.listtable > tbody > tr > td.kind-col { padding-left: 4px; padding-right: 4px; }
   table.listtable .bidtime-col { width: 150px; min-width: 150px; max-width: 150px; }
   table.listtable .file-col { width: 80px; min-width: 80px; max-width: 80px; }
-  table.listtable .analysis-col { width: 120px; min-width: 120px; max-width: 120px; }
+  table.listtable .analysis-col { width: 80px; min-width: 80px; max-width: 80px; }
+  table.listtable > thead > tr > th.rownum-col { text-align: center; }
+  table.listtable > tbody > tr > td.file-col,
+  table.listtable > tbody > tr > td.analysis-col { padding: 6px 4px; text-align: center; vertical-align: middle; }
+  table.listtable button.filebtn { padding-left: 4px; padding-right: 4px; }
+  table.listtable .analysis-actions { gap: 2px; }
+  table.listtable .analysis-col .analysis-actions .btn-analyze.is-done:not(.analysis-menu-toggle) {
+    padding-left: 1px; padding-right: 1px;
+  }
+  table.listtable .analysis-col .analysis-actions .btn-analyze.is-done.analysis-menu-toggle {
+    padding-left: 3px; padding-right: 3px;
+  }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
   td.kindcell { text-align: center; vertical-align: middle; }
   td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
@@ -657,6 +670,7 @@ BASE_CSS = """
   /* 공고번호/공고명 통합 셀: 기존 글꼴·링크 스타일을 유지하고 두 줄로 표시 */
   td.ntcecell .ntceno, td.ntcecell .ntcenm { display: block; }
   td.ntcecell .ntceno { margin-bottom: 4px; }
+  td.ntcecell .relntce { color: #8a93a2; }
   td.ntcecell .ntcenm { width: fit-content; }
   /* 공고일시·제출일시는 각 두 줄이며 정렬 기준을 헤더에서 선택한다. */
   td.bidtime-cell, th.bidtime-head { white-space: nowrap; }
@@ -705,6 +719,8 @@ BASE_CSS = """
   .list-filter .field input, .list-filter .field select { background: #fff; }
   .list-filter .filter-summary { display: block; padding: 10px 16px; }
   .list-filter .list-summary-main { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .list-filter .list-summary-main .field input,
+  .list-filter .list-summary-main .field select { height: 31px; box-sizing: border-box; }
   .list-filter .list-filter-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0 0; }
   .list-filter .list-group-label { flex: 0 0 96px; width: 96px; min-width: max-content;
                                    font-size: 13px; font-weight: 600; line-height: 1.35; white-space: nowrap; }
@@ -1222,7 +1238,10 @@ def _render_ntce(
     related = _related_ntce_no(kind, raw_json, no)
     number_line = _e(number or "-")
     if related:
-        number_line += f" - [{_e(related)}]"
+        number_line += (
+            f'<span class="relntce" title="관련공고(이전 공고번호)">'
+            f' - [{_e(related)}]</span>'
+        )
     text = _e(name or "-")
     if url:
         name_line = (
@@ -3495,8 +3514,7 @@ def list_page(
           <input type="text" inputmode="numeric" class="price-comma" name="price_max" id="price_max" value="{_e(price_max_field)}" placeholder="예: 100,000,000">
         </label>
         <label class="field">
-          <span class="flabel">표기개수</span>
-          <select name="page_size" onchange="this.form.submit()">{ps_opts}</select>
+          <select name="page_size" aria-label="표기개수" onchange="this.form.submit()">{ps_opts}</select>
         </label>
         <button type="submit" class="submit">검색</button>
         {_filter_toggle_button("filterCard")}
