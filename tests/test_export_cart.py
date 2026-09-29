@@ -410,6 +410,8 @@ class TestApiExportCartDownload:
         assert ws.cell(row=1, column=1).value == "구분"
         assert ws.cell(row=1, column=2).value == "공고번호"
         assert ws.cell(row=1, column=3).value == "제목"
+        assert ws.cell(row=1, column=8).value == "공고일시"
+        assert all(ws.cell(row=1, column=col).value != "개시일시" for col in range(1, 10))
         # 데이터 행 확인
         assert ws.cell(row=2, column=1).value == "입찰공고"
         assert ws.cell(row=2, column=2).value == "BID001"
