@@ -170,8 +170,8 @@ class AppConfig(Base):
     intrntnl_div_cd = Column(String(1), nullable=False, default="1")      # 국내(1)/국제(2)/전체(빈값)
     indstryty_cds = Column(String(100), nullable=False, default="1426,1468,1469,1470")  # 업종코드 CSV
     prtcpt_lmt_rgn_cd = Column(String(2))                     # 참가제한지역(미사용=null)
-    presmpt_prce_bgn = Column(String(25))                    # 추정가격 하한(미사용)
-    presmpt_prce_end = Column(String(25))                    # 추정가격 상한(미사용)
+    presmpt_prce_bgn = Column(String(25))                    # 입찰공고 배정예산 기본 하한
+    presmpt_prce_end = Column(String(25))                    # 입찰공고 배정예산 기본 상한
     last_success_dt = Column(DateTime)                       # 마지막 성공 윈도우 종료 시각
     updated_at = Column(DateTime)                            # 설정 변경 시각
     # --- 사전규격 잡(Phase 5.4) — 입찰과 독립 토글·윈도우 기준 ---
