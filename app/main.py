@@ -32,7 +32,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, 
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
-from app import api_client, industry_codes, region_codes, repository, scheduler
+from app import __version__, api_client, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal, init_db
 from app.logging_config import setup_logging
 from app.models import BidNotice, PreSpec
@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
     logger.info("FastAPI 종료 — 스케줄러를 정리했습니다.")
 
 
-app = FastAPI(title="나라장터 입찰공고 수집 (Phase 3)", lifespan=lifespan)
+app = FastAPI(title="나라장터 입찰공고·사전규격 자동 수집", version=__version__, lifespan=lifespan)
 
 # 조회일시 영역에서 전용 위젯으로 렌더링하므로 일반 입력 그리드에서는 제외하는 파라미터.
 # (inqryBgnDt/inqryEndDt 는 화면의 날짜 선택값으로부터 서버에서 조립한다)
@@ -341,7 +341,7 @@ PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>나라장터 입찰공고 API 테스트 (Phase 1)</title>
+  <title>나라장터 입찰공고 API 테스트</title>
   <style>
     * {{ box-sizing: border-box; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
