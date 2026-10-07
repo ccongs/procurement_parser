@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 
 import pytest
-from sqlalchemy import Column, MetaData, Table, create_engine, event, inspect, select
+from sqlalchemy import Column, MetaData, Table, create_engine, event, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -56,7 +56,7 @@ def test_new_schema_tables_columns_indexes_and_rule_unique(database):
         "bid_ntce_no", "bid_ntce_ord", "lmt_grp_no", "lmt_sno",
     ]
     assert {tuple(i["column_names"]) for i in inspector.get_indexes("bid_license_limit")} == {
-        ("bid_ntce_no",), ("lcns_cd",),
+        ("lcns_cd",),
     }
     for table, fields in (
         ("bid_notice_raw", ["updated_at"]),
@@ -81,12 +81,13 @@ def test_new_schema_tables_columns_indexes_and_rule_unique(database):
         session.rollback()
 
 
-def _old_notice_table(engine):
+def _old_notice_table(engine, retained_columns=()):
     """신규 5컬럼·테이블·인덱스가 없는 기존 공고 스키마를 생성."""
     metadata = MetaData()
     table = Table("bid_notice", metadata, *[
         Column(c.name, c.type, primary_key=c.primary_key, nullable=c.nullable)
-        for c in BidNotice.__table__.columns if c.name not in NEW_COLUMNS
+        for c in BidNotice.__table__.columns
+        if c.name not in NEW_COLUMNS or c.name in retained_columns
     ])
     metadata.create_all(engine)
     return table
@@ -203,3 +204,104 @@ def test_classification_migrates_without_any_legacy_raw(database):
     first = _snapshot(engine)
     db.init_db()
     assert _snapshot(engine) == first
+
+
+def test_existing_classification_columns_preserve_null_basis_after_two_inits(database):
+    engine, local = database
+    db.init_db()
+    with local() as session:
+        session.add_all([
+            BidNotice(
+                bid_ntce_no=f"EXISTING-{visible}", list_visible=visible, match_basis=None,
+                collected_at=NOW, updated_at=NOW,
+            )
+            for visible in (False, True)
+        ])
+        session.commit()
+    before = _snapshot(engine)
+    db.init_db()
+    db.init_db()
+    assert _snapshot(engine) == before
+    with local() as session:
+        row = session.get(BidNotice, "EXISTING-False")
+        assert row.list_visible is False and row.match_basis is None
+
+
+def test_new_match_basis_column_only_backfills_visible_notices(database):
+    engine, local = database
+    table = _old_notice_table(engine, retained_columns={"list_visible"})
+    with engine.begin() as conn:
+        conn.execute(table.insert(), [
+            {"bid_ntce_no": f"LEGACY-{visible}", "list_visible": visible,
+             "collected_at": NOW, "updated_at": NOW}
+            for visible in (False, True)
+        ])
+    db.init_db()
+    with local() as session:
+        hidden = session.get(BidNotice, "LEGACY-False")
+        visible = session.get(BidNotice, "LEGACY-True")
+        assert hidden.list_visible is False and hidden.match_basis is None
+        assert visible.list_visible is True and visible.match_basis == "업종"
+    before = _snapshot(engine)
+    db.init_db()
+    assert _snapshot(engine) == before
+
+
+def test_list_rule_sql_insert_uses_enabled_server_default(database):
+    engine, local = database
+    db.init_db()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO list_rule (rule_type, value, created_at) "
+            "VALUES (:rule_type, :value, :created_at)"
+        ), {"rule_type": "keyword", "value": "소프트웨어", "created_at": NOW.isoformat(sep=" ")})
+    with local() as session:
+        rule = session.execute(select(ListRule)).scalar_one()
+        assert rule.enabled is True
+
+
+@pytest.mark.parametrize("failed_batch", [1, 2])
+def test_raw_migration_batch_rolls_back_and_retries(database, failed_batch):
+    engine, local = database
+    db.init_db()
+    original = '{"befBidBbancNo":"OLD", "pubPrcrmntClsfcNm":"분류"}'
+    with engine.begin() as conn:
+        conn.execute(BidNotice.__table__.insert(), [
+            {"bid_ntce_no": f"ROLLBACK-{i:04}", "raw_json": original,
+             "collected_at": NOW, "updated_at": NOW}
+            for i in range(1001)
+        ])
+    batches = []
+
+    def fail_after_first_notice_update(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("INSERT INTO bid_notice_raw"):
+            batches.append(len(parameters) if executemany else 1)
+        if len(batches) == failed_batch and statement.startswith("UPDATE bid_notice SET"):
+            # 원문 INSERT 와 첫 호환 컬럼 비우기가 실행된 뒤 예외를 주입한다.
+            raise RuntimeError("원문 이관 배치 실패 주입")
+
+    event.listen(engine, "after_cursor_execute", fail_after_first_notice_update)
+    try:
+        with pytest.raises(RuntimeError, match="원문 이관 배치 실패 주입"):
+            db.init_db()
+    finally:
+        event.remove(engine, "after_cursor_execute", fail_after_first_notice_update)
+    assert batches == [500] * failed_batch
+    committed = (failed_batch - 1) * 500
+    with local() as session:
+        notices = session.execute(select(BidNotice).order_by(BidNotice.bid_ntce_no)).scalars().all()
+        raw_rows = session.execute(select(BidNoticeRaw)).scalars().all()
+        assert len(raw_rows) == committed
+        assert all(raw.raw_json == original and raw.updated_at == NOW for raw in raw_rows)
+        for i, row in enumerate(notices):
+            assert row.raw_json == (None if i < committed else original)
+            assert row.bef_bid_bbanc_no == ("OLD" if i < committed else None)
+            assert row.pub_prcrmnt_clsfc_nm == ("분류" if i < committed else None)
+    db.init_db()
+    with local() as session:
+        notices = session.execute(select(BidNotice)).scalars().all()
+        raw_rows = session.execute(select(BidNoticeRaw)).scalars().all()
+        assert len(notices) == len(raw_rows) == 1001
+        assert all(row.raw_json is None and row.bef_bid_bbanc_no == "OLD"
+                   and row.pub_prcrmnt_clsfc_nm == "분류" for row in notices)
+        assert all(raw.raw_json == original and raw.updated_at == NOW for raw in raw_rows)

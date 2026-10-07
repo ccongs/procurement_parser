@@ -281,6 +281,28 @@ def test_upsert_notice_and_raw_rollback_together(session):
     assert session.get(BidNoticeRaw, "ROLLBACK-13") is None
 
 
+def test_upsert_without_raw_preserves_legacy_raw_until_replacement(session):
+    t1 = datetime(2026, 6, 1, 10)
+    t2 = datetime(2026, 6, 1, 11)
+    session.add(BidNotice(
+        bid_ntce_no="LEGACY-RAW-13", raw_json="legacy",
+        collected_at=t1, updated_at=t1,
+    ))
+    session.commit()
+    values = {"bid_ntce_no": "LEGACY-RAW-13", "bid_ntce_nm": "갱신", "updated_at": t2}
+    assert repository.upsert_bid_notices(session, [values])[:2] == (0, 1)
+    session.commit()
+    row = session.get(BidNotice, "LEGACY-RAW-13")
+    assert row.bid_ntce_nm == "갱신" and row.updated_at == t2
+    assert row.raw_json == "legacy"
+    assert session.get(BidNoticeRaw, "LEGACY-RAW-13") is None
+
+    repository.upsert_bid_notices(session, [{**values, "raw_json": "replacement"}])
+    session.commit()
+    assert session.get(BidNotice, "LEGACY-RAW-13").raw_json is None
+    assert session.get(BidNoticeRaw, "LEGACY-RAW-13").raw_json == "replacement"
+
+
 def test_upsert_mixed_new_and_existing(session):
     t = datetime(2026, 6, 1, 10, 0, 0)
     repository.upsert_bid_notices(

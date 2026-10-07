@@ -93,7 +93,7 @@ def init_db() -> None:
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
       create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
-    - 순서: create_all → 컬럼 ALTER → 인덱스 생성 → 원문·분류값 이관 → 기존 시드.
+    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관 → 기존 시드.
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
@@ -114,8 +114,8 @@ def _migrate_add_columns() -> None:
     (`collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다). init_db() 를 여러 번 호출해도
     안전하다.
 
-    ⚠️ PostgreSQL 이전 시: boolean 기본값 리터럴 `1`(SQLite 표기)을 `true` 로 바꿔야 한다
-    (SQLite 우선·표준 ALTER 사용). 컬럼 추가만 하므로 그 외 표준 SQL 로 이식 가능하다.
+    list_visible 기본값 TRUE 는 SQLite·PostgreSQL 공통 표기다.
+    기존 pre_spec_enabled 의 DEFAULT 1 은 PostgreSQL 이전 시 true 로 조정해야 한다.
     """
     insp = inspect(engine)
     tables = set(insp.get_table_names())
@@ -124,11 +124,11 @@ def _migrate_add_columns() -> None:
         return {c["name"] for c in insp.get_columns(t)}
 
     stmts: list[str] = []
+    match_basis_added = False
     if "bid_notice" in tables:
         bn = colset("bid_notice")
-        # PG 이전 시 list_visible 의 DEFAULT 1 → DEFAULT true 로 조정.
         additions = {
-            "list_visible": "BOOLEAN NOT NULL DEFAULT 1",
+            "list_visible": "BOOLEAN NOT NULL DEFAULT TRUE",
             "match_basis": "VARCHAR(10)",
             "match_detail": "VARCHAR(200)",
             "pub_prcrmnt_clsfc_nm": "VARCHAR(100)",
@@ -137,6 +137,8 @@ def _migrate_add_columns() -> None:
         for name, definition in additions.items():
             if name not in bn:
                 stmts.append(f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}")
+                if name == "match_basis":
+                    match_basis_added = True
     if "collection_run" in tables and "source" not in colset("collection_run"):
         stmts.append(
             "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
@@ -166,6 +168,12 @@ def _migrate_add_columns() -> None:
         with engine.begin() as conn:
             for s in stmts:
                 conn.execute(text(s))
+            if match_basis_added:
+                # 컬럼을 새로 추가한 이번 실행에서만 기존 표시 공고의 분류값을 보정한다.
+                conn.execute(text(
+                    "UPDATE bid_notice SET match_basis='업종', list_visible=true "
+                    "WHERE match_basis IS NULL AND list_visible = true"
+                ))
 
 
 def _migrate_bid_notice_indexes() -> None:
@@ -232,13 +240,6 @@ def _migrate_bid_notice_raw() -> None:
                     notice.update().where(notice.c.bid_ntce_no == row["bid_ntce_no"])
                     .values(**values)
                 )
-
-    # 원문 이관 대상이 없어도 기존 업종 검색 공고의 분류값을 보정한다.
-    with engine.begin() as conn:
-        conn.execute(
-            notice.update().where(notice.c.match_basis.is_(None))
-            .values(match_basis="업종", list_visible=True)
-        )
 
 
 def _seed_app_config() -> None:

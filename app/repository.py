@@ -213,7 +213,8 @@ def upsert_bid_notices(
                 if key == "collected_at":
                     continue  # 최초 수집 시각 보존
                 setattr(row, key, value)
-            row.raw_json = None  # 호환 컬럼에는 원문을 남기지 않는다.
+            if "raw_json" in values:
+                row.raw_json = None  # 원문을 분리 저장하는 경우에만 호환 컬럼을 비운다.
             updated_count += 1
 
         if "raw_json" in values:

@@ -154,7 +154,7 @@ class BidLicenseLimit(Base):
 
     __tablename__ = "bid_license_limit"
 
-    bid_ntce_no = Column(String(40), primary_key=True, index=True)
+    bid_ntce_no = Column(String(40), primary_key=True)
     bid_ntce_ord = Column(String(3), primary_key=True)
     lmt_grp_no = Column(String(10), primary_key=True)
     lmt_sno = Column(String(10), primary_key=True)
@@ -173,7 +173,7 @@ class ListRule(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     rule_type = Column(String(20), nullable=False)       # clsfc/keyword/negative
     value = Column(String(100), nullable=False)
-    enabled = Column(Boolean, nullable=False, default=True)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=true())
     created_at = Column(DateTime, nullable=False, default=_utcnow)
 
     __table_args__ = (
