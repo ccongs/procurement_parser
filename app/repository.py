@@ -981,11 +981,11 @@ def delete_list_rule(session: Session, rule_id: int, *, commit: bool = True) -> 
 
 
 def set_list_rules_enabled(
-    session: Session, enabled_ids: list[int], *, commit: bool = True,
+    session: Session, rule_ids: list[int], enabled_ids: list[int], *, commit: bool = True,
 ) -> None:
-    """전달된 id 만 사용하도록 전체 규칙의 체크 상태를 저장한다."""
+    """화면에 렌더된 규칙만 체크 상태를 저장한다(나중에 추가된 규칙은 유지)."""
     wanted = set(enabled_ids)
-    for row in session.scalars(select(ListRule)):
+    for row in session.scalars(select(ListRule).where(ListRule.id.in_(rule_ids))):
         row.enabled = row.id in wanted
     if commit:
         session.commit()

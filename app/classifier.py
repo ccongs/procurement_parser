@@ -244,17 +244,22 @@ def iter_classifications(
 
 def reclassify_notices(
     session: Session, *, bid_ntce_nos: Iterable[str] | None = None,
+    rules: RuleSet | None = None, match_codes: Collection[str] | None = None,
     commit: bool = True,
 ) -> dict:
-    """변경된 분류 컬럼만 갱신하고 판정 통계를 반환한다(기본 1회 커밋)."""
-    session.flush()
-    rules = load_rule_set(session)
-    codes = load_match_codes(session)
+    """초안이 있으면 쓰기를 커밋까지 미루고, 없으면 flush 후 저장된 기준으로 판정한다."""
+    if rules is None and match_codes is None:
+        session.flush()
+    with session.no_autoflush:
+        if rules is None:
+            rules = load_rule_set(session)
+        if match_codes is None:
+            match_codes = load_match_codes(session)
     stats = {"total": 0, "changed": 0, "visible": 0, "hidden": 0,
              "by_basis": {"업종": 0, "분류": 0, "키워드": 0}}
     columns = ("list_visible", "match_basis", "match_detail", "matched_indstryty_cds")
     for notice, result in iter_classifications(
-        session, rules=rules, match_codes=codes, bid_ntce_nos=bid_ntce_nos,
+        session, rules=rules, match_codes=match_codes, bid_ntce_nos=bid_ntce_nos,
     ):
         stats["total"] += 1
         if result.list_visible:

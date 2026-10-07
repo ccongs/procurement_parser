@@ -4745,6 +4745,9 @@ def _render_rule_card(
           </table>
         </div>""")
     options = "".join(f'<option value="{_e(name)}"></option>' for name in clsfc_names)
+    rule_ids = "".join(
+        f'<input type="hidden" name="rule_ids" value="{int(rule["id"])}">' for rule in rules
+    ) or '<input type="hidden" name="rule_ids" value="">'
     return f"""
     <div class="card" id="rules">
       <h2>목록 표시 규칙</h2>
@@ -4755,6 +4758,7 @@ def _render_rule_card(
         저장 시 저장된 전체 공고를 다시 분류합니다.
       </p>
       <form method="post" action="/config/rules">
+        {rule_ids}
         <datalist id="clsfc-names">{options}</datalist>
         {''.join(sections)}
         <div style="margin-top:12px;">
@@ -5064,7 +5068,8 @@ def config_page(
         msg = f"{msg.rstrip('.')} — 표시 {visible}건(업종 {industry} · 분류 {clsfc} · 키워드 {keyword})"
     list_rules, clsfc_names = _load_rules_view()
     return HTMLResponse(
-        _render_config_page(cfg, runs, _sched_view(), msg, err or rules_err, _load_keywords(),
+        _render_config_page(cfg, runs, _sched_view(), None if rules or rules_err else msg,
+                            None if rules or rules_err else err, _load_keywords(),
                             list_rules, clsfc_names, msg if rules else None, rules_err)
     )
 
@@ -5166,12 +5171,15 @@ async def config_save(request: Request):
     def save() -> dict:
         params = {"saved": "1"}
         # 잠금 획득 후 세션을 열고 변경·재분류·커밋을 한 트랜잭션으로 묶는다.
-        with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session:
+        with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session, session.no_autoflush:
             try:
                 codes_changed = repository.get_config(session).indstryty_cds != updates["indstryty_cds"]
+                rules = classifier.load_rule_set(session) if codes_changed else None
                 repository.update_config(session, commit=False, **updates)
                 if codes_changed:
-                    params.update(_classification_params(classifier.reclassify_notices(session)))
+                    params.update(_classification_params(classifier.reclassify_notices(
+                        session, rules=rules, match_codes=frozenset(codes),
+                    )))
                 else:
                     session.commit()
             except Exception:
@@ -5205,27 +5213,51 @@ async def config_rules_save(request: Request):
             raise ValueError("알 수 없는 규칙 작업입니다.")
         delete_id = _parse_rule_id(form["delete_id"]) if "delete_id" in form else None
         enabled_ids = [_parse_rule_id(value) for value in form.getlist("enabled_ids")]
+        if "rule_ids" not in form:
+            raise ValueError("규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.")
+        rendered_ids = form.getlist("rule_ids")
+        rule_ids = [] if rendered_ids == [""] else [_parse_rule_id(value) for value in rendered_ids]
     except ValueError as exc:
         return _rules_error_redirect(str(exc))
     rule_type = action.removeprefix("add_")
     value = repository.normalize_rule_value(str(form.get(f"new_{rule_type}") or ""))
 
-    def save() -> tuple[dict, str | None]:
+    def save() -> tuple[dict | None, str | None]:
         err = None
-        with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session:
+        with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session, session.no_autoflush:
             try:
-                repository.set_list_rules_enabled(session, enabled_ids, commit=False)
+                draft = repository.list_list_rules(session)
+                current_ids = {rule["id"] for rule in draft}
+                if (not set(rule_ids).issubset(current_ids)
+                        or not set(enabled_ids).issubset(current_ids)
+                        or not set(enabled_ids).issubset(rule_ids)
+                        or (delete_id is not None and delete_id not in current_ids)):
+                    return None, "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요."
+                match_codes = classifier.load_match_codes(session)
+                repository.set_list_rules_enabled(session, rule_ids, enabled_ids, commit=False)
+                for rule in draft:
+                    if rule["id"] in rule_ids:
+                        rule["enabled"] = rule["id"] in enabled_ids
                 if delete_id is not None:
                     repository.delete_list_rule(session, delete_id, commit=False)
+                    draft = [rule for rule in draft if rule["id"] != delete_id]
                 elif action != "save":
                     try:
                         if not repository.add_list_rule(session, rule_type, value, commit=False):
                             existing = repository.find_list_rule_duplicate(session, rule_type, value)
                             err = f"이미 등록된 규칙입니다('{existing}')."
+                        else:
+                            # 새 규칙은 같은 종류의 기존 id 순 뒤에 붙는다.
+                            draft.append({"rule_type": rule_type, "value": value, "enabled": True})
                     except ValueError as exc:
                         err = str(exc)
                 # 추가 입력 오류여도 체크 편집분과 재분류는 함께 커밋한다.
-                stats = classifier.reclassify_notices(session)
+                rules = classifier.RuleSet(*(
+                    tuple(rule["value"] for rule in draft
+                          if rule["rule_type"] == kind and rule["enabled"])
+                    for kind in ("clsfc", "keyword", "negative")
+                ))
+                stats = classifier.reclassify_notices(session, rules=rules, match_codes=match_codes)
             except Exception:
                 session.rollback()
                 raise

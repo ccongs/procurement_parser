@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import api_client, classifier, collector, main, repository
 from app.db import Base, _register_sqlite_pragmas
-from app.models import AppConfig, BidNotice
+from app.models import AppConfig, BidNotice, CollectionRun
 
 
 @pytest.fixture
@@ -56,6 +56,7 @@ def _state(no):
 
 
 def _post(client, data):
+    data = {"rule_ids": [r["id"] for r in _rules()] or "", **data}
     return client.post("/config/rules", data=data, follow_redirects=False)
 
 
@@ -132,7 +133,7 @@ def test_repository_rules_crud_normalization_and_types(client):
         rows = repository.list_list_rules(session)
         assert [r["rule_type"] for r in rows] == ["clsfc", "keyword", "negative"]
         assert rows[1]["value"] == "시스템 개발"
-        repository.set_list_rules_enabled(session, [rows[1]["id"]])
+        repository.set_list_rules_enabled(session, [r["id"] for r in rows], [rows[1]["id"]])
         assert [r["enabled"] for r in repository.list_list_rules(session)] == [False, True, False]
         assert repository.delete_list_rule(session, rows[1]["id"])
         assert not repository.delete_list_rule(session, rows[1]["id"])
@@ -153,7 +154,9 @@ def test_config_rule_tables_check_state_datalist_and_position(client):
         for rule_type, value in [("clsfc", '<분류&"명>'), ("keyword", "새 플랫폼"), ("negative", "전산화단층")]:
             repository.add_list_rule(session, rule_type, value)
         rules = repository.list_list_rules(session)
-        repository.set_list_rules_enabled(session, [rules[0]["id"], rules[2]["id"]])
+        repository.set_list_rules_enabled(
+            session, [r["id"] for r in rules], [rules[0]["id"], rules[2]["id"]],
+        )
         session.get(BidNotice, "K").pub_prcrmnt_clsfc_nm = "빈도 높은 분류"
         session.get(BidNotice, "N").pub_prcrmnt_clsfc_nm = "빈도 높은 분류"
         session.commit()
@@ -164,6 +167,7 @@ def test_config_rule_tables_check_state_datalist_and_position(client):
     for title in ["IT 공공조달분류", "SW 키워드", "판별 제외어"]:
         assert title in card
     for rule in rules:
+        assert f'<input type="hidden" name="rule_ids" value="{rule["id"]}">' in card
         field = f'name="enabled_ids" value="{rule["id"]}"'
         assert field + (" checked>" if rule["rule_type"] != "keyword" else ">") in card
     assert 'name="new_clsfc" maxlength="100" list="clsfc-names"' in card
@@ -177,6 +181,7 @@ def test_config_rule_tables_check_state_datalist_and_position(client):
 def test_empty_rule_tables(client):
     page = client.get("/config").text
     assert page.count("등록된 규칙이 없습니다") == 3
+    assert '<input type="hidden" name="rule_ids" value="">' in page
 
 
 def test_clsfc_suggestions_count_order_blank_exclusion_and_limit(client):
@@ -273,9 +278,9 @@ def test_config_code_change_reclassifies_and_reports_counts(client, monkeypatch)
     original = classifier.reclassify_notices
     calls = []
 
-    def reclassify(session):
+    def reclassify(session, **kwargs):
         calls.append(session)
-        return original(session)
+        return original(session, **kwargs)
 
     monkeypatch.setattr(classifier, "reclassify_notices", reclassify)
     assert _state("I")[:2] == (True, "업종")
@@ -324,9 +329,9 @@ def test_reclassification_failure_rolls_back_rules_and_notices(client, monkeypat
     before = _database_state()
     original = classifier.reclassify_notices
 
-    def fail(session):
+    def fail(session, **kwargs):
         # 규칙·표시 상태가 실제 flush된 뒤 실패해도 전체 트랜잭션을 취소해야 한다.
-        original(session, commit=False)
+        original(session, commit=False, **kwargs)
         session.flush()
         raise RuntimeError("재분류 예외 주입")
 
@@ -353,8 +358,8 @@ def test_reclassification_failure_rolls_back_config_and_allows_retry(client, mon
     monkeypatch.setattr(main.scheduler, "is_running", lambda: True)
     monkeypatch.setattr(main.scheduler, "reschedule", rescheduled.append)
 
-    def fail(session):
-        original(session, commit=False)
+    def fail(session, **kwargs):
+        original(session, commit=False, **kwargs)
         session.flush()
         raise RuntimeError("재분류 예외 주입")
 
@@ -382,7 +387,7 @@ def test_invalid_ids_and_actions_never_change_state(client, monkeypatch, data):
     _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
     before = _database_state()
 
-    def unexpected(session):
+    def unexpected(session, **kwargs):
         pytest.fail("잘못된 ID·action에서 재분류하면 안 됩니다")
 
     monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
@@ -440,9 +445,11 @@ def test_rule_card_messages_are_separate_from_other_config_errors(client):
     page = client.get("/config?rules=1&vis=3&u=1&c=0&k=2").text
     card = page.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
     assert '<div class="msg ok">표시 규칙을 저장했습니다 — 표시 3건' in card
+    assert page.count('<div class="msg ok">표시 규칙을 저장했습니다') == 1
     page = client.get("/config", params={"rules_err": '<규칙&"오류>'}).text
     card = page.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
     assert '<div class="msg err">&lt;규칙&amp;&quot;오류&gt;</div>' in card
+    assert page.count('<div class="msg err">&lt;규칙&amp;&quot;오류&gt;</div>') == 1
     for query in ("err=다른오류", "saved=1"):
         card = client.get(f"/config?{query}").text.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
         assert '<div class="msg ' not in card
@@ -478,15 +485,15 @@ def test_config_writes_and_classification_run_in_worker_thread(client, monkeypat
         session_threads.append(threading.get_ident())
         return original_local()
 
-    def classify(session):
+    def classify(session, **kwargs):
         classify_threads.append(threading.get_ident())
-        return original_classify(session)
+        return original_classify(session, **kwargs)
 
     monkeypatch.setattr(main, "run_in_threadpool", pool)
     monkeypatch.setattr(main, "SessionLocal", local)
     monkeypatch.setattr(classifier, "reclassify_notices", classify)
     data = (_config_data(indstryty_cds="1426") if path == "/config" else
-            {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+            {"action": "add_keyword", "new_keyword": "새 플랫폼", "rule_ids": ""})
     response = client.post(path, data=data, follow_redirects=False)
     assert response.status_code == 303
     assert len(loop_threads) == len(session_threads) == len(classify_threads) == 1
@@ -519,7 +526,7 @@ def test_rule_save_serializes_collector_storage_in_file_sqlite(client, monkeypat
     original_upsert = repository.upsert_bid_notices
 
     def classify(session, **kwargs):
-        if not kwargs:  # 규칙 저장 경로가 잠금 안에서 재분류에 도달함.
+        if "rules" in kwargs:  # 초안으로 재분류하는 규칙 저장 경로.
             saving.set()
             assert release_save.wait(5), "규칙 저장 해제 신호 없음"
         return original_classify(session, **kwargs)
@@ -586,3 +593,146 @@ def test_rule_save_serializes_collector_storage_in_file_sqlite(client, monkeypat
     assert collector_acquired.is_set() and upserted.is_set()
     assert _state("AFTER") == (True, "키워드", "새 플랫폼")
     assert _state("K") == (True, "키워드", "새 플랫폼")
+
+
+@pytest.mark.parametrize("data", [
+    {"delete_id": "999999"}, {"enabled_ids": ["999999"]},
+    {"rule_ids": ["999999"]}, {"rule_ids": ["²"]}, {"rule_ids": ["1", "x"]},
+])
+def test_nonexistent_or_invalid_rule_ids_do_not_change_any_table(client, monkeypatch, data):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    before = _database_state()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("유효하지 않은 규칙 목록에서 재분류하면 안 됩니다")
+
+    monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
+    response = _post(client, data)
+    assert response.status_code == 303
+    assert "rules_err=" in response.headers["location"]
+    assert _database_state() == before
+
+
+def test_missing_rule_ids_is_rejected_without_changes(client):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    before = _database_state()
+    response = client.post("/config/rules", data={"action": "save"}, follow_redirects=False)
+    assert response.status_code == 303
+    error = parse_qs(urlsplit(response.headers["location"]).query)["rules_err"][0]
+    assert error == "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요."
+    assert _database_state() == before
+
+
+@pytest.mark.parametrize("new_enabled", [True, False])
+def test_old_form_only_updates_rendered_rules(client, new_enabled):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    page_a = client.get("/config").text
+    rendered = re.findall(r'<input type="hidden" name="rule_ids" value="(\d+)">', page_a)
+    _post(client, {"action": "add_negative", "new_negative": "전산화단층",
+                   "enabled_ids": rendered})
+    negative_id = next(r["id"] for r in _rules() if r["rule_type"] == "negative")
+    if not new_enabled:
+        _post(client, {"enabled_ids": rendered})
+    response = _post(client, {"action": "save", "rule_ids": rendered})
+    assert "rules=1" in response.headers["location"]
+    rules = {r["id"]: r for r in _rules()}
+    assert not rules[int(rendered[0])]["enabled"]
+    assert rules[negative_id]["enabled"] is new_enabled
+    with main.SessionLocal() as session:
+        assert classifier.reclassify_notices(session)["changed"] == 0
+
+
+@pytest.mark.parametrize("action", ["add_clsfc", "add_keyword", "add_negative", "delete", "save"])
+def test_draft_rule_order_and_results_equal_committed_rules(client, action):
+    # 여러 일치 후보를 두고 id 순에 따른 match_detail 선택도 비교한다.
+    for kind, value in (("keyword", "새 플랫폼"), ("negative", "전산화단층"),
+                        ("keyword", "플랫폼"), ("clsfc", '<분류&"명>')):
+        _post(client, {"action": f"add_{kind}", f"new_{kind}": value,
+                       "enabled_ids": [r["id"] for r in _rules()]})
+    ids = [r["id"] for r in _rules()]
+    data = {"enabled_ids": ids}
+    if action.startswith("add_"):
+        kind = action.removeprefix("add_")
+        data.update(action=action, **{f"new_{kind}": {
+            "clsfc": "다른 분류", "keyword": "개발", "negative": "개발",
+        }[kind]})
+    elif action == "delete":
+        data["delete_id"] = next(r["id"] for r in _rules() if r["value"] == "새 플랫폼")
+    else:
+        data.update(action="save", enabled_ids=[r["id"] for r in _rules() if r["value"] != "새 플랫폼"])
+    response = _post(client, data)
+    assert "rules=1" in response.headers["location"]
+    with main.SessionLocal() as session:
+        stats = classifier.reclassify_notices(session)
+        assert stats["changed"] == 0
+        assert _classification_counts(response) == main._classification_params(stats)
+
+
+def _classification_counts(response):
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    return {key: int(query[key][0]) for key in ("vis", "u", "c", "k")}
+
+
+@pytest.mark.parametrize("path", ["/config/rules", "/config"])
+def test_classification_does_not_hold_sqlite_write_lock(client, monkeypatch, path):
+    """파일 DB의 판정을 멈추고 별도 연결이 대기 없이 쓰는지 검증한다."""
+    original_local = main.SessionLocal
+    # autoflush=True여도 판정 중 조회가 쓰기를 유발하면 안 된다.
+    monkeypatch.setattr(main, "SessionLocal", sessionmaker(
+        bind=original_local.kw["bind"], autoflush=True,
+    ))
+    paused, resume = threading.Event(), threading.Event()
+    original_classify = classifier.classify_notice
+    results, errors = {}, []
+
+    def classify(**kwargs):
+        if kwargs["bid_ntce_nm"] == "새플랫폼 전산화단층":
+            # K(규칙 변경) 또는 I(설정 변경)의 메모리 갱신 뒤 멈춘다.
+            paused.set()
+            assert resume.wait(5), "재분류 해제 신호 없음"
+        return original_classify(**kwargs)
+
+    monkeypatch.setattr(classifier, "classify_notice", classify)
+
+    def save():
+        try:
+            data = ({"action": "add_keyword", "new_keyword": "새 플랫폼", "rule_ids": ""}
+                    if path == "/config/rules" else _config_data(indstryty_cds="1426"))
+            results["response"] = client.post(path, data=data, follow_redirects=False)
+        except Exception as exc:
+            errors.append(exc)
+
+    independent = create_engine(original_local.kw["bind"].url, connect_args={"timeout": 0})
+    thread = threading.Thread(target=save)
+    thread.start()
+    try:
+        assert paused.wait(5)
+        # busy_timeout=0이므로 쓰기 잠금이 있으면 즉시 실패한다.
+        with independent.begin() as connection:
+            connection.exec_driver_sql("PRAGMA busy_timeout=0")
+            connection.execute(CollectionRun.__table__.insert().values(trigger="test", status="running"))
+        assert _rules() == []
+        assert _state("K") == (False, None, None)
+        assert _state("I")[:2] == (True, "업종")
+        with original_local() as session:
+            assert repository.get_config(session).indstryty_cds == "1426,1468"
+            assert session.scalar(select(CollectionRun.id)) is not None
+    finally:
+        resume.set()
+        thread.join(10)
+        independent.dispose()
+    assert not thread.is_alive()
+    assert errors == []
+    response = results["response"]
+    assert response.status_code == 303
+    if path == "/config/rules":
+        assert _rules()[0]["value"] == "새 플랫폼"
+        assert _state("K") == (True, "키워드", "새 플랫폼")
+    else:
+        assert _state("I")[:2] == (False, None)
+        with original_local() as session:
+            assert repository.get_config(session).indstryty_cds == "1426"
+    with original_local() as session:
+        stats = classifier.reclassify_notices(session)
+        assert stats["changed"] == 0
+        assert _classification_counts(response) == main._classification_params(stats)
