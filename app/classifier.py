@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -13,6 +14,10 @@ from sqlalchemy.orm import Session
 
 from app.models import BidLicenseLimit, BidNotice, ListRule
 from app.repository import get_config
+
+
+# 설정·규칙 변경과 수집 저장을 재분류 커밋까지 직렬화한다(프로세스 내 공용).
+CLASSIFY_WRITE_LOCK = threading.RLock()
 
 
 DEFAULT_LIST_RULES: tuple[tuple[str, str], ...] = (

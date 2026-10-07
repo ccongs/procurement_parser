@@ -2,16 +2,17 @@
 
 import html
 import re
+import threading
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app import classifier, main, repository
-from app.db import Base
+from app import api_client, classifier, collector, main, repository
+from app.db import Base, _register_sqlite_pragmas
 from app.models import AppConfig, BidNotice
 
 
@@ -20,6 +21,7 @@ def client(tmp_path, monkeypatch):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'rules.db'}", connect_args={"check_same_thread": False},
     )
+    _register_sqlite_pragmas(engine)
     Base.metadata.create_all(engine)
     local = sessionmaker(bind=engine, autoflush=False)
     now = datetime(2026, 10, 7)
@@ -88,7 +90,9 @@ def test_unrestricted_badge_and_escaped_tip(basis, label, detail):
     assert f'class="indcode nolimit" data-tip="{html.escape(tip)}" tabindex="0"' in cell
     assert f'제한없음<span class="sr-only">({html.escape(tip)})</span>' in cell
     assert "1468" not in cell
-    assert ".indcode[data-tip]" in main._LIST_MATCHIND_TIP_SCRIPT
+    badge = re.search(r'<span class="([^"]*)" data-tip="([^"]*)"', cell)
+    assert "indcode" in badge[1].split()
+    assert html.unescape(badge[2]) == tip
 
 
 @pytest.mark.parametrize("basis", [None, "", "기타"])
@@ -244,7 +248,7 @@ def test_add_error_keeps_checks_and_reclassifies(client, value, error):
     response = _post(client, {"action": "add_keyword", "new_keyword": value})
     location = response.headers["location"]
     assert location.endswith("#rules")
-    assert error in parse_qs(urlsplit(location).query)["err"][0]
+    assert error in parse_qs(urlsplit(location).query)["rules_err"][0]
     assert len(_rules()) == 1 and not _rules()[0]["enabled"]
     assert _state("K")[:2] == (False, None)
 
@@ -288,7 +292,7 @@ def test_config_code_change_reclassifies_and_reports_counts(client, monkeypatch)
 def test_config_page_size_bounds_labels_and_api_hint(client):
     response = client.post("/config", data=_config_data(num_of_rows="1000"))
     assert response.status_code == 400
-    assert "누락 보정 조회 페이지 크기: 1~999" in response.text
+    assert "사전규격 수집·면허 누락 보정 조회 페이지 크기: 1~999" in response.text
     assert 'id="rules"' in response.text
     with main.SessionLocal() as session:
         assert repository.get_config(session).num_of_rows == 20
@@ -297,7 +301,288 @@ def test_config_page_size_bounds_labels_and_api_hint(client):
     with main.SessionLocal() as session:
         assert repository.get_config(session).num_of_rows == 999
     assert "매칭 업종코드 CSV" in response.text
+    assert "사전규격 수집·면허 누락 보정 조회 페이지 크기" in response.text
     assert "목록 표시 판정 기준(면허제한 코드와 비교) — 수집 조건이 아닙니다." in response.text
-    assert "공고·면허 일괄 조회는 999행 고정, 이 값은 면허 누락 보정 조회에만 쓰입니다." in response.text
+    assert "입찰공고·면허 일괄 조회는 999행 고정. API 상한 999 — 1000 이상이면 오류 없이 10행만 응답합니다." in response.text
     assert 'name="num_of_rows" value="999" min="1" max="999"' in response.text
     assert "최대 999 — 1000 이상이면 API 가 기본 10행만 돌려줍니다" in client.get("/api-test").text
+
+
+def _database_state():
+    """실패 전후 모든 테이블의 저장 값(설정 시각·분류 상세 포함)을 비교한다."""
+    with main.SessionLocal() as session:
+        return {
+            table.name: session.execute(select(table).order_by(*table.primary_key.columns)).all()
+            for table in Base.metadata.sorted_tables
+        }
+
+
+@pytest.mark.parametrize("operation", ["add", "delete", "save"])
+def test_reclassification_failure_rolls_back_rules_and_notices(client, monkeypatch, operation):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    rule_id = _rules()[0]["id"]
+    before = _database_state()
+    original = classifier.reclassify_notices
+
+    def fail(session):
+        # 규칙·표시 상태가 실제 flush된 뒤 실패해도 전체 트랜잭션을 취소해야 한다.
+        original(session, commit=False)
+        session.flush()
+        raise RuntimeError("재분류 예외 주입")
+
+    monkeypatch.setattr(classifier, "reclassify_notices", fail)
+    data = {
+        "add": {"action": "add_negative", "new_negative": "전산화단층"},
+        "delete": {"delete_id": rule_id, "enabled_ids": [rule_id]},
+        "save": {"action": "save"},
+    }[operation]
+    response = _post(client, data)
+    assert response.status_code == 303
+    assert _database_state() == before
+    location = response.headers["location"]
+    assert location.endswith("#rules")
+    assert "변경을 취소" in parse_qs(urlsplit(location).query)["rules_err"][0]
+    card = client.get(location).text.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
+    assert '<div class="msg err">표시 규칙 저장에 실패' in card
+
+
+def test_reclassification_failure_rolls_back_config_and_allows_retry(client, monkeypatch):
+    before = _database_state()
+    original = classifier.reclassify_notices
+    rescheduled = []
+    monkeypatch.setattr(main.scheduler, "is_running", lambda: True)
+    monkeypatch.setattr(main.scheduler, "reschedule", rescheduled.append)
+
+    def fail(session):
+        original(session, commit=False)
+        session.flush()
+        raise RuntimeError("재분류 예외 주입")
+
+    monkeypatch.setattr(classifier, "reclassify_notices", fail)
+    data = _config_data(indstryty_cds="1426", num_of_rows="99")
+    response = client.post("/config", data=data, follow_redirects=False)
+    assert response.status_code == 303
+    assert "변경을 취소" in parse_qs(urlsplit(response.headers["location"]).query)["err"][0]
+    assert _database_state() == before
+    assert rescheduled == []
+    monkeypatch.setattr(classifier, "reclassify_notices", original)
+    response = client.post("/config", data=data, follow_redirects=False)
+    assert "vis=0" in response.headers["location"]
+    assert _state("I")[:2] == (False, None)
+    assert rescheduled == [60]
+
+
+@pytest.mark.parametrize("data", [
+    {"delete_id": "abc"}, {"delete_id": "²"}, {"delete_id": ""},
+    {"delete_id": "١"}, {"delete_id": " 1"},
+    {"enabled_ids": ["1", "x"]}, {"enabled_ids": ["²"]},
+    {"action": "unknown"}, {"action": ""}, {"action": "unknown", "delete_id": "1"},
+])
+def test_invalid_ids_and_actions_never_change_state(client, monkeypatch, data):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    before = _database_state()
+
+    def unexpected(session):
+        pytest.fail("잘못된 ID·action에서 재분류하면 안 됩니다")
+
+    monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
+    response = _post(client, data)
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert "rules_err=" in location and location.endswith("#rules")
+    assert _database_state() == before
+
+
+@pytest.mark.parametrize("rule_type,existing,duplicate", [
+    (rule_type, existing, duplicate)
+    for rule_type in ("keyword", "negative")
+    for existing, duplicate in (("SW", "sw"), ("SW", "S W"), ("시스템 구축", "시스템구축"))
+])
+def test_duplicate_terms_use_existing_value_in_error(client, rule_type, existing, duplicate):
+    _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": existing})
+    rule_id = _rules()[0]["id"]
+    with main.SessionLocal() as session:
+        assert not repository.add_list_rule(session, rule_type, duplicate)
+    response = _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": duplicate,
+                             "enabled_ids": [rule_id]})
+    error = parse_qs(urlsplit(response.headers["location"]).query)["rules_err"][0]
+    assert error == f"이미 등록된 규칙입니다('{existing}')."
+    assert len(_rules()) == 1
+
+
+def test_clsfc_duplicate_comparison_keeps_case_and_spaces(client):
+    with main.SessionLocal() as session:
+        assert repository.normalize_rule_value("  시스템\t 구축\n") == "시스템 구축"
+        assert repository.add_list_rule(session, "clsfc", "  시스템\t 구축\n")
+        assert not repository.add_list_rule(session, "clsfc", "시스템 구축")
+        assert repository.add_list_rule(session, "clsfc", "시스템구축")
+        assert repository.add_list_rule(session, "clsfc", "SW")
+        assert repository.add_list_rule(session, "clsfc", "sw")
+
+
+def test_rule_enter_markup_and_keyword_submit_ignore_clsfc_input(client):
+    card = client.get("/config").text.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
+    for kind in ("clsfc", "keyword", "negative"):
+        assert re.search(rf'<input[^>]*name="new_{kind}"[^>]*data-add-btn="add-{kind}"', card)
+        assert re.search(rf'<button[^>]*id="add-{kind}"[^>]*value="add_{kind}"', card)
+    assert "'#rules input[data-add-btn]'" in card
+    assert "event.key !== 'Enter' || event.isComposing" in card
+    assert "event.preventDefault()" in card
+    assert "document.getElementById(input.dataset.addBtn)" in card
+    assert "input.form.requestSubmit(button)" in card
+    assert "else button.click()" in card
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼", "new_clsfc": "다른 분류"})
+    assert [(r["rule_type"], r["value"]) for r in _rules()] == [("keyword", "새 플랫폼")]
+    assert _state("K")[:2] == (True, "키워드")
+
+
+def test_rule_card_messages_are_separate_from_other_config_errors(client):
+    page = client.get("/config?rules=1&vis=3&u=1&c=0&k=2").text
+    card = page.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
+    assert '<div class="msg ok">표시 규칙을 저장했습니다 — 표시 3건' in card
+    page = client.get("/config", params={"rules_err": '<규칙&"오류>'}).text
+    card = page.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
+    assert '<div class="msg err">&lt;규칙&amp;&quot;오류&gt;</div>' in card
+    for query in ("err=다른오류", "saved=1"):
+        card = client.get(f"/config?{query}").text.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
+        assert '<div class="msg ' not in card
+
+
+@pytest.mark.parametrize("key", ["vis", "u", "c", "k"])
+@pytest.mark.parametrize("value", ["abc", "²"])
+def test_invalid_count_query_is_ignored(client, key, value):
+    query = {"rules": "1", "vis": "3", "u": "1", "c": "0", "k": "2", key: value}
+    response = client.get("/config", params=query)
+    assert response.status_code == 200
+    assert '<div class="msg ok">표시 규칙을 저장했습니다</div>' in response.text
+    assert "— 표시" not in response.text
+
+
+def test_unrestricted_badge_css_has_no_underline(client):
+    css = re.search(r"\.indcode\.nolimit\s*\{([^}]+)\}", client.get("/list").text)[1]
+    assert "text-decoration: none" in css
+
+
+@pytest.mark.parametrize("path", ["/config", "/config/rules"])
+def test_config_writes_and_classification_run_in_worker_thread(client, monkeypatch, path):
+    original_pool = main.run_in_threadpool
+    original_local = main.SessionLocal
+    original_classify = classifier.reclassify_notices
+    loop_threads, session_threads, classify_threads = [], [], []
+
+    async def pool(func, *args, **kwargs):
+        loop_threads.append(threading.get_ident())
+        return await original_pool(func, *args, **kwargs)
+
+    def local():
+        session_threads.append(threading.get_ident())
+        return original_local()
+
+    def classify(session):
+        classify_threads.append(threading.get_ident())
+        return original_classify(session)
+
+    monkeypatch.setattr(main, "run_in_threadpool", pool)
+    monkeypatch.setattr(main, "SessionLocal", local)
+    monkeypatch.setattr(classifier, "reclassify_notices", classify)
+    data = (_config_data(indstryty_cds="1426") if path == "/config" else
+            {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    response = client.post(path, data=data, follow_redirects=False)
+    assert response.status_code == 303
+    assert len(loop_threads) == len(session_threads) == len(classify_threads) == 1
+    assert session_threads == classify_threads
+    assert classify_threads[0] != loop_threads[0]
+
+
+def test_rule_save_serializes_collector_storage_in_file_sqlite(client, monkeypatch):
+    """조회 중인 수집이 규칙 저장의 잠금을 기다린 뒤 새 규칙으로 저장·분류한다."""
+    monkeypatch.setattr(collector, "SessionLocal", main.SessionLocal)
+    fetched, continue_fetch, saving, release_save = [threading.Event() for _ in range(4)]
+    collector_waiting, collector_acquired, upserted = [threading.Event() for _ in range(3)]
+    lock = threading.RLock()
+    results, errors = {}, []
+
+    class ObservedLock:
+        def __enter__(self):
+            if threading.current_thread().name == "test-collector":
+                collector_waiting.set()
+            lock.acquire()
+            if threading.current_thread().name == "test-collector":
+                collector_acquired.set()
+            return self
+
+        def __exit__(self, *args):
+            lock.release()
+
+    monkeypatch.setattr(classifier, "CLASSIFY_WRITE_LOCK", ObservedLock())
+    original_classify = classifier.reclassify_notices
+    original_upsert = repository.upsert_bid_notices
+
+    def classify(session, **kwargs):
+        if not kwargs:  # 규칙 저장 경로가 잠금 안에서 재분류에 도달함.
+            saving.set()
+            assert release_save.wait(5), "규칙 저장 해제 신호 없음"
+        return original_classify(session, **kwargs)
+
+    def upsert(session, values):
+        assert collector_acquired.is_set()
+        upserted.set()
+        return original_upsert(session, values)
+
+    def fake_call(operation, params, max_retries):
+        if operation == collector.OPERATION:
+            items = [{"bidNtceNo": "AFTER", "bidNtceOrd": "000", "bidNtceNm": "새플랫폼 개발",
+                      "indstrytyLmtYn": "N"}]
+        else:
+            fetched.set()
+            assert continue_fetch.wait(5), "수집 조회 해제 신호 없음"
+            items = []
+        return api_client.ApiResult(
+            operation=operation, request_url="", sent_params={}, response_type="json",
+            status_code=200, raw_text="", parsed=None, result_code="00" if items else "03",
+            result_msg="", items=items, total_count=str(len(items)),
+        ), 0, "ok"
+
+    monkeypatch.setattr(classifier, "reclassify_notices", classify)
+    monkeypatch.setattr(repository, "upsert_bid_notices", upsert)
+    monkeypatch.setattr(collector, "_call_with_retry", fake_call)
+
+    def collect():
+        try:
+            results["run"] = collector.collect_window(datetime(2026, 10, 1), datetime(2026, 10, 7))
+        except Exception as exc:
+            errors.append(exc)
+
+    def save():
+        try:
+            results["response"] = _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+        except Exception as exc:
+            errors.append(exc)
+
+    collect_thread = threading.Thread(target=collect, name="test-collector")
+    save_thread = threading.Thread(target=save, name="test-rule-save")
+    collect_thread.start()
+    try:
+        assert fetched.wait(5)
+        save_thread.start()
+        assert saving.wait(5)
+        # 저장이 막혀 있어도 이벤트 루프에서 다른 요청을 처리할 수 있다.
+        assert client.get("/config").status_code == 200
+        continue_fetch.set()
+        assert collector_waiting.wait(5)
+        assert not collector_acquired.is_set()
+        assert not upserted.is_set()
+    finally:
+        release_save.set()
+        continue_fetch.set()
+        collect_thread.join(10)
+        if save_thread.ident is not None:
+            save_thread.join(10)
+    assert not collect_thread.is_alive() and not save_thread.is_alive()
+    assert errors == []
+    assert results["response"].status_code == 303
+    assert "rules=1" in results["response"].headers["location"]
+    assert results["run"].status == "success"
+    assert collector_acquired.is_set() and upserted.is_set()
+    assert _state("AFTER") == (True, "키워드", "새 플랫폼")
+    assert _state("K") == (True, "키워드", "새 플랫폼")

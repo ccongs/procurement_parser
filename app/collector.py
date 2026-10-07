@@ -485,26 +485,27 @@ def collect_window(
                 continue
             values.update(collected_at=meta_ts, updated_at=meta_ts)
             values_list.append(values)
-        new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)
-        repository.upsert_license_limits(session, list(licenses.values()), meta_ts)
-        classify = classifier.reclassify_notices(
-            session, bid_ntce_nos=notice_nos | {row["bid_ntce_no"] for row in licenses.values()},
-            commit=False,
-        )
-        for change in ord_changes:
-            logger.info("차수변경 %s: %s -> %s", change["no"], change["old"], change["new"])
-        status = "partial" if failed else "success"
-        error_code = next((result["last_code"] for _, result in failed if result["last_code"]), None)
-        error_msg = "; ".join(f"{stage}: {result['error_msg']}" for stage, result in failed) or None
-        total_retry = sum(detail["retry_count"] for detail in by_call.values())
-        repository.finish_run(
-            session, run, status=status, total_fetched=len(notices),
-            total_new=new_count, total_updated=updated_count, retry_count=total_retry,
-            error_code=error_code, error_msg=error_msg,
-            detail_json=_build_detail_json(by_call, ord_changes, classify),
-        )
-        if status == "success":
-            repository.update_last_success_dt(session, window_end)
+        with classifier.CLASSIFY_WRITE_LOCK:
+            new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)
+            repository.upsert_license_limits(session, list(licenses.values()), meta_ts)
+            classify = classifier.reclassify_notices(
+                session, bid_ntce_nos=notice_nos | {row["bid_ntce_no"] for row in licenses.values()},
+                commit=False,
+            )
+            for change in ord_changes:
+                logger.info("차수변경 %s: %s -> %s", change["no"], change["old"], change["new"])
+            status = "partial" if failed else "success"
+            error_code = next((result["last_code"] for _, result in failed if result["last_code"]), None)
+            error_msg = "; ".join(f"{stage}: {result['error_msg']}" for stage, result in failed) or None
+            total_retry = sum(detail["retry_count"] for detail in by_call.values())
+            repository.finish_run(
+                session, run, status=status, total_fetched=len(notices),
+                total_new=new_count, total_updated=updated_count, retry_count=total_retry,
+                error_code=error_code, error_msg=error_msg,
+                detail_json=_build_detail_json(by_call, ord_changes, classify),
+            )
+            if status == "success":
+                repository.update_last_success_dt(session, window_end)
         logger.info("수집 종료: status=%s 공고=%d 면허보존=%d 면허저장=%d 보정=%d/%d 분류표시=%d "
                     "new=%d updated=%d retry=%d ord_changed=%d",
                     status, len(notices), by_call["license"]["kept"], len(licenses),

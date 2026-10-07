@@ -2188,7 +2188,8 @@ def test_list_renders_change_notice_order_but_keeps_checkbox_id(client):
 def test_list_notice_cell_normalizes_lines(value, expected):
     """공고번호·공고명은 같은 방식으로 정규화·이스케이프하고 빈 줄만 대시로 표시한다."""
     text = main._render_list_rows(
-        [{"bid_ntce_no": value, "bid_ntce_nm": value}], main._DEFAULT_SORT, {}
+        [{"bid_ntce_no": value, "bid_ntce_nm": value}], main._DEFAULT_SORT, {},
+        match_codes=frozenset()
     )
     assert (
         f'<td class="ntcecell"><span class="ntceno"><span class="ntcenum">{expected}</span></span>'

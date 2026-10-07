@@ -31,6 +31,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app import __version__, api_client, classifier, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal, init_db
@@ -975,7 +976,8 @@ BASE_CSS = """
 _LIST_MATCHIND_TIP_CSS = """
   .indcode[data-tip] { cursor: help; text-decoration: underline dotted; text-underline-offset: 2px; }
   .indcode.nolimit { display: inline-block; padding: 2px 7px; border-radius: 12px;
-                     background: #e9eef2; color: #455b6b; font-size: inherit; white-space: nowrap; }
+                     background: #e9eef2; color: #455b6b; font-size: inherit; white-space: nowrap;
+                     text-decoration: none; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
              clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
   .ind-tip { position: fixed; z-index: 90; padding: 4px 8px; border-radius: 4px;
@@ -1496,7 +1498,7 @@ def _render_list_rows(
     sort: str,
     qs: dict[str, str],
     status_map: dict[str, str] | None = None,
-    match_codes: frozenset[str] = frozenset(),
+    *, match_codes: frozenset[str],
 ) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
@@ -3715,7 +3717,7 @@ def list_page(
         <h2>수집된 공고</h2>
         <span class="rangeinfo">{'개찰일' if date_field == 'openg_dt' else '공고일'} {_e(dt_from_eff)} ~ {_e(dt_to_eff)}</span>
       </div>
-      {_render_list_rows(rows, sort, qs, status_map, match_codes)}
+      {_render_list_rows(rows, sort, qs, status_map, match_codes=match_codes)}
       {_render_pager(total, page, page_size, qs)}
     </div>
 
@@ -4599,7 +4601,7 @@ _CONFIG_INT_FIELDS: list[tuple[str, str, int, int]] = [
     ("interval_minutes", "수집 주기(분)", 1, 100000),
     ("window_overlap_minutes", "윈도우 겹침(분)", 0, 100000),
     ("backfill_days", "백필 기간(일)", 1, 366),
-    ("num_of_rows", "누락 보정 조회 페이지 크기", 1, 999),
+    ("num_of_rows", "사전규격 수집·면허 누락 보정 조회 페이지 크기", 1, 999),
     ("max_retries", "재시도 한도", 0, 10),
 ]
 
@@ -4702,9 +4704,13 @@ def _render_keyword_card(keywords: list[dict[str, Any]]) -> str:
     </div>"""
 
 
-def _render_rule_card(rules: list[dict], clsfc_names: list[str]) -> str:
+def _render_rule_card(
+    rules: list[dict], clsfc_names: list[str], msg: str | None = None, err: str | None = None,
+) -> str:
     """/config — 목록 표시 규칙 세 종류를 한 폼에서 편집한다."""
     sections = []
+    message = (f'<div class="msg err">{_e(err)}</div>' if err else
+               f'<div class="msg ok">{_e(msg)}</div>' if msg else "")
     for rule_type, title, help_text in (
         ("clsfc", "IT 공공조달분류", "정식 분류명과 정확히 같을 때"),
         ("keyword", "SW 키워드", "공고명 부분 일치, 영문·숫자 약어는 앞뒤가 영문·숫자가 아닐 때, 공백은 있어도 없어도 일치"),
@@ -4726,8 +4732,10 @@ def _render_rule_card(rules: list[dict], clsfc_names: list[str]) -> str:
         <div class="row" style="margin-top:18px;gap:12px;">
           <h3 style="white-space:nowrap;">{title}</h3>
           <input type="text" name="new_{rule_type}" maxlength="100"{datalist}
+                 data-add-btn="add-{rule_type}"
                  aria-label="{title} 추가" placeholder="{title} 추가">
-          <button type="submit" class="submit" name="action" value="add_{rule_type}">추가</button>
+          <button type="submit" class="submit" id="add-{rule_type}"
+                  name="action" value="add_{rule_type}">추가</button>
         </div>
         <p class="muted">{help_text}</p>
         <div class="table-wrap">
@@ -4740,6 +4748,7 @@ def _render_rule_card(rules: list[dict], clsfc_names: list[str]) -> str:
     return f"""
     <div class="card" id="rules">
       <h2>목록 표시 규칙</h2>
+      {message}
       <p class="muted">
         ① 매칭 업종코드와 면허제한 일치 → ② 업종 제한 없는 공고 중 공공조달분류 일치 →<br>
         ③ 업종 제한 없는 공고 중 공고명 키워드 일치(판별 제외어가 있으면 ③ 제외).<br>
@@ -4752,6 +4761,17 @@ def _render_rule_card(rules: list[dict], clsfc_names: list[str]) -> str:
           <button type="submit" class="submit" name="action" value="save">표시 규칙 저장</button>
         </div>
       </form>
+      <script>
+      document.querySelectorAll('#rules input[data-add-btn]').forEach(function(input) {{
+        input.addEventListener('keydown', function(event) {{
+          if (event.key !== 'Enter' || event.isComposing) return;
+          event.preventDefault();
+          const button = document.getElementById(input.dataset.addBtn);
+          if (input.form.requestSubmit) input.form.requestSubmit(button);
+          else button.click();
+        }});
+      }});
+      </script>
     </div>"""
 
 
@@ -4764,6 +4784,8 @@ def _render_config_page(
     keywords: list[dict[str, Any]] | None = None,
     rules: list[dict[str, Any]] | None = None,
     clsfc_names: list[str] | None = None,
+    rules_msg: str | None = None,
+    rules_err: str | None = None,
 ) -> str:
     msg_html = ""
     if err:
@@ -4777,7 +4799,7 @@ def _render_config_page(
         <label class="field">
           <span class="flabel">{_e(lbl)} <code>{_e(name)}</code></span>
           <input type="number" name="{_e(name)}" value="{_e(cfg.get(name))}" min="{lo}" max="{hi}">
-          {'<span class="help">공고·면허 일괄 조회는 999행 고정, 이 값은 면허 누락 보정 조회에만 쓰입니다.</span>' if name == 'num_of_rows' else ''}
+          {'<span class="help">입찰공고·면허 일괄 조회는 999행 고정. API 상한 999 — 1000 이상이면 오류 없이 10행만 응답합니다.</span>' if name == 'num_of_rows' else ''}
         </label>"""
         for name, lbl, lo, hi in _CONFIG_INT_FIELDS
     )
@@ -4940,7 +4962,7 @@ def _render_config_page(
       </form>
     </div>
 
-    {_render_rule_card(rules or [], clsfc_names or [])}
+    {_render_rule_card(rules or [], clsfc_names or [], rules_msg, rules_err)}
 
     {_render_keyword_card(keywords or [])}
 
@@ -5026,17 +5048,24 @@ def _sched_view() -> dict:
 @app.get("/config", response_class=HTMLResponse)
 def config_page(
     saved: str | None = None, err: str | None = None, rules: str | None = None,
-    vis: int | None = None, u: int = 0, c: int = 0, k: int = 0,
+    vis: str | None = None, u: str = "0", c: str = "0", k: str = "0",
+    rules_err: str | None = None,
 ) -> HTMLResponse:
     cfg, runs = _load_config_view()
     msg = "설정을 저장했습니다." if saved else None
     if rules:
         msg = "표시 규칙을 저장했습니다"
-    if msg and vis is not None:
-        msg = f"{msg.rstrip('.')} — 표시 {vis}건(업종 {u} · 분류 {c} · 키워드 {k})"
+    try:
+        counts = [int(value) for value in (vis, u, c, k)]
+    except (TypeError, ValueError):
+        counts = None
+    if msg and counts is not None:
+        visible, industry, clsfc, keyword = counts
+        msg = f"{msg.rstrip('.')} — 표시 {visible}건(업종 {industry} · 분류 {clsfc} · 키워드 {keyword})"
     list_rules, clsfc_names = _load_rules_view()
     return HTMLResponse(
-        _render_config_page(cfg, runs, _sched_view(), msg, err, _load_keywords(), list_rules, clsfc_names)
+        _render_config_page(cfg, runs, _sched_view(), msg, err or rules_err, _load_keywords(),
+                            list_rules, clsfc_names, msg if rules else None, rules_err)
     )
 
 
@@ -5134,12 +5163,30 @@ async def config_save(request: Request):
         )
         return HTMLResponse(html_page, status_code=400)
 
-    params = {"saved": "1"}
-    with SessionLocal() as session:
-        codes_changed = repository.get_config(session).indstryty_cds != updates["indstryty_cds"]
-        repository.update_config(session, **updates)
-        if codes_changed:
-            params.update(_classification_params(classifier.reclassify_notices(session)))
+    def save() -> dict:
+        params = {"saved": "1"}
+        # 잠금 획득 후 세션을 열고 변경·재분류·커밋을 한 트랜잭션으로 묶는다.
+        with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session:
+            try:
+                codes_changed = repository.get_config(session).indstryty_cds != updates["indstryty_cds"]
+                repository.update_config(session, commit=False, **updates)
+                if codes_changed:
+                    params.update(_classification_params(classifier.reclassify_notices(session)))
+                else:
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
+        return params
+
+    try:
+        params = await run_in_threadpool(save)
+    except Exception:
+        logger.exception("설정 저장·재분류 실패 — 변경을 롤백했습니다.")
+        return RedirectResponse(
+            url="/config?err=" + quote("설정 저장에 실패했습니다. 변경을 취소했습니다. 다시 시도해 주세요."),
+            status_code=303,
+        )
 
     # interval 변경을 실행 중 스케줄러에 즉시 반영.
     if scheduler.is_running():
@@ -5152,30 +5199,59 @@ async def config_save(request: Request):
 async def config_rules_save(request: Request):
     """체크 상태를 먼저 저장하고 추가·삭제 후 전체 공고를 재분류한다."""
     form = await request.form()
-    action = str(form.get("action") or "save")
-    delete_raw = str(form.get("delete_id") or "").strip()
-    enabled_ids = [int(v) for v in form.getlist("enabled_ids") if str(v).strip().isdigit()]
-    err = None
-    with SessionLocal() as session:
-        repository.set_list_rules_enabled(session, enabled_ids)
-        if delete_raw.isdigit():
-            repository.delete_list_rule(session, int(delete_raw))
-        elif action in {"add_clsfc", "add_keyword", "add_negative"}:
-            rule_type = action.removeprefix("add_")
-            value = str(form.get(f"new_{rule_type}") or "")
+    action = str(form.get("action", "save"))
+    try:
+        if action not in {"save", "add_clsfc", "add_keyword", "add_negative"}:
+            raise ValueError("알 수 없는 규칙 작업입니다.")
+        delete_id = _parse_rule_id(form["delete_id"]) if "delete_id" in form else None
+        enabled_ids = [_parse_rule_id(value) for value in form.getlist("enabled_ids")]
+    except ValueError as exc:
+        return _rules_error_redirect(str(exc))
+    rule_type = action.removeprefix("add_")
+    value = repository.normalize_rule_value(str(form.get(f"new_{rule_type}") or ""))
+
+    def save() -> tuple[dict, str | None]:
+        err = None
+        with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session:
             try:
-                if not repository.add_list_rule(session, rule_type, value):
-                    err = f"이미 등록된 규칙입니다('{' '.join(value.split())}')."
-            except ValueError as exc:
-                err = str(exc)
-        elif action != "save":
-            err = "알 수 없는 규칙 작업입니다."
-        # 추가 오류가 나도 먼저 저장한 체크 상태에 맞게 재분류한다.
-        stats = classifier.reclassify_notices(session)
+                repository.set_list_rules_enabled(session, enabled_ids, commit=False)
+                if delete_id is not None:
+                    repository.delete_list_rule(session, delete_id, commit=False)
+                elif action != "save":
+                    try:
+                        if not repository.add_list_rule(session, rule_type, value, commit=False):
+                            existing = repository.find_list_rule_duplicate(session, rule_type, value)
+                            err = f"이미 등록된 규칙입니다('{existing}')."
+                    except ValueError as exc:
+                        err = str(exc)
+                # 추가 입력 오류여도 체크 편집분과 재분류는 함께 커밋한다.
+                stats = classifier.reclassify_notices(session)
+            except Exception:
+                session.rollback()
+                raise
+        return stats, err
+
+    try:
+        stats, err = await run_in_threadpool(save)
+    except Exception:
+        logger.exception("표시 규칙 저장·재분류 실패 — 변경을 롤백했습니다.")
+        return _rules_error_redirect("표시 규칙 저장에 실패했습니다. 변경을 취소했습니다. 다시 시도해 주세요.")
     if err:
-        return RedirectResponse(url=f"/config?err={quote(err)}#rules", status_code=303)
+        return _rules_error_redirect(err)
     params = {"rules": "1", **_classification_params(stats)}
     return RedirectResponse(url=f"/config?{urlencode(params)}#rules", status_code=303)
+
+
+def _parse_rule_id(raw: Any) -> int:
+    """규칙 ID는 ASCII 숫자로만 해석한다(잘못된 값은 저장 전에 거부)."""
+    value = str(raw)
+    if not value or not value.isascii() or not value.isdecimal():
+        raise ValueError("규칙 ID는 ASCII 숫자여야 합니다.")
+    return int(value)
+
+
+def _rules_error_redirect(err: str) -> RedirectResponse:
+    return RedirectResponse(url=f"/config?rules_err={quote(err)}#rules", status_code=303)
 
 
 @app.post("/config/keywords")

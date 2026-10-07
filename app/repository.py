@@ -691,14 +691,15 @@ def search_pre_specs(
     return list(rows), total
 
 
-def update_config(session: Session, **fields: Any) -> AppConfig:
-    """허용 컬럼(_CONFIG_UPDATABLE)만 갱신 + updated_at. 비허용 키는 무시하고 commit."""
+def update_config(session: Session, *, commit: bool = True, **fields: Any) -> AppConfig:
+    """허용 컬럼만 갱신 + updated_at. 기본 커밋, 재분류와 묶을 때는 커밋을 미룬다."""
     cfg = get_config(session)
     for key, value in fields.items():
         if key in _CONFIG_UPDATABLE:
             setattr(cfg, key, value)
     cfg.updated_at = datetime.now()
-    session.commit()
+    if commit:
+        session.commit()
     return cfg
 
 
@@ -931,41 +932,63 @@ def list_list_rules(session: Session) -> list[dict[str, Any]]:
     ]
 
 
-def add_list_rule(session: Session, rule_type: str, value: str) -> bool:
+def normalize_rule_value(raw: str) -> str:
+    """규칙 값의 앞뒤·연속 공백을 정규화한다."""
+    return " ".join(raw.split())
+
+
+def find_list_rule_duplicate(session: Session, rule_type: str, value: str) -> str | None:
+    """같은 종류에서 중복인 기존 값을 반환한다(키워드·제외어는 대소문자·공백 무시)."""
+    def key(raw: str) -> str:
+        normalized = normalize_rule_value(raw)
+        return normalized if rule_type == "clsfc" else "".join(normalized.split()).lower()
+
+    wanted = key(value)
+    for existing in session.scalars(select(ListRule.value).where(ListRule.rule_type == rule_type)):
+        if key(existing) == wanted:
+            return existing
+    return None
+
+
+def add_list_rule(
+    session: Session, rule_type: str, value: str, *, commit: bool = True,
+) -> bool:
     """공백을 정규화해 규칙을 추가한다. 같은 종류의 중복이면 False."""
     if rule_type not in {"clsfc", "keyword", "negative"}:
         raise ValueError("알 수 없는 규칙 종류입니다.")
-    value = " ".join(value.split())
+    value = normalize_rule_value(value)
     if not value:
         raise ValueError("추가할 규칙 값을 입력하세요.")
     if len(value) > 100:
         raise ValueError("규칙 값은 100자 이하여야 합니다.")
-    exists = session.scalar(select(ListRule.id).where(
-        ListRule.rule_type == rule_type, ListRule.value == value,
-    ))
-    if exists is not None:
+    if find_list_rule_duplicate(session, rule_type, value) is not None:
         return False
     session.add(ListRule(rule_type=rule_type, value=value, enabled=True))
-    session.commit()
+    if commit:
+        session.commit()
     return True
 
 
-def delete_list_rule(session: Session, rule_id: int) -> bool:
+def delete_list_rule(session: Session, rule_id: int, *, commit: bool = True) -> bool:
     """규칙 1건 삭제. 없으면 False."""
     row = session.get(ListRule, rule_id)
     if row is None:
         return False
     session.delete(row)
-    session.commit()
+    if commit:
+        session.commit()
     return True
 
 
-def set_list_rules_enabled(session: Session, enabled_ids: list[int]) -> None:
+def set_list_rules_enabled(
+    session: Session, enabled_ids: list[int], *, commit: bool = True,
+) -> None:
     """전달된 id 만 사용하도록 전체 규칙의 체크 상태를 저장한다."""
     wanted = set(enabled_ids)
     for row in session.scalars(select(ListRule)):
         row.enabled = row.id in wanted
-    session.commit()
+    if commit:
+        session.commit()
 
 
 def list_clsfc_names(session: Session, limit: int = 200) -> list[str]:
