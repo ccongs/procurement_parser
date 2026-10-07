@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
 import pytest
@@ -451,6 +452,38 @@ def test_missing_license_fix_queries_all_targets(monkeypatch, db_engine, count):
         assert session.get(AppConfig, 1).last_success_dt == WIN_END
 
 
+@pytest.mark.parametrize("count", [49, 50])
+def test_many_missing_license_targets_warns_without_changing_status(monkeypatch, db_engine, caplog, count):
+    _, Local = db_engine
+    notices = [_notice(f"MISSING-{i}") for i in range(count)] + [
+        _notice("BULK"), _notice("UNLIMITED", limited="N"),
+    ]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result(notices, str(len(notices)))
+        if params["inqryDiv"] == "1":
+            return _ok_result([_license("BULK")], "1")
+        return _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
+    with caplog.at_level(logging.WARNING, logger="app.collector"):
+        run = collector.collect_window(WIN_BGN, WIN_END)
+    warnings = [record for record in caplog.records
+                if record.name == "app.collector" and record.levelno == logging.WARNING]
+    if count >= 50:
+        assert len(warnings) == 1
+        assert warnings[0].getMessage() == f"면허 누락 보정 대상 {count}건 — 이번 창 공고 {len(notices)}건"
+    else:
+        assert warnings == []
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["targets"] == fix["called"] == count
+    assert len(calls) == count + 2
+    assert run.status == "success" and run.error_msg is None
+    with Local() as session:
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+
 @pytest.mark.parametrize("code", ["03", "00"])
 def test_missing_license_fix_no_rows_advances_successive_windows(monkeypatch, db_engine, code):
     _, Local = db_engine
@@ -571,7 +604,7 @@ def test_all_stages_page_and_retry_and_config_params(monkeypatch, db_engine):
             tried.add(key)
             return _failed_result()
         if stage == "servc":
-            return _ok_result([_notice("FIX" if page == 1 else "BULK")], "2")
+            return _ok_result([_notice("FIX" if page == 1 else "BULK")], "1001")
         if stage == "license":
             return _ok_result([_license("BULK", lmtSno=str(page))], "1001")
         return _ok_result([_license("FIX", lmtSno=str(page))], "2")
@@ -584,10 +617,11 @@ def test_all_stages_page_and_retry_and_config_params(monkeypatch, db_engine):
     for params in servc_calls:
         assert "indstrytyCd" not in params
         assert params["inqryDiv"] == "2" and params["intrntnlDivCd"] == "2"
-        assert params["prtcptLmtRgnCd"] == "28" and params["numOfRows"] == "1"
+        assert params["prtcptLmtRgnCd"] == "28" and params["numOfRows"] == "1000"
         assert params["inqryBgnDt"] == "202605010000" and params["inqryEndDt"] == "202606010000"
     data = json.loads(run.detail_json)
     assert data["by_call"]["servc"]["pages"] == data["by_call"]["license"]["pages"] == 2
+    assert data["by_call"]["servc"]["page_size"] == 1000
     assert data["by_call"]["license"]["page_size"] == 1000
     license_calls = [params for op, params in calls if op == collector.LICENSE_OPERATION]
     assert all(params["numOfRows"] == ("1000" if params["inqryDiv"] == "1" else "1")
@@ -715,9 +749,12 @@ def test_previous_license_with_no_current_fix_is_hidden(monkeypatch, db_engine):
              if op == collector.LICENSE_OPERATION and params["inqryDiv"] == "2"]
     assert len(fixes) == 1 and fixes[0]["bidNtceOrd"] == "001"
     assert fixes[0]["numOfRows"] == "20"
+    servc = next(params for op, params in calls if op == collector.OPERATION)
+    assert servc["numOfRows"] == "1000"
     bulk = next(params for op, params in calls if op == collector.LICENSE_OPERATION)
     assert bulk["numOfRows"] == "1000"
     detail = json.loads(run.detail_json)
+    assert detail["by_call"]["servc"]["page_size"] == 1000
     assert detail["by_call"]["license"]["page_size"] == 1000
     assert detail["by_call"]["license_fix"]["found"] == 0
     with Local() as session:
@@ -776,7 +813,7 @@ def test_complete_last_page_at_safety_limit_is_not_truncated(monkeypatch, stage)
     monkeypatch.setattr(collector, "_MAX_PAGES_SAFETY", 2)
     operation = collector.OPERATION if stage == "servc" else collector.LICENSE_OPERATION
     params = {"inqryDiv": "2" if stage == "license_fix" else "1"}
-    page_size = 1000 if stage == "license" else 20
+    page_size = 20 if stage == "license_fix" else 1000
     calls = _fake_api(monkeypatch, lambda op, params: _ok_result([
         {"page": params["pageNo"]},
     ], str(page_size * 2)))

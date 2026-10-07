@@ -30,7 +30,7 @@ _OK_CODES: frozenset[str] = frozenset({"00", "03"})
 _RETRY_CODES: frozenset[str] = frozenset({"01", "02", "04", "05"})
 _RETRY_BACKOFF_SECONDS = 2.0
 _MAX_PAGES_SAFETY = 1000
-_LICENSE_BULK_PAGE_SIZE = 1000
+_BULK_PAGE_SIZE = 1000
 
 
 def classify_result_code(code: str | None) -> str:
@@ -191,8 +191,9 @@ def _call_with_retry(
 
 def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSnapshot) -> dict[str, Any]:
     """operation 을 끝까지 페이징한다. 조회 결과만 모으고 DB 는 쓰지 않는다."""
-    page_size = (_LICENSE_BULK_PAGE_SIZE
-                 if operation == LICENSE_OPERATION and base_params.get("inqryDiv") == "1"
+    page_size = (_BULK_PAGE_SIZE
+                 if operation == OPERATION or (
+                     operation == LICENSE_OPERATION and base_params.get("inqryDiv") == "1")
                  else config.num_of_rows)
     base_params = {**base_params, "numOfRows": str(page_size)}
     items: list[dict] = []
@@ -332,10 +333,11 @@ def collect_window(
                     trigger, fmt_dt(window_bgn), fmt_dt(window_end))
         by_call = {
             "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
-                      "items": 0, "notices": 0, "retry_count": 0},
+                      "items": 0, "notices": 0, "retry_count": 0,
+                      "page_size": _BULK_PAGE_SIZE},
             "license": {"outcome": "skipped", "pages": 0, "last_result_code": None,
                         "items": 0, "kept": 0, "retry_count": 0,
-                        "page_size": _LICENSE_BULK_PAGE_SIZE},
+                        "page_size": _BULK_PAGE_SIZE},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
                             "found": 0, "failed": [], "retry_count": 0},
         }
@@ -360,7 +362,7 @@ def collect_window(
         servc = _fetch_pages(OPERATION, _servc_params(window_bgn, window_end, snapshot), snapshot)
         notices = dedup_notices(servc["items"])
         notice_nos = {_text(item["bidNtceNo"]) for item in notices}
-        by_call["servc"] = _call_detail(servc, notices=len(notices))
+        by_call["servc"] = _call_detail(servc, notices=len(notices), page_size=_BULK_PAGE_SIZE)
         if servc["outcome"] == "halt":
             return halt("servc", servc)
         if servc["outcome"] == "failed":
@@ -371,7 +373,7 @@ def collect_window(
         }, snapshot)
         licenses = _keep_licenses(session, license_result["items"], notice_nos)
         by_call["license"] = _call_detail(
-            license_result, kept=len(licenses), page_size=_LICENSE_BULK_PAGE_SIZE,
+            license_result, kept=len(licenses), page_size=_BULK_PAGE_SIZE,
         )
         if license_result["outcome"] == "halt":
             return halt("license", license_result)
@@ -381,6 +383,9 @@ def collect_window(
         fix = by_call["license_fix"]
         if servc["outcome"] == license_result["outcome"] == "ok":
             targets = _missing_license_targets(session, notices, licenses)
+            if len(targets) >= 50:
+                logger.warning("면허 누락 보정 대상 %d건 — 이번 창 공고 %d건",
+                               len(targets), len(notices))
             fix.update(outcome="ok", targets=len(targets))
             for item in targets:
                 no = _text(item["bidNtceNo"])
