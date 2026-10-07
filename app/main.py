@@ -22,6 +22,7 @@ import logging
 import math
 import re
 import zipfile
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -5305,11 +5306,17 @@ class RuleTestView:
     err: str | None = None
     msg: str | None = None
     stale: bool = False
+    focus_preview: bool = False
 
 
-def _rule_test_filter_params(data) -> dict[str, str]:
-    return {"dt_from": data.get("dt_from", ""), "dt_to": data.get("dt_to", ""),
-            "q": data.get("search", "")}
+def _rule_test_filter_params(data: Mapping[str, Any]) -> dict[str, str]:
+    return {key: value if isinstance(value := data.get(field, ""), str) else ""
+            for key, field in (("dt_from", "dt_from"), ("dt_to", "dt_to"), ("q", "search"))}
+
+
+def _rule_test_reload_redirect(data: Mapping[str, Any], err: str) -> RedirectResponse:
+    params = {"err": err, **_rule_test_filter_params(data)}
+    return RedirectResponse(url=f"/config/rules/test?{urlencode(params)}", status_code=303)
 
 
 def _render_rule_test_page(view: RuleTestView) -> str:
@@ -5348,7 +5355,7 @@ def _render_rule_test_page(view: RuleTestView) -> str:
             results += _rule_test_table("공고명 검색 결과", result["search_rows"],
                                         result["search_total"], match_codes)
     focus_script = ""
-    if result is not None or err or view.stale:
+    if result is not None or view.focus_preview:
         results = f'<div id="preview">{message}{warning}{results}</div>'
         message = ""
         focus_script = '<script>window.location.hash = "preview";</script>'
@@ -5382,7 +5389,7 @@ def _render_rule_test_page(view: RuleTestView) -> str:
       초안에서 뺀 규칙은 삭제하지 않고 끕니다.</p></form></section>{results}</main>{focus_script}</body></html>'''
 
 
-def _rule_test_view(data=None, *, preview: bool = False,
+def _rule_test_view(data: Mapping[str, Any] | None = None, *, preview: bool = False,
                     err: str | None = None, msg: str | None = None) -> RuleTestView:
     with SessionLocal() as session, session.no_autoflush:
         rows = repository.list_list_rules(session)
@@ -5399,13 +5406,15 @@ def _rule_test_view(data=None, *, preview: bool = False,
             try:
                 plan = rule_test.rule_plan(rows, rule_test.draft_values(data))
                 result = rule_test.preview(session, plan, codes, data)
+            except rule_test.FormStructureError:
+                raise
             except rule_test.DraftValidationError as exc:
                 err = str(exc)
             except Exception:
                 logger.exception("규칙 테스트 미리보기 실패")
                 err = "미리보기에 실패했습니다. 다시 시도해 주세요."
         return RuleTestView(data=dict(data), match_codes=codes, result=result, err=err,
-                            msg=msg, stale=stale)
+                            msg=msg, stale=stale, focus_preview=preview or err is not None)
 
 
 @app.get("/config/rules/test", response_class=HTMLResponse)
@@ -5414,7 +5423,7 @@ async def config_rules_test(request: Request):
     today = date.today()
     view.data.update({"dt_from": request.query_params.get("dt_from", (today - timedelta(days=29)).isoformat()),
                  "dt_to": request.query_params.get("dt_to", today.isoformat()),
-                 "search": request.query_params.get("q", request.query_params.get("search", ""))})
+                 "search": request.query_params.get("q", "")})
     msg = None
     if request.query_params.get("applied") == "1":
         msg = "규칙을 적용했습니다"
@@ -5426,12 +5435,18 @@ async def config_rules_test(request: Request):
     view.msg = msg
     if request.query_params.get("err") == "stale":
         view.err = rule_test.STALE_MESSAGE
+    elif request.query_params.get("err") == "form":
+        view.err = rule_test.FORM_MESSAGE
     return HTMLResponse(_render_rule_test_page(view))
 
 
 @app.post("/config/rules/test", response_class=HTMLResponse)
 async def config_rules_test_preview(request: Request):
     data = await request.form()
+    try:
+        rule_test.validate_form_structure(data)
+    except rule_test.FormStructureError:
+        return _rule_test_reload_redirect(data, "form")
     view = await run_in_threadpool(_rule_test_view, data, preview=True)
     return HTMLResponse(_render_rule_test_page(view), status_code=400 if view.err else 200)
 
@@ -5439,6 +5454,10 @@ async def config_rules_test_preview(request: Request):
 @app.post("/config/rules/test/apply")
 async def config_rules_test_apply(request: Request):
     data = await request.form()
+    try:
+        rule_test.validate_form_structure(data)
+    except rule_test.FormStructureError:
+        return _rule_test_reload_redirect(data, "form")
 
     def save():
         with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session, session.no_autoflush:
@@ -5461,8 +5480,7 @@ async def config_rules_test_apply(request: Request):
     try:
         stats = await run_in_threadpool(save)
     except rule_test.StaleRulesError:
-        params = {"err": "stale", **_rule_test_filter_params(data)}
-        return RedirectResponse(url=f"/config/rules/test?{urlencode(params)}#preview", status_code=303)
+        return _rule_test_reload_redirect(data, "stale")
     except rule_test.DraftValidationError as exc:
         err = str(exc)
     except Exception:

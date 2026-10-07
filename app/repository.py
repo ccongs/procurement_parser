@@ -962,7 +962,7 @@ def normalize_rule_value(raw: str) -> str:
 def list_rule_value_key(rule_type: str, raw: str) -> str:
     """공백을 정리한 값으로 비교하며 키워드·제외어는 대소문자를 무시한다."""
     normalized = normalize_rule_value(raw)
-    return normalized if rule_type == "clsfc" else normalized.casefold()
+    return normalized if rule_type == "clsfc" else normalized.lower()
 
 
 def validate_list_rule_value(rule_type: str, raw: str) -> str:

@@ -6,9 +6,9 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
+from typing import Any
 
 from sqlalchemy import select
-from starlette.datastructures import FormData
 
 from app import classifier, repository
 from app.models import BidNotice
@@ -17,6 +17,11 @@ from app.models import BidNotice
 MAX_RULES_PER_KIND = 300
 MAX_DRAFT_CHARS = 20_000
 STALE_MESSAGE = "다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌어 현재 규칙을 다시 불러왔습니다. 초안을 다시 입력한 뒤 미리보기하세요."
+FORM_MESSAGE = "요청 형식이 올바르지 않아 현재 규칙을 다시 불러왔습니다."
+
+
+class FormStructureError(ValueError):
+    """입력칸 누락·중복 또는 비문자열 폼 값."""
 
 
 class DraftValidationError(ValueError):
@@ -34,14 +39,25 @@ def rules_fingerprint(rows: list[dict], match_codes: frozenset[str]) -> str:
     return hashlib.sha256(json.dumps([references, sorted(match_codes)]).encode("utf-8")).hexdigest()
 
 
-def draft_values(data: Mapping[str, str] | FormData) -> dict[str, list[str]]:
-    """필드 제출 횟수·총 크기를 먼저 검사하고 빈 줄을 뺀 규칙을 검증한다."""
+def validate_form_structure(data: Mapping[str, Any]) -> dict[str, str]:
+    """다중값을 보존한 상태에서 구조를 확인하고 초안 문자열을 반환한다."""
+    getlist = getattr(data, "getlist", None)
     inputs = {}
     for kind, title, _ in repository.RULE_FIELDS:
-        items = data.getlist(kind) if isinstance(data, FormData) else ([data[kind]] if kind in data else [])
+        items = getlist(kind) if callable(getlist) else ([data[kind]] if kind in data else [])
         if len(items) != 1 or not isinstance(items[0], str):
-            raise DraftValidationError(f"{title}: 초안 입력칸을 각각 정확히 한 번 제출해야 합니다.")
+            raise FormStructureError(f"{title}: 초안 입력칸을 각각 정확히 한 번 제출해야 합니다.")
         inputs[kind] = items[0]
+    for field in ("dt_from", "dt_to", "search"):
+        items = getlist(field) if callable(getlist) else ([data[field]] if field in data else [])
+        if any(not isinstance(item, str) for item in items):
+            raise FormStructureError(FORM_MESSAGE)
+    return inputs
+
+
+def draft_values(data: Mapping[str, Any]) -> dict[str, list[str]]:
+    """필드 제출 횟수·총 크기를 먼저 검사하고 빈 줄을 뺀 규칙을 검증한다."""
+    inputs = validate_form_structure(data)
     if sum(len(value) for value in inputs.values()) > MAX_DRAFT_CHARS:
         raise DraftValidationError(f"세 초안 입력 합계는 {MAX_DRAFT_CHARS:,}자 이하여야 합니다.")
     result = {}

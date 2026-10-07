@@ -418,7 +418,7 @@ def test_invalid_ids_and_actions_never_change_state(client, monkeypatch, data):
 @pytest.mark.parametrize("rule_type,existing,duplicate", [
     (rule_type, existing, duplicate)
     for rule_type in ("keyword", "negative")
-    for existing, duplicate in (("SW", "sw"), ("Straße", "STRASSE"), ("시스템 구축", "시스템  구축"))
+    for existing, duplicate in (("SW", "sw"), ("시스템 구축", "시스템  구축"))
 ])
 def test_duplicate_terms_use_existing_value_in_error(client, rule_type, existing, duplicate):
     _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": existing})
@@ -434,8 +434,8 @@ def test_duplicate_terms_use_existing_value_in_error(client, rule_type, existing
 
 @pytest.mark.parametrize("rule_type", ["keyword", "negative"])
 @pytest.mark.parametrize("existing,new", [("홈페이지", "홈 페이지"), ("SW", "S W"),
-                                         ("시스템 구축", "시스템구축")])
-def test_rule_card_allows_distinct_spacing_values(client, rule_type, existing, new):
+                                         ("시스템 구축", "시스템구축"), ("Straße", "STRASSE")])
+def test_rule_card_allows_distinct_values(client, rule_type, existing, new):
     _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": existing})
     response = _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": new,
                              "enabled_ids": [_rules()[0]["id"]]})
@@ -919,13 +919,19 @@ def test_classification_does_not_hold_sqlite_write_lock(client, monkeypatch, pat
 
 # --- Phase 13.4b: 새 창 초안 미리보기·적용 ---
 
-def _test_form(client, **updates):
-    page = client.get("/config/rules/test").text
+def _rule_test_page_form(page):
     data = {kind: html.unescape(re.search(
         rf'<textarea name="{kind}"[^>]*>(.*?)</textarea>', page, re.S)[1])
         for kind in ("clsfc", "keyword", "negative")}
     data.update(fingerprint=re.search(r'name="fingerprint" value="([^"]+)"', page)[1],
-                dt_from="", dt_to="", search="")
+                **{field: html.unescape(re.search(rf'name="{field}" value="([^"]*)"', page)[1])
+                   for field in ("dt_from", "dt_to", "search")})
+    return data
+
+
+def _test_form(client, **updates):
+    data = _rule_test_page_form(client.get("/config/rules/test").text)
+    data.update(dt_from="", dt_to="", search="")
     return {**data, **updates}
 
 
@@ -1133,10 +1139,14 @@ def test_rule_test_stale_whole_set_fingerprint_refuses_changes(client, monkeypat
     response = _apply(client, {**data, "fingerprint": fingerprint})
     assert response.status_code == 303
     location = response.headers["location"]
+    assert urlsplit(location).fragment == ""
     assert parse_qs(urlsplit(location).query) == {"err": ["stale"], **expected_filters}
     refreshed = client.get(location)
     assert refreshed.status_code == 200
     assert rule_test.STALE_MESSAGE in refreshed.text
+    assert 'id="preview"' not in refreshed.text
+    assert 'window.location.hash' not in refreshed.text
+    assert refreshed.text.index("초안 편집") < refreshed.text.index(rule_test.STALE_MESSAGE) < refreshed.text.index('<textarea')
     new_fingerprint = re.search(r'name="fingerprint" value="([^"]*)"', refreshed.text)[1]
     assert new_fingerprint != fingerprint
     assert 'name="dt_from" value="2026-10-01"' in refreshed.text
@@ -1200,8 +1210,9 @@ def test_rule_test_preview_worker_thread_without_lock_and_apply_lock(client, mon
 @pytest.mark.parametrize("kind", ["clsfc", "keyword", "negative"])
 @pytest.mark.parametrize("invalid", ["missing", "duplicate"])
 def test_rule_test_requires_each_draft_field_exactly_once(client, monkeypatch, kind, invalid):
-    assert _apply(client, _test_form(client, keyword="새 플랫폼")).status_code == 303
-    data = _test_form(client)
+    assert _apply(client, _test_form(client, clsfc='<분류&"명>', keyword="새 플랫폼",
+                                    negative="전산화단층")).status_code == 303
+    data = _test_form(client, dt_from="2026-10-01", dt_to="2026-10-07", search='<검색&"값>')
     if invalid == "missing":
         data.pop(kind)
     else:
@@ -1209,13 +1220,78 @@ def test_rule_test_requires_each_draft_field_exactly_once(client, monkeypatch, k
     before = _database_state()
     def unexpected(*args, **kwargs):
         pytest.fail("누락·중복 필드는 분류 전에 거부해야 합니다")
+    for path in ("/config/rules/test", "/config/rules/test/apply"):
+        with monkeypatch.context() as patches:
+            patches.setattr(classifier, "iter_classifications", unexpected)
+            patches.setattr(classifier, "reclassify_notices", unexpected)
+            response = client.post(path, data=data, follow_redirects=False)
+            assert response.status_code == 303
+            location = response.headers["location"]
+            assert urlsplit(location).fragment == ""
+            assert parse_qs(urlsplit(location).query) == {
+                "err": ["form"], "dt_from": [data["dt_from"]], "dt_to": [data["dt_to"]],
+                "q": [data["search"]]}
+            refreshed = client.get(location)
+            assert refreshed.status_code == 200
+            assert rule_test.FORM_MESSAGE in refreshed.text
+            assert 'id="preview"' not in refreshed.text
+            assert 'window.location.hash' not in refreshed.text
+            assert refreshed.text.index("초안 편집") < refreshed.text.index(rule_test.FORM_MESSAGE) < refreshed.text.index('<textarea')
+            fresh_data = _rule_test_page_form(refreshed.text)
+            assert fresh_data == _test_form(client, dt_from=data["dt_from"], dt_to=data["dt_to"],
+                                            search=data["search"])
+            assert _database_state() == before
+        applied = _apply(client, fresh_data)
+        assert applied.status_code == 303 and "applied=1" in applied.headers["location"]
+        assert _database_state() == before
+
+
+@pytest.mark.parametrize("field", ["clsfc", "keyword", "negative", "dt_from", "dt_to", "search"])
+def test_rule_test_file_form_values_reload_without_classification_or_error_logs(client, monkeypatch, caplog, field):
+    assert _apply(client, _test_form(client, keyword="새 플랫폼")).status_code == 303
+    data = _test_form(client, dt_from="2026-10-01", dt_to="2026-10-07", search="검색")
+    data.pop(field)
+    before = _database_state()
+    def unexpected(*args, **kwargs):
+        pytest.fail("파일 폼 값은 분류 전에 거부해야 합니다")
     monkeypatch.setattr(classifier, "iter_classifications", unexpected)
     monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
-    for response in (_preview(client, data), _apply(client, data)):
-        assert response.status_code == 400
-        assert "초안 입력칸을 각각 정확히 한 번 제출" in response.text
-        assert 'id="preview"' in response.text and "미리보기 결과" not in response.text
+    caplog.clear()
+    for path in ("/config/rules/test", "/config/rules/test/apply"):
+        response = client.post(path, data=data, files={field: ("value.txt", b"value", "text/plain")},
+                               follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers["location"]
+        params = parse_qs(urlsplit(location).query, keep_blank_values=True)
+        assert params == {"err": ["form"], "dt_from": [data.get("dt_from", "")],
+                          "dt_to": [data.get("dt_to", "")], "q": [data.get("search", "")]}
+        refreshed = client.get(location)
+        assert refreshed.status_code == 200 and rule_test.FORM_MESSAGE in refreshed.text
+        assert '<textarea name="keyword" rows="10">새 플랫폼</textarea>' in refreshed.text
         assert _database_state() == before
+    assert not [record for record in caplog.records if record.levelno >= 40 or record.exc_info]
+
+
+@pytest.mark.parametrize("field", ["clsfc", "keyword", "negative", "dt_from", "dt_to", "search"])
+def test_rule_test_non_string_mapping_values_are_structure_errors(field):
+    data = dict(clsfc="", keyword="", negative="", dt_from="", dt_to="", search="")
+    data[field] = object()
+    with pytest.raises(rule_test.FormStructureError):
+        rule_test.draft_values(data)
+
+
+def test_rule_test_getlist_protocol_rejects_duplicates_without_formdata_dependency():
+    class MultiValues(dict):
+        def getlist(self, key):
+            return [self[key], self[key]] if key == "keyword" else [self[key]] if key in self else []
+
+    with pytest.raises(rule_test.FormStructureError):
+        rule_test.draft_values(MultiValues(clsfc="", keyword="SW", negative=""))
+
+
+def test_rule_test_get_uses_only_q_for_search(client):
+    assert _rule_test_page_form(client.get("/config/rules/test?search=ignored").text)["search"] == ""
+    assert _rule_test_page_form(client.get("/config/rules/test?q=chosen&search=ignored").text)["search"] == "chosen"
 
 
 def _sized_draft(client, size):
@@ -1269,6 +1345,20 @@ def test_rule_test_spacing_values_remain_distinct_in_preview_and_apply(client, k
     assert _apply(client, data).status_code == 303
     assert [(r["value"], r["enabled"]) for r in _rules()] == [
         ("홈페이지", True), ("시스템 구축", False), ("홈 페이지", True), ("시스템구축", True)]
+
+
+@pytest.mark.parametrize("kind", ["keyword", "negative"])
+def test_rule_test_unicode_values_remain_distinct_in_preview_and_apply(client, kind):
+    assert classifier.match_terms("STRASSE", ["Straße"]) == []
+    assert classifier.match_terms("Straße", ["STRASSE"]) == []
+    with main.SessionLocal() as session:
+        assert repository.add_list_rule(session, kind, "Straße")
+    data = _test_form(client, **{kind: "Straße\nSTRASSE"})
+    before = _database_state()
+    assert _preview(client, data).status_code == 200
+    assert _database_state() == before
+    assert _apply(client, data).status_code == 303
+    assert [(r["value"], r["enabled"]) for r in _rules()] == [("Straße", True), ("STRASSE", True)]
 
 
 @pytest.mark.parametrize("invalid", ["duplicate", "date"])
