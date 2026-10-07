@@ -2477,3 +2477,26 @@ def test_list_column_count_with_analysis_toggle(client, monkeypatch, enabled, co
         assert 'data-name="스모크 테스트 공고"' in tbody
     else:
         assert not spans
+
+
+# --- Phase 13.3 표시 대상 필터 -----------------------------------------
+def test_search_bid_notices_visible_only_filters_count_and_rows(session):
+    _seed_notices(session)
+    session.get(BidNotice, "A-2").list_visible = False
+    session.commit()
+    rows, total = repository.search_bid_notices(session, page_size=2)
+    assert total == 3 and len(rows) == 2
+    assert "A-2" not in {row.bid_ntce_no for row in rows}
+    rows, total = repository.search_bid_notices(session, visible_only=False)
+    assert total == 4 and {row.bid_ntce_no for row in rows} == {"A-1", "A-2", "A-3", "A-4"}
+
+
+def test_list_hides_nonvisible_notice(client):
+    from app import main
+    with main.SessionLocal() as session:
+        session.get(BidNotice, "S-1").list_visible = False
+        session.commit()
+    response = client.get("/list", params=_WIDE)
+    assert response.status_code == 200
+    assert "스모크 테스트 공고" not in response.text
+    assert "첨부 있는 공고" in response.text

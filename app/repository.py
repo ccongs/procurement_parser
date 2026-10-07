@@ -14,12 +14,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, select, tuple_
 from sqlalchemy.orm import Session
 
 from app.models import (
     AnalysisResult,
     AppConfig,
+    BidLicenseLimit,
     BidNotice,
     BidNoticeRaw,
     CollectionRun,
@@ -149,6 +150,7 @@ def upsert_bid_notices(
       컬럼값 dict.
     - 공고·원문 각각 기존 PK 를 `IN` 한 번으로 조회해 N+1 을 피한다.
       raw_json 은 같은 세션의 bid_notice_raw 에만 저장한다.
+    - 신규 행은 list_visible 이 없으면 False 로 시작하며, 기존 분류값은 없는 키로 덮지 않는다.
     - **collected_at(최초 수집 시각)은 insert 시에만 설정하고 update 시 보존**한다.
       updated_at 등 나머지 컬럼은 항상 갱신.
     - ord_changes: update 경로에서 bid_ntce_ord 가 바뀐 공고 목록. 각 원소
@@ -186,9 +188,9 @@ def upsert_bid_notices(
 
         row = existing.get(pk)
         if row is None:
-            obj = BidNotice(
-                **{k: v for k, v in values.items() if k in _BID_NOTICE_COLUMNS}
-            )
+            insert_values = {k: v for k, v in values.items() if k in _BID_NOTICE_COLUMNS}
+            insert_values.setdefault("list_visible", False)
+            obj = BidNotice(**insert_values)
             session.add(obj)
             existing[pk] = obj  # 같은 배치 내 PK 중복 방어(이후 update 로 흡수)
             new_count += 1
@@ -228,6 +230,42 @@ def upsert_bid_notices(
 
     session.flush()
     return (new_count, updated_count, ord_changes)
+
+
+# --- 면허제한 upsert ----------------------------------------------------
+def upsert_license_limits(
+    session: Session, rows: list[dict[str, Any]], collected_at: datetime,
+) -> tuple[int, int]:
+    """면허 복합 PK 를 묶음 IN 조회해 upsert 하고 flush 만 한다(삭제 없음).
+
+    같은 배치의 중복 PK 는 마지막 값으로 흡수하며 최초 collected_at 은 보존한다.
+    """
+    pk_names = ("bid_ntce_no", "bid_ntce_ord", "lmt_grp_no", "lmt_sno")
+    deduped = {tuple(row[name] for name in pk_names): row for row in rows}
+    pks = list(deduped)
+    existing = {}
+    pk_columns = tuple_(*(getattr(BidLicenseLimit, name) for name in pk_names))
+    # 복합 PK 4개 × 200행으로 SQLite 바인드 수에도 여유를 둔다.
+    for start in range(0, len(pks), 200):
+        for row in session.scalars(select(BidLicenseLimit).where(
+            pk_columns.in_(pks[start:start + 200])
+        )):
+            existing[tuple(getattr(row, name) for name in pk_names)] = row
+    inserted = updated = 0
+    columns = {column.name for column in BidLicenseLimit.__table__.columns}
+    for pk, values in deduped.items():
+        data = {key: value for key, value in values.items()
+                if key in columns and key != "collected_at"}
+        row = existing.get(pk)
+        if row is None:
+            session.add(BidLicenseLimit(**data, collected_at=collected_at))
+            inserted += 1
+        else:
+            for key, value in data.items():
+                setattr(row, key, value)
+            updated += 1
+    session.flush()
+    return inserted, updated
 
 
 # --- pre_spec upsert (Phase 5.3) ----------------------------------------
@@ -452,9 +490,11 @@ def search_bid_notices(
     page: int = 1,
     page_size: int = 50,
     now: datetime | None = None,
+    visible_only: bool = True,
 ) -> tuple[list[BidNotice], int]:
     """저장된 공고를 필터·정렬·페이지네이션해서 (행 목록, 전체건수)로 반환.
 
+    - visible_only=True: 목록 표시 대상(list_visible=True)만 건수·행 조회에 포함.
     - q: bid_ntce_nm 부분검색(LIKE %q%, 대소문자 무시).
     - dt_from/dt_to: 날짜 범위(둘 중 하나만 와도 처리). 화면에서 dt_to 는
       그 날 23:59:59 로 만들어 넘긴다(여기서는 받은 값 그대로 <= 비교).
@@ -486,6 +526,8 @@ def search_bid_notices(
     date_col = getattr(BidNotice, date_field)
 
     conditions = []
+    if visible_only:
+        conditions.append(BidNotice.list_visible.is_(True))
     if q:
         conditions.append(BidNotice.bid_ntce_nm.ilike(f"%{q}%"))
     if dt_from is not None:
