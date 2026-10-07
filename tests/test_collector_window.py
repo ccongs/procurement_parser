@@ -222,6 +222,7 @@ def test_detail_json_structure(monkeypatch, db_engine):
     assert set(data["by_call"]) == {"servc", "license", "license_fix"}
     assert data["classify"]["total"] == 0
     assert all(detail["total_count"] == 0 for detail in data["by_call"].values())
+    assert all(detail["unique_items"] == 0 for detail in data["by_call"].values())
     assert isinstance(data["ord_changes"], list)
     assert data["ord_changed_count"] == len(data["ord_changes"])
 
@@ -396,7 +397,7 @@ def test_missing_license_only_current_limited_notices_are_called(monkeypatch, db
     assert run.status == "success"
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": 2, "called": 2, "found": 1,
-                   "failed": [], "retry_count": 0, "total_count": 1}
+                   "failed": [], "retry_count": 0, "total_count": 1, "unique_items": 1}
     with Local() as session:
         assert session.get(BidNotice, "MISS").list_visible is False
         assert session.get(BidNotice, "FIX").match_basis == "업종"
@@ -445,7 +446,7 @@ def test_missing_license_fix_queries_all_targets(monkeypatch, db_engine, count):
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": count, "called": count,
                    "found": (count + 1) // 2, "failed": [], "retry_count": 0,
-                   "total_count": (count + 1) // 2}
+                   "total_count": (count + 1) // 2, "unique_items": (count + 1) // 2}
     fixes = [params for op, params in calls
              if op == collector.LICENSE_OPERATION and params["inqryDiv"] == "2"]
     assert [params["bidNtceNo"] for params in fixes] == [item["bidNtceNo"] for item in notices]
@@ -511,7 +512,8 @@ def test_missing_license_fix_no_rows_advances_successive_windows(monkeypatch, db
         assert run.status == "success" and run.error_msg is None
         fix = json.loads(run.detail_json)["by_call"]["license_fix"]
         assert fix == {"outcome": "ok", "targets": 205, "called": 205,
-                       "found": 0, "failed": [], "retry_count": 0, "total_count": 0}
+                       "found": 0, "failed": [], "retry_count": 0, "total_count": 0,
+                       "unique_items": 0}
         assert len(calls) == 207
         with Local() as session:
             assert session.get(AppConfig, 1).last_success_dt == window_end
@@ -607,10 +609,14 @@ def test_all_stages_page_and_retry_and_config_params(monkeypatch, db_engine):
             tried.add(key)
             return _failed_result()
         if stage == "servc":
-            return _ok_result([_notice("FIX" if page == 1 else "BULK")] * (999 if page == 1 else 1), "1000")
+            rows = ([_notice("FIX")] + [_notice(f"EXTRA-{i}", limited="N") for i in range(998)]
+                    if page == 1 else [_notice("BULK")])
+            return _ok_result(rows, "1000")
         if stage == "license":
-            return _ok_result([_license("BULK", lmtSno=str(page))] * (999 if page == 1 else 1), "1000")
-        return _ok_result([_license("FIX", lmtSno=str(page))], "2")
+            offset = (page - 1) * 999
+            return _ok_result([_license("BULK", lmtGrpNo="1", lmtSno=str(i))
+                               for i in range(offset, min(offset + 999, 1000))], "1000")
+        return _ok_result([_license("FIX", lmtGrpNo="1", lmtSno=str(page))], "2")
 
     calls = _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
@@ -631,7 +637,7 @@ def test_all_stages_page_and_retry_and_config_params(monkeypatch, db_engine):
                for params in license_calls)
     assert data["by_call"]["license_fix"]["retry_count"] == 1
     with Local() as session:
-        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 4
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 1002
         assert session.get(AppConfig, 1).last_success_dt == WIN_END
 
 
@@ -860,11 +866,12 @@ def test_short_api_pages_are_partial_and_keep_received_data(
     calls = _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
     received = expected_pages * 10
-    reason = f"건수 미달: 받은 {received} / 전체 {total}"
+    reason = f"건수 미달: 고유 {received} / 전체 {total}"
     detail = json.loads(run.detail_json)
     result = detail["by_call"][stage]
     assert run.status == "partial" and f"{stage}: {reason}" in run.error_msg
     assert result["outcome"] == "failed" and result["total_count"] == total
+    assert result["unique_items"] == received
     assert result["error_msg"] == reason and not result.get("truncated")
     stage_calls = [params for op, params in calls if (
         "servc" if op == collector.OPERATION else
@@ -942,6 +949,7 @@ def test_received_count_at_least_total_is_success(monkeypatch, db_engine, stage,
     detail = json.loads(run.detail_json)["by_call"][stage]
     assert run.status == "success" and run.error_msg is None
     assert detail["outcome"] == "ok" and detail["total_count"] == 1
+    assert detail["unique_items"] == received
     if stage != "license_fix":
         assert detail["items"] == received
     _, Local = db_engine
@@ -987,7 +995,7 @@ def test_first_total_count_is_preserved_when_later_page_changes(monkeypatch, sta
     assert result["total_count"] == total and len(calls) == 2
     assert result["outcome"] == ("ok" if second_code == "00" else "failed")
     if second_code == "03":
-        assert result["error_msg"] == f"건수 미달: 받은 {page_size} / 전체 {total}"
+        assert result["error_msg"] == f"건수 미달: 고유 {page_size} / 전체 {total}"
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -1019,6 +1027,7 @@ def test_no_data_without_total_count_is_ok(monkeypatch, stage):
     fetched = collector._fetch_pages(operation, {"inqryDiv": "2" if stage == "license_fix" else "1"},
                                      collector._ConfigSnapshot("1", "1", None, 20, 0))
     assert fetched["outcome"] == "ok" and fetched["total_count"] == 0
+    assert fetched["unique_items"] == 0
 
 
 def test_license_fix_total_count_sums_all_targets(monkeypatch, db_engine):
@@ -1036,6 +1045,130 @@ def test_license_fix_total_count_sums_all_targets(monkeypatch, db_engine):
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert run.status == "success"
     assert fix["called"] == fix["found"] == 2 and fix["total_count"] == 3
+    assert fix["unique_items"] == 3
+
+
+@pytest.mark.parametrize("configured_size,expected_size", [(1000, 999), (20, 20)])
+def test_license_fix_caps_page_size_and_receives_all_rows(
+    monkeypatch, db_engine, configured_size, expected_size,
+):
+    _, Local = db_engine
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = configured_size
+        session.commit()
+    rows = [_license("FIX", lmtGrpNo="1", lmtSno=str(i)) for i in range(17)]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("FIX")], "1")
+        if params["inqryDiv"] == "1":
+            return _ok_result()
+        # 실측 장애 재현: 1000 요청은 오류 없이 기본 10행만 응답한다.
+        size = int(params["numOfRows"])
+        actual_size = 10 if size >= 1000 else size
+        offset = (int(params["pageNo"]) - 1) * actual_size
+        return _ok_result(rows[offset:offset + actual_size], "17")
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fixes = [params for _, params in calls if params["inqryDiv"] == "2"]
+    assert len(fixes) == 1 and fixes[0]["numOfRows"] == str(expected_size)
+    assert run.status == "success" and run.error_msg is None
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["outcome"] == "ok" and fix["total_count"] == 17
+    assert fix["unique_items"] == 17
+    with Local() as session:
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 17
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+
+@pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
+def test_repeated_page_key_cannot_hide_missing_row(monkeypatch, db_engine, stage):
+    _, Local = db_engine
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 999
+        session.get(AppConfig, 1).last_success_dt = WIN_BGN
+        session.commit()
+    rows = ([_notice(f"NEW-{i}", limited="N") for i in range(999)] if stage == "servc"
+            else [_license("NEW", lmtGrpNo="1", lmtSno=str(i)) for i in range(999)])
+
+    def responder(op, params):
+        current = "servc" if op == collector.OPERATION else (
+            "license" if params["inqryDiv"] == "1" else "license_fix")
+        if current == stage:
+            return _ok_result(rows if params["pageNo"] == "1" else [rows[0]], "1000")
+        if current == "servc":
+            return _ok_result([_notice("NEW")], "1")
+        return _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    detail = json.loads(run.detail_json)["by_call"]
+    result = detail[stage]
+    reason = "건수 미달: 고유 999 / 전체 1000 (중복 1)"
+    assert run.status == "partial" and f"{stage}: {reason}" in run.error_msg
+    assert result["outcome"] == "failed" and result["error_msg"] == reason
+    assert result["total_count"] == 1000 and result["unique_items"] == 999
+    if stage == "license_fix":
+        assert result["failed"] == ["NEW"]
+    else:
+        assert result["items"] == 1000 and result["pages"] == 2
+        assert detail["license_fix"]["outcome"] == "skipped"
+        assert all(params["inqryDiv"] != "2" for _, params in calls)
+    with Local() as session:
+        assert session.get(AppConfig, 1).last_success_dt == WIN_BGN
+        assert session.scalar(select(func.count()).select_from(BidNotice)) == (
+            999 if stage == "servc" else 1)
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
+            0 if stage == "servc" else 999)
+
+
+@pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
+@pytest.mark.parametrize("orders,unique", [
+    (("000", "001"), 2), (("0001", "1", "001"), 1), (("A", "00A"), 1),
+])
+def test_unique_keys_normalize_orders_and_keep_distinct_orders(monkeypatch, stage, orders, unique):
+    operation = collector.OPERATION if stage == "servc" else collector.LICENSE_OPERATION
+    rows = ([_notice("SAME", order) for order in orders] if stage == "servc" else
+            [_license("SAME", order, lmtGrpNo="1", lmtSno="1") for order in orders])
+    _fake_api(monkeypatch, lambda op, params: _ok_result(rows, "2"))
+    result = collector._fetch_pages(operation, {"inqryDiv": "2" if stage == "license_fix" else "1"},
+                                    collector._ConfigSnapshot("1", "1", None, 20, 0))
+    assert result["unique_items"] == unique and len(result["items"]) == len(orders)
+    assert result["outcome"] == ("ok" if unique == 2 else "failed")
+    if unique == 1:
+        assert result["error_msg"] == f"건수 미달: 고유 1 / 전체 2 (중복 {len(orders) - 1})"
+
+
+@pytest.mark.parametrize("operation,missing_field", [
+    (collector.OPERATION, "bidNtceNo"), (collector.OPERATION, "bidNtceOrd"),
+    (collector.LICENSE_OPERATION, "bidNtceNo"), (collector.LICENSE_OPERATION, "bidNtceOrd"),
+    (collector.LICENSE_OPERATION, "lmtGrpNo"), (collector.LICENSE_OPERATION, "lmtSno"),
+])
+@pytest.mark.parametrize("blank", [None, "  ", "missing"])
+def test_incomplete_key_rows_each_count_once(monkeypatch, operation, missing_field, blank):
+    complete = _license("SAME", lmtGrpNo="1", lmtSno="1")
+    incomplete = {**complete, missing_field: blank}
+    if blank == "missing":
+        incomplete.pop(missing_field)
+    # 같은 불완전 행도 각각 1건으로 세고, 완전한 키 중복만 제거한다.
+    rows = [complete, complete, incomplete, incomplete]
+    _fake_api(monkeypatch, lambda op, params: _ok_result(rows, "3"))
+    result = collector._fetch_pages(operation, {"inqryDiv": "1"},
+                                    collector._ConfigSnapshot("1", "1", None, 20, 0))
+    assert result["outcome"] == "ok" and result["unique_items"] == 3
+    assert len(result["items"]) == 4 and result["error_msg"] is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("bidNtceNo", "OTHER"), ("bidNtceOrd", "001"), ("lmtGrpNo", "2"), ("lmtSno", "2"),
+])
+def test_license_unique_key_uses_every_pk_field(monkeypatch, field, value):
+    first = _license("SAME", lmtGrpNo="1", lmtSno="1")
+    _fake_api(monkeypatch, lambda op, params: _ok_result([first, {**first, field: value}], "2"))
+    result = collector._fetch_pages(collector.LICENSE_OPERATION, {"inqryDiv": "1"},
+                                    collector._ConfigSnapshot("1", "1", None, 20, 0))
+    assert result["outcome"] == "ok" and result["unique_items"] == 2
 
 
 def test_finish_run_commit_failure_rolls_back_notices_licenses_and_classification(monkeypatch, db_engine):

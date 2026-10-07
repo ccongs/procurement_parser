@@ -63,6 +63,23 @@ def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def _count_unique_items(operation: str, items: list[dict]) -> int:
+    """응답 키로 중복을 세되, 키 필드가 없거나 비면 행마다 1건으로 센다."""
+    fields = ("bidNtceNo", "bidNtceOrd")
+    if operation == LICENSE_OPERATION:
+        fields += ("lmtGrpNo", "lmtSno")
+    keys = set()
+    unkeyed = 0
+    for item in items:
+        parts = tuple(_text(item.get(field)) for field in fields) if isinstance(item, dict) else ()
+        if not parts or not all(parts):
+            # 변환에서 버리는 행도 수신 건수에는 포함하고, 저장 변환 규칙은 유지한다.
+            unkeyed += 1
+            continue
+        keys.add((parts[0], classifier.normalize_order(parts[1]), *parts[2:]))
+    return len(keys) + unkeyed
+
+
 def dedup_notices(items: list[dict]) -> list[dict]:
     """같은 공고는 가장 높은 차수를 유지한다(정수 우선, 불가하면 3자리 문자열)."""
     deduped: dict[str, dict] = {}
@@ -194,7 +211,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
     page_size = (_BULK_PAGE_SIZE
                  if operation == OPERATION or (
                      operation == LICENSE_OPERATION and base_params.get("inqryDiv") == "1")
-                 else config.num_of_rows)
+                 else min(config.num_of_rows, _BULK_PAGE_SIZE))
     base_params = {**base_params, "numOfRows": str(page_size)}
     items: list[dict] = []
     retry_count = 0
@@ -215,6 +232,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                 halt_code = result.result_code
                 return {
                     "items": items,
+                    "unique_items": _count_unique_items(operation, items),
                     "pages": pages_fetched,
                     "last_code": last_code,
                     "retry_count": retry_count,
@@ -227,6 +245,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             if outcome == "failed":
                 return {
                     "items": items,
+                    "unique_items": _count_unique_items(operation, items),
                     "pages": pages_fetched,
                     "last_code": last_code,
                     "retry_count": retry_count,
@@ -252,6 +271,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             except ValueError:
                 return {
                     "items": items, "pages": pages_fetched, "last_code": last_code,
+                    "unique_items": _count_unique_items(operation, items),
                     "retry_count": retry_count, "total_count": total_count,
                     "outcome": "failed", "halt_code": None,
                     "error_msg": "totalCount 누락/오류",
@@ -271,6 +291,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                 )
                 return {
                     "items": items, "pages": pages_fetched, "last_code": last_code,
+                    "unique_items": _count_unique_items(operation, items),
                     "retry_count": retry_count, "outcome": "failed", "halt_code": None,
                     "total_count": total_count,
                     "truncated": True,
@@ -281,6 +302,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
         # 파라미터/키 등 클라이언트 측 오류 — 일시 장애로 보지 않고 실패 처리.
         return {
             "items": items,
+            "unique_items": _count_unique_items(operation, items),
             "pages": pages_fetched,
             "last_code": last_code,
             "retry_count": retry_count,
@@ -290,16 +312,22 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             "error_msg": f"ApiClientError: {exc}",
         }
 
-    shortfall = len(items) < total_count
+    unique_items = _count_unique_items(operation, items)
+    shortfall = unique_items < total_count
+    duplicates = len(items) - unique_items
+    error_msg = f"건수 미달: 고유 {unique_items} / 전체 {total_count}" if shortfall else None
+    if shortfall and duplicates:
+        error_msg += f" (중복 {duplicates})"
     return {
         "items": items,
+        "unique_items": unique_items,
         "pages": pages_fetched,
         "last_code": last_code,
         "retry_count": retry_count,
         "total_count": total_count,
         "outcome": "failed" if shortfall else "ok",
         "halt_code": None,
-        "error_msg": f"건수 미달: 받은 {len(items)} / 전체 {total_count}" if shortfall else None,
+        "error_msg": error_msg,
     }
 
 
@@ -326,6 +354,7 @@ def _build_detail_json(by_call: dict, ord_changes: list[dict], classify: dict | 
 def _call_detail(result: dict, **counts) -> dict:
     return {"outcome": result["outcome"], "pages": result["pages"],
             "last_result_code": result["last_code"], "items": len(result["items"]),
+            "unique_items": result["unique_items"],
             "total_count": result["total_count"], "error_msg": result["error_msg"],
             **({"truncated": True} if result.get("truncated") else {}),
             **counts, "retry_count": result["retry_count"]}
@@ -355,13 +384,14 @@ def collect_window(
                     trigger, fmt_dt(window_bgn), fmt_dt(window_end))
         by_call = {
             "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
-                      "items": 0, "notices": 0, "retry_count": 0,
+                      "items": 0, "unique_items": 0, "notices": 0, "retry_count": 0,
                       "page_size": _BULK_PAGE_SIZE, "total_count": None},
             "license": {"outcome": "skipped", "pages": 0, "last_result_code": None,
-                        "items": 0, "kept": 0, "retry_count": 0,
+                        "items": 0, "unique_items": 0, "kept": 0, "retry_count": 0,
                         "page_size": _BULK_PAGE_SIZE, "total_count": None},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
-                            "found": 0, "failed": [], "retry_count": 0, "total_count": None},
+                            "found": 0, "failed": [], "retry_count": 0, "total_count": None,
+                            "unique_items": 0},
         }
         failed: list[tuple[str, dict]] = []
 
@@ -416,6 +446,7 @@ def collect_window(
                 }, snapshot)
                 fix["called"] += 1
                 fix["retry_count"] += result["retry_count"]
+                fix["unique_items"] += result["unique_items"]
                 # 보정 단계의 전체 건수는 공고별 첫 정상 응답 건수의 합(불명이 있으면 None).
                 fix["total_count"] = (fix["total_count"] + result["total_count"]
                                       if fix["total_count"] is not None
