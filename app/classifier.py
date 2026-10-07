@@ -78,14 +78,15 @@ class Classification:
 def _compile_terms(terms: tuple[str, ...]) -> tuple[tuple[str, re.Pattern[str]], ...]:
     """규칙 값 튜플별 캐시로 전 공고 순회 중 반복 컴파일을 피한다."""
     patterns = []
-    for term in dict.fromkeys(terms):
+    normalized = dict.fromkeys(" ".join(term.split()) for term in terms)
+    for term in normalized:
         parts = term.split()
         if not parts:
             continue
         pattern = r"\s*".join(re.escape(part) for part in parts)
-        if re.fullmatch(r"[A-Za-z0-9]", term[0]):
+        if re.fullmatch(r"[A-Za-z0-9]", parts[0][0]):
             pattern = r"(?<![A-Za-z0-9])" + pattern
-        if re.fullmatch(r"[A-Za-z0-9]", term[-1]):
+        if re.fullmatch(r"[A-Za-z0-9]", parts[-1][-1]):
             pattern += r"(?![A-Za-z0-9])"
         patterns.append((term, re.compile(pattern, re.IGNORECASE)))
     return tuple(patterns)
@@ -137,6 +138,11 @@ def load_rule_set(session: Session) -> RuleSet:
     return RuleSet(tuple(values["clsfc"]), tuple(values["keyword"]), tuple(values["negative"]))
 
 
+def load_match_codes(session: Session) -> frozenset[str]:
+    """설정의 매칭 업종코드를 공백·빈값·중복 없이 읽는다."""
+    return frozenset(_split_codes(get_config(session).indstryty_cds))
+
+
 def iter_classifications(
     session: Session,
     *,
@@ -145,24 +151,37 @@ def iter_classifications(
     bid_ntce_nos: Iterable[str] | None = None,
     batch_size: int = 500,
 ) -> Iterator[tuple[BidNotice, Classification]]:
-    """공고·면허를 배치 조회해 판정만 내준다. 미리보기용으로 쓰기·커밋은 없다."""
+    """공고·면허를 배치 조회해 판정만 내준다. 미리보기용으로 쓰기·커밋은 없다.
+
+    flush 된 행만 대상이며, 호출자가 필요 시 flush 한다.
+    """
     if batch_size <= 0:
         raise ValueError("batch_size 는 양수여야 합니다.")
-    targets = tuple(dict.fromkeys(bid_ntce_nos)) if bid_ntce_nos is not None else None
+    targets = (
+        tuple(sorted({no.strip() for no in bid_ntce_nos if no.strip()}))
+        if bid_ntce_nos is not None else None
+    )
     if targets == ():
         return
     codes = set(match_codes)
     last_no = None
+    target_offset = 0
     # 호출자의 autoflush 설정과 무관하게 미리보기 중 DB 쓰기를 막는다.
     with session.no_autoflush:
         while True:
-            query = select(BidNotice).order_by(BidNotice.bid_ntce_no).limit(batch_size)
-            if last_no is not None:
-                query = query.where(BidNotice.bid_ntce_no > last_no)
+            query = select(BidNotice).order_by(BidNotice.bid_ntce_no)
             if targets is not None:
-                query = query.where(BidNotice.bid_ntce_no.in_(targets))
+                batch = targets[target_offset:target_offset + batch_size]
+                if not batch:
+                    break
+                target_offset += batch_size
+                query = query.where(BidNotice.bid_ntce_no.in_(batch))
+            else:
+                query = query.limit(batch_size)
+                if last_no is not None:
+                    query = query.where(BidNotice.bid_ntce_no > last_no)
             notices = session.scalars(query).all()
-            if not notices:
+            if not notices and targets is None:
                 break
             licenses: dict[str, list[BidLicenseLimit]] = defaultdict(list)
             for row in session.scalars(select(BidLicenseLimit).where(
@@ -196,15 +215,17 @@ def iter_classifications(
                     # 면허가 없는 기존 공고의 유일한 업종 근거는 숨겨져도 보존한다.
                     result = replace(result, matched_indstryty_cds=notice.matched_indstryty_cds)
                 yield notice, result
-            last_no = notices[-1].bid_ntce_no
+            if targets is None:
+                last_no = notices[-1].bid_ntce_no
 
 
 def reclassify_notices(
     session: Session, *, bid_ntce_nos: Iterable[str] | None = None,
 ) -> dict:
     """변경된 분류 컬럼만 갱신하고 전체 대상의 판정 통계와 함께 1회 커밋한다."""
+    session.flush()
     rules = load_rule_set(session)
-    codes = _split_codes(get_config(session).indstryty_cds)
+    codes = load_match_codes(session)
     stats = {"total": 0, "changed": 0, "visible": 0, "hidden": 0,
              "by_basis": {"업종": 0, "분류": 0, "키워드": 0}}
     columns = ("list_visible", "match_basis", "match_detail", "matched_indstryty_cds")

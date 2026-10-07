@@ -11,7 +11,8 @@ from sqlalchemy.orm import sessionmaker
 from app import db
 from app.classifier import (
     DEFAULT_LIST_RULES, Classification, RuleSet, _compile_terms,
-    classify_notice, iter_classifications, load_rule_set, match_terms, reclassify_notices,
+    classify_notice, iter_classifications, load_match_codes, load_rule_set, match_terms,
+    reclassify_notices,
 )
 from app.models import AppConfig, BidLicenseLimit, BidNotice, ListRule, SchemaMigration
 
@@ -133,6 +134,18 @@ def test_keyword_order_duplicates_and_detail_limit():
     assert len(result.match_detail) == 200
 
 
+@pytest.mark.parametrize("title,terms,expected", [
+    ("ASW 개발", [" SW"], []),
+    ("SW 개발", [" SW "], ["SW"]),
+    ("SWOT 분석", ["SW "], []),
+    ("시스템구축 및 SW 개발", [" 시스템\t 구축 ", "시스템 구축", " SW ", "SW"],
+     ["시스템 구축", "SW"]),
+    ("SW 개발", [" ", "\t\n", ""], []),
+])
+def test_match_terms_normalizes_rule_values(title, terms, expected):
+    assert match_terms(title, terms) == expected
+
+
 def test_rule_patterns_are_cached_across_notices():
     rules = RuleSet((), ("캐시검증 SW",), ("캐시제외",))
     _compile_terms.cache_clear()
@@ -174,6 +187,83 @@ def test_load_rule_set_filters_and_orders_by_id(database):
         ])
         session.commit()
         assert load_rule_set(session) == RuleSet(("분류",), ("선순위", "후순위"), ("제외",))
+
+
+@pytest.mark.parametrize("codes,expected", [
+    (" ,1468, 1470, ,1468,", frozenset({"1468", "1470"})),
+    (" , \t,", frozenset()),
+    ("", frozenset()),
+])
+def test_load_match_codes_normalizes_config(database, codes, expected):
+    _, local = database
+    with local() as session:
+        session.add(AppConfig(id=1, indstryty_cds=codes))
+        session.commit()
+        result = load_match_codes(session)
+        assert isinstance(result, frozenset)
+        assert result == expected
+
+
+@pytest.mark.parametrize("action", ["add", "disable", "delete"])
+def test_reclassification_flushes_pending_rule_changes(database, action):
+    _, local = database
+    with local() as session:
+        assert session.autoflush is False
+        visible_before = action != "add"
+        rule = ListRule(rule_type="keyword", value="홈페이지")
+        session.add_all([
+            AppConfig(id=1, indstryty_cds=""),
+            _notice("RULE", bid_ntce_nm="홈페이지", list_visible=visible_before,
+                    match_basis="키워드" if visible_before else None,
+                    match_detail="홈페이지" if visible_before else None),
+        ])
+        if visible_before:
+            session.add(rule)
+        session.commit()
+        if action == "add":
+            session.add(rule)
+        elif action == "disable":
+            rule.enabled = False
+        else:
+            session.delete(rule)
+
+        stats = reclassify_notices(session)
+        assert stats["total"] == 1 and stats["changed"] == 1
+        assert stats["visible"] == int(action == "add")
+        assert stats["hidden"] == int(action != "add")
+    with local() as verifier:
+        rules = load_rule_set(verifier)
+        assert rules.keywords == (("홈페이지",) if action == "add" else ())
+        notice = verifier.get(BidNotice, "RULE")
+        result = classify_notice(
+            indstryty_lmt_yn=notice.indstryty_lmt_yn, pub_prcrmnt_clsfc_nm=None,
+            bid_ntce_nm=notice.bid_ntce_nm, license_codes=(), match_codes=(), rules=rules,
+        )
+        assert notice.list_visible is result.list_visible
+        assert notice.match_basis == result.match_basis
+        assert notice.match_detail == result.match_detail
+
+
+def test_reclassification_flushes_pending_notice_and_license(database):
+    _, local = database
+    with local() as session:
+        assert session.autoflush is False
+        session.add(AppConfig(id=1, indstryty_cds="1468"))
+        session.commit()
+        session.add_all([
+            BidNotice(bid_ntce_no="NEW", bid_ntce_ord="001", indstryty_lmt_yn="Y",
+                      collected_at=NOW, updated_at=NOW),
+            _license("NEW", "1468"),
+        ])
+        assert reclassify_notices(session, bid_ntce_nos=["NEW"]) == {
+            "total": 1, "changed": 1, "visible": 1, "hidden": 0,
+            "by_basis": {"업종": 1, "분류": 0, "키워드": 0},
+        }
+    with local() as verifier:
+        notice = verifier.get(BidNotice, "NEW")
+        assert notice.list_visible is True and notice.match_basis == "업종"
+        assert notice.match_detail is None and notice.matched_indstryty_cds == "1468"
+        assert verifier.get(BidLicenseLimit, ("NEW", "001", "1", "1")) is not None
 
 
 @pytest.mark.parametrize("fallback", [None, "분류", "키워드"])
@@ -321,6 +411,63 @@ def test_preview_batches_no_n_plus_one_and_reclassification_statistics(database)
         assert list(iter_classifications(session, rules=DEFAULT_RULES, match_codes=(), bid_ntce_nos=[])) == []
         empty = reclassify_notices(session, bid_ntce_nos=[])
         assert empty == dict(subset, total=0, changed=0, hidden=0)
+
+
+def test_target_batches_bound_parameters_and_only_process_existing_notices(database):
+    engine, local = database
+    targets = [f"TARGET-{index:04d}" for index in range(1005)]
+    existing = targets[::50]
+    batch_size = 10
+    with local() as session:
+        for no in [*existing, "OUTSIDE"]:
+            session.add_all([_notice(no), _license(no, "1468")])
+        session.commit()
+        before = _snapshot(session)
+        queries = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            queries.append((statement, parameters))
+
+        # 역순·공백·중복·빈값을 포함한 단발성 iterable 도 정규화한다.
+        supplied = (no for no in reversed([*targets, f" {existing[0]} ", "", " \t "]))
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            results = list(iter_classifications(
+                session, rules=DEFAULT_RULES, match_codes=("1468",),
+                bid_ntce_nos=supplied, batch_size=batch_size,
+            ))
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+
+        assert [row.bid_ntce_no for row, _ in results] == existing
+        assert all(result == Classification(True, "업종", None, "1468") for _, result in results)
+        assert all(len(parameters) <= batch_size for _, parameters in queries)
+        batch_count = (len(targets) + batch_size - 1) // batch_size
+        assert sum("FROM bid_notice \n" in query for query, _ in queries) == batch_count
+        assert sum("FROM bid_license_limit" in query for query, _ in queries) == batch_count
+        assert all(query.startswith("SELECT") for query, _ in queries)
+        assert not session.dirty and _snapshot(session) == before
+
+
+@pytest.mark.parametrize("targets", [[], ["", " ", "\t\n"]])
+def test_empty_normalized_targets_do_not_query(database, targets):
+    engine, local = database
+    queries = []
+
+    def record_query(conn, cursor, statement, parameters, context, executemany):
+        queries.append(statement)
+
+    with local() as session:
+        session.add(_notice("OUTSIDE"))
+        session.commit()
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            assert list(iter_classifications(
+                session, rules=DEFAULT_RULES, match_codes=(), bid_ntce_nos=targets,
+            )) == []
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+        assert queries == []
 
 
 def test_preview_does_not_autoflush_pending_changes(database):
