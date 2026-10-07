@@ -89,11 +89,12 @@ _register_sqlite_pragmas(engine)
 
 
 def init_db() -> None:
-    """모델 테이블 생성 + 자동 마이그레이션 + app_config 기본행 시드.
+    """모델 테이블 생성 + 자동 마이그레이션 + 설정·표시 규칙 기본값 시드.
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
       create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
-    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관 → 기존 시드.
+    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관
+      → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회).
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
@@ -105,6 +106,7 @@ def init_db() -> None:
     _migrate_bid_notice_indexes()
     _migrate_bid_notice_raw()
     _seed_app_config()
+    _seed_list_rules()
 
 
 def _migrate_add_columns() -> None:
@@ -284,6 +286,25 @@ def _seed_app_config() -> None:
             )
         )
         session.commit()
+
+
+def _seed_list_rules() -> None:
+    """완료 기록이 없을 때 누락된 기본 표시 규칙만 추가한다(재분류 없음)."""
+    from app.classifier import DEFAULT_LIST_RULES
+    from app.models import ListRule, SchemaMigration
+
+    rule = ListRule.__table__
+    migration = SchemaMigration.__table__
+    name = "phase13_list_rule_seed"
+    # 규칙 INSERT·완료 기록은 함께 커밋되거나 함께 롤백된다.
+    with engine.begin() as conn:
+        if conn.execute(select(migration.c.name).where(migration.c.name == name)).first():
+            return
+        existing = set(conn.execute(select(rule.c.rule_type, rule.c.value)).all())
+        for rule_type, value in DEFAULT_LIST_RULES:
+            if (rule_type, value) not in existing:
+                conn.execute(rule.insert().values(rule_type=rule_type, value=value, enabled=True))
+        conn.execute(migration.insert().values(name=name))
 
 
 def _print_summary() -> None:
