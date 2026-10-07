@@ -1,50 +1,39 @@
-"""수집기 — Phase 3.3.
+"""수집기 — 전체 용역 검색·면허 일괄·누락 보정·분류(Phase 13.3).
 
-12번 용역 검색조건 조회(`getBidPblancListInfoServcPPSSrch`)를 업종코드 4종에 대해
-**동시 병렬 호출 → 끝까지 페이징 → 병합·dedup(bidNtceNo) → transform → upsert →
-collection_run 기록**까지 수행한다. 재시도/halt 정책(계획서 §2.2)을 적용한다.
-
-이 단계의 collector 는 **윈도우(시작·종료 datetime)와 trigger 를 인자로 받는다.**
-윈도우 자동 산정(last_success_dt 기반)·주기 실행은 3.4(scheduler), 화면은 3.5.
-
-설계 메모:
-- api_client.call_endpoint 는 동기(httpx.get)이므로 4코드 병렬은 ThreadPoolExecutor 로 한다.
-- **워커(스레드)는 API 호출·페이징·item 수집만** 하고 DB 는 건드리지 않는다.
-  transform·upsert·run·config 등 DB 쓰기는 병합 후 **메인 스레드 단일 세션**에서 처리한다.
+API 조회 중에는 공고·면허를 쓰지 않고, 단일 세션에서 upsert 후 분류와 함께 커밋한다.
+윈도우 계산·게이트·수동 백필 진입점은 기존 정책을 유지한다.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from app import api_client, repository
+from sqlalchemy import select
+
+from app import api_client, classifier, repository
 from app.db import SessionLocal, init_db
-from app.models import CollectionRun
-from app.transform import item_to_bid_notice_values
+from app.models import BidLicenseLimit, BidNotice, CollectionRun
+from app.transform import item_to_bid_notice_values, parse_datetime
 
 logger = logging.getLogger(__name__)
 
-# 12번 용역 검색조건 조회.
 OPERATION = "getBidPblancListInfoServcPPSSrch"
+LICENSE_OPERATION = "getBidPblancListInfoLicenseLimit"
 
-# resultCode 분류(계획서 §2.2).
 _OK_CODES: frozenset[str] = frozenset({"00", "03"})
 _RETRY_CODES: frozenset[str] = frozenset({"01", "02", "04", "05"})
-
-# 일시 장애 재시도 백오프(초). 잔여 미결(계획서 §9) → 짧은 선형 백오프 기본값.
 _RETRY_BACKOFF_SECONDS = 2.0
-
-# 페이징 안전장치(무한 루프 방지). 초과 시 로그로 알린다.
 _MAX_PAGES_SAFETY = 1000
+_BULK_PAGE_SIZE = 999  # API 상한 999 — 1000 이상은 오류 없이 기본 10행 응답(2026-10-07 실측)
 
 
-# --- 순수 헬퍼(네트워크/DB 비의존) --------------------------------------
 def classify_result_code(code: str | None) -> str:
     """resultCode → 'ok' | 'retry' | 'halt'.
 
@@ -71,30 +60,110 @@ def total_pages(total_count: Any, num_of_rows: int) -> int:
     return (tc + num_of_rows - 1) // num_of_rows
 
 
-def merge_and_dedup(
-    results_by_cd: dict[str, list[dict]],
-) -> tuple[list[dict], dict[str, str]]:
-    """업종코드별 item 목록을 합치고 bidNtceNo 로 중복 제거.
+def _text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
 
-    반환: (dedup된 item 리스트, matched_map)
-      - matched_map[bidNtceNo] = 그 공고를 잡은 업종코드 합집합 CSV(정렬), 예: "1468,1470".
-      - 같은 공고는 처음 본 item 을 유지한다.
-    """
+
+def _count_unique_items(operation: str, items: list[dict]) -> int:
+    """응답 키로 중복을 세되, 키 필드가 없거나 비면 행마다 1건으로 센다."""
+    fields = ("bidNtceNo", "bidNtceOrd")
+    if operation == LICENSE_OPERATION:
+        fields += ("lmtGrpNo", "lmtSno")
+    keys = set()
+    unkeyed = 0
+    for item in items:
+        parts = tuple(_text(item.get(field)) for field in fields) if isinstance(item, dict) else ()
+        if not parts or not all(parts):
+            # 변환에서 버리는 행도 수신 건수에는 포함하고, 저장 변환 규칙은 유지한다.
+            unkeyed += 1
+            continue
+        keys.add((parts[0], classifier.normalize_order(parts[1]), *parts[2:]))
+    return len(keys) + unkeyed
+
+
+def dedup_notices(items: list[dict]) -> list[dict]:
+    """같은 공고는 가장 높은 차수를 유지한다(정수 우선, 불가하면 3자리 문자열)."""
     deduped: dict[str, dict] = {}
-    matched: dict[str, set[str]] = {}
-    for cd, items in results_by_cd.items():
-        for item in items:
-            raw_no = item.get("bidNtceNo") if isinstance(item, dict) else None
-            no = str(raw_no).strip() if raw_no is not None else ""
-            if not no:
+    for item in items:
+        no = _text(item.get("bidNtceNo")) if isinstance(item, dict) else ""
+        if not no:
+            continue
+        previous = deduped.get(no)
+        if previous is not None:
+            new_ord = classifier.normalize_order(_text(item.get("bidNtceOrd")))
+            old_ord = classifier.normalize_order(_text(previous.get("bidNtceOrd")))
+            try:
+                higher = new_ord > old_ord
+            except TypeError:
+                higher = str(new_ord).zfill(3) > str(old_ord).zfill(3)
+            if not higher:
                 continue
-            if no not in deduped:
-                deduped[no] = item
-            matched.setdefault(no, set()).add(str(cd))
+        deduped[no] = item
+    return list(deduped.values())
 
-    deduped_items = list(deduped.values())
-    matched_map = {no: ",".join(sorted(cds)) for no, cds in matched.items()}
-    return deduped_items, matched_map
+
+def license_values(item: dict) -> dict[str, Any] | None:
+    """면허 응답의 명/코드·허용업종 목록을 저장 컬럼으로 변환한다."""
+    no, ord_ = _text(item.get("bidNtceNo")), _text(item.get("bidNtceOrd"))
+    if not no or not ord_:
+        return None
+    group, sequence = _text(item.get("lmtGrpNo")), _text(item.get("lmtSno"))
+    name = _text(item.get("lcnsLmtNm"))
+    allowed_list = _text(item.get("permsnIndstrytyList"))
+    if not group or not sequence:
+        # 선택 키가 비어도 서로 다른 면허는 보존하고, 같은 내용은 재수신 시 갱신한다.
+        content = "|".join((group, sequence, name, allowed_list))
+        sequence = "h" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:9]
+    if "/" in name:
+        name, code = (part.strip() for part in name.rsplit("/", 1))
+    else:
+        code = None
+    codes = []
+    for entry in re.findall(r"\[([^\[\]]*)\]", allowed_list):
+        if "/" in entry:
+            allowed_code = entry.rsplit("/", 1)[1].strip()
+            if allowed_code and allowed_code not in codes:
+                codes.append(allowed_code)
+    return {
+        "bid_ntce_no": no, "bid_ntce_ord": ord_,
+        "lmt_grp_no": group, "lmt_sno": sequence,
+        "lcns_cd": code or None, "lcns_nm": name or None,
+        "permsn_cds": ",".join(codes) or None, "rgst_dt": parse_datetime(item.get("rgstDt")),
+    }
+
+
+def _license_key(row: dict) -> tuple[str, str, str, str]:
+    return tuple(row[name] for name in ("bid_ntce_no", "bid_ntce_ord", "lmt_grp_no", "lmt_sno"))
+
+
+def _keep_licenses(session, items: list[dict], notice_nos: set[str]) -> dict[tuple, dict]:
+    """이번 창 공고와 DB 기존 공고의 면허만 보존한다(후보 500개 이하 IN 조회)."""
+    rows = [row for item in items if (row := license_values(item)) is not None]
+    candidates = sorted({row["bid_ntce_no"] for row in rows} - notice_nos)
+    keep = set(notice_nos)
+    for start in range(0, len(candidates), 500):
+        keep.update(session.scalars(select(BidNotice.bid_ntce_no).where(
+            BidNotice.bid_ntce_no.in_(candidates[start:start + 500])
+        )))
+    return {_license_key(row): row for row in rows if row["bid_ntce_no"] in keep}
+
+
+def _missing_license_targets(session, notices: list[dict], licenses: dict[tuple, dict]) -> list[dict]:
+    """업종 제한 Y 공고의 현재 차수 면허가 일괄 응답·DB 모두에 없으면 보정한다."""
+    candidates = [item for item in notices if _text(item.get("indstrytyLmtYn")) == "Y"
+                  and _text(item.get("bidNtceOrd"))]
+    pairs = {(row["bid_ntce_no"], classifier.normalize_order(row["bid_ntce_ord"]))
+             for row in licenses.values()}
+    nos = [_text(item["bidNtceNo"]) for item in candidates]
+    for start in range(0, len(nos), 500):
+        pairs.update((no, classifier.normalize_order(ord_)) for no, ord_ in session.execute(
+            select(BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord).where(
+                BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500])
+            ).distinct()
+        ))
+    return [item for item in candidates
+            if (_text(item["bidNtceNo"]),
+                classifier.normalize_order(_text(item["bidNtceOrd"]))) not in pairs]
 
 
 def fmt_dt(dt: datetime) -> str:
@@ -102,10 +171,9 @@ def fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y%m%d%H%M")
 
 
-# --- 워커(스레드): 업종코드 1개를 끝까지 페이징 -------------------------
 @dataclass(frozen=True)
 class _ConfigSnapshot:
-    """스레드에 넘기는 설정값 스냅샷(ORM 객체를 스레드 간 공유하지 않기 위함)."""
+    """한 실행에서 공통으로 사용할 조회 설정."""
 
     inqry_div: str
     intrntnl_div_cd: str | None
@@ -114,8 +182,17 @@ class _ConfigSnapshot:
     max_retries: int
 
 
+def _servc_params(window_bgn: datetime, window_end: datetime, config: _ConfigSnapshot) -> dict[str, str]:
+    return {
+        "inqryDiv": config.inqry_div,
+        "intrntnlDivCd": config.intrntnl_div_cd or "",
+        "prtcptLmtRgnCd": config.prtcpt_lmt_rgn_cd or "",
+        "inqryBgnDt": fmt_dt(window_bgn), "inqryEndDt": fmt_dt(window_end),
+    }
+
+
 def _call_with_retry(
-    raw_params: dict[str, str], max_retries: int
+    operation: str, raw_params: dict[str, str], max_retries: int
 ) -> tuple[api_client.ApiResult, int, str]:
     """페이지 1건 호출 + 재시도. 반환: (마지막 ApiResult, 사용한 재시도 수, outcome).
 
@@ -123,7 +200,7 @@ def _call_with_retry(
     """
     used_retries = 0
     while True:
-        result = api_client.call_endpoint(OPERATION, raw_params, response_type="json")
+        result = api_client.call_endpoint(operation, raw_params, response_type="json")
         cls = classify_result_code(result.result_code)
         if cls == "ok":
             return result, used_retries, "ok"
@@ -136,50 +213,37 @@ def _call_with_retry(
         time.sleep(_RETRY_BACKOFF_SECONDS * used_retries)  # 선형 백오프
 
 
-def _fetch_cd(
-    cd: str,
-    window_bgn: datetime,
-    window_end: datetime,
-    config: _ConfigSnapshot,
-) -> dict[str, Any]:
-    """업종코드 1개를 끝까지 페이징해 item 을 모은다. DB 는 건드리지 않는다.
-
-    반환 dict: cd, items, pages, last_code, retry_count, outcome, halt_code, error_msg.
-      outcome ∈ {"ok","failed","halt"}.
-    """
-    base_params: dict[str, str] = {
-        "inqryDiv": config.inqry_div,
-        "intrntnlDivCd": config.intrntnl_div_cd or "",  # 빈값이면 build_params 가 제거(=전체)
-        # 참가제한지역(Phase 4.3): "00"=전국(지역제한 없는 공고만), 빈값/None 이면 제거(=전체).
-        "prtcptLmtRgnCd": config.prtcpt_lmt_rgn_cd or "",
-        "indstrytyCd": cd,
-        "numOfRows": str(config.num_of_rows),
-        "inqryBgnDt": fmt_dt(window_bgn),
-        "inqryEndDt": fmt_dt(window_end),
-    }
-
+def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSnapshot) -> dict[str, Any]:
+    """operation 을 끝까지 페이징한다. 조회 결과만 모으고 DB 는 쓰지 않는다."""
+    page_size = (_BULK_PAGE_SIZE
+                 if operation == OPERATION or (
+                     operation == LICENSE_OPERATION and base_params.get("inqryDiv") == "1")
+                 else min(config.num_of_rows, _BULK_PAGE_SIZE))
+    base_params = {**base_params, "numOfRows": str(page_size)}
     items: list[dict] = []
     retry_count = 0
     pages_fetched = 0
     last_code: str | None = None
+    total_count: int | None = None
     max_page: int | None = None
     page = 1
 
     try:
         while True:
             params = {**base_params, "pageNo": str(page)}
-            result, used_retries, outcome = _call_with_retry(params, config.max_retries)
+            result, used_retries, outcome = _call_with_retry(operation, params, config.max_retries)
             retry_count += used_retries
             last_code = result.result_code
 
             if outcome == "halt":
                 halt_code = result.result_code
                 return {
-                    "cd": cd,
                     "items": items,
+                    "unique_items": _count_unique_items(operation, items),
                     "pages": pages_fetched,
                     "last_code": last_code,
                     "retry_count": retry_count,
+                    "total_count": total_count,
                     "outcome": "halt",
                     "halt_code": halt_code,
                     "error_msg": f"resultCode={halt_code} "
@@ -187,11 +251,12 @@ def _fetch_cd(
                 }
             if outcome == "failed":
                 return {
-                    "cd": cd,
                     "items": items,
+                    "unique_items": _count_unique_items(operation, items),
                     "pages": pages_fetched,
                     "last_code": last_code,
                     "retry_count": retry_count,
+                    "total_count": total_count,
                     "outcome": "failed",
                     "halt_code": None,
                     "error_msg": result.error
@@ -201,49 +266,78 @@ def _fetch_cd(
             # outcome == "ok"
             pages_fetched += 1
             if result.result_code == "03":  # No Data → 종료
+                if total_count is None:
+                    total_count = 0
                 break
             items.extend(result.items)
 
+            try:
+                response_total_count = int(_text(result.total_count))
+                if response_total_count < 0:
+                    raise ValueError
+            except ValueError:
+                return {
+                    "items": items, "pages": pages_fetched, "last_code": last_code,
+                    "unique_items": _count_unique_items(operation, items),
+                    "retry_count": retry_count, "total_count": total_count,
+                    "outcome": "failed", "halt_code": None,
+                    "error_msg": "totalCount 누락/오류",
+                }
             if max_page is None:
-                max_page = total_pages(result.total_count, config.num_of_rows)
+                total_count = response_total_count
+                max_page = total_pages(total_count, page_size)
 
             if page >= max_page:
                 break
             if page >= _MAX_PAGES_SAFETY:
                 logger.warning(
-                    "업종코드 %s: 안전 상한(%d페이지) 도달 — 페이징 중단(total_count=%s)",
-                    cd,
+                    "operation %s: 안전 상한(%d페이지) 도달 — 페이징 중단(total_count=%s)",
+                    operation,
                     _MAX_PAGES_SAFETY,
                     result.total_count,
                 )
-                break
+                return {
+                    "items": items, "pages": pages_fetched, "last_code": last_code,
+                    "unique_items": _count_unique_items(operation, items),
+                    "retry_count": retry_count, "outcome": "failed", "halt_code": None,
+                    "total_count": total_count,
+                    "truncated": True,
+                    "error_msg": f"안전 상한({_MAX_PAGES_SAFETY}페이지) 도달 — 잘린 수집",
+                }
             page += 1
     except api_client.ApiClientError as exc:
         # 파라미터/키 등 클라이언트 측 오류 — 일시 장애로 보지 않고 실패 처리.
         return {
-            "cd": cd,
             "items": items,
+            "unique_items": _count_unique_items(operation, items),
             "pages": pages_fetched,
             "last_code": last_code,
             "retry_count": retry_count,
+            "total_count": total_count,
             "outcome": "failed",
             "halt_code": None,
             "error_msg": f"ApiClientError: {exc}",
         }
 
+    unique_items = _count_unique_items(operation, items)
+    shortfall = unique_items < total_count
+    duplicates = len(items) - unique_items
+    error_msg = f"건수 미달: 고유 {unique_items} / 전체 {total_count}" if shortfall else None
+    if shortfall and duplicates:
+        error_msg += f" (중복 {duplicates})"
     return {
-        "cd": cd,
         "items": items,
+        "unique_items": unique_items,
         "pages": pages_fetched,
         "last_code": last_code,
         "retry_count": retry_count,
-        "outcome": "ok",
+        "total_count": total_count,
+        "outcome": "failed" if shortfall else "ok",
         "halt_code": None,
-        "error_msg": None,
+        "error_msg": error_msg,
     }
 
 
-# --- 실행 이력 detail ----------------------------------------------------
 def _detach_run(session, run: CollectionRun) -> CollectionRun:
     """commit 으로 만료된 run 속성을 로드하고 세션에서 분리한다.
 
@@ -256,199 +350,166 @@ def _detach_run(session, run: CollectionRun) -> CollectionRun:
     return run
 
 
-def _build_detail_json(
-    results: list[dict[str, Any]],
-    ord_changes: list[dict[str, Any]],
-) -> str:
-    """업종코드별 결과와 차수변경 목록을 detail_json(문자열)으로 직렬화.
-
-    반환 JSON 구조:
-    {
-        "by_cd": [ {"indstrytyCd": ..., "outcome": ..., "pages": ...,
-                    "last_result_code": ..., "items": ..., "retry_count": ...}, ... ],
-        "ord_changes": [ {"no": "...", "old": "1", "new": "2"}, ... ],
-        "ord_changed_count": <len(ord_changes)>
-    }
-    """
-    by_cd = [
-        {
-            "indstrytyCd": r["cd"],
-            "outcome": r["outcome"],
-            "pages": r["pages"],
-            "last_result_code": r["last_code"],
-            "items": len(r["items"]),
-            "retry_count": r["retry_count"],
-        }
-        for r in sorted(results, key=lambda x: str(x["cd"]))
-    ]
-    return json.dumps(
-        {
-            "by_cd": by_cd,
-            "ord_changes": ord_changes,
-            "ord_changed_count": len(ord_changes),
-        },
-        ensure_ascii=False,
-    )
+def _build_detail_json(by_call: dict, ord_changes: list[dict], classify: dict | None = None) -> str:
+    """단계별 조회 결과·분류 통계·차수 변경을 직렬화한다."""
+    return json.dumps({
+        "by_call": by_call, "classify": classify,
+        "ord_changes": ord_changes, "ord_changed_count": len(ord_changes),
+    }, ensure_ascii=False)
 
 
-# --- 진입 함수 -----------------------------------------------------------
+def _call_detail(result: dict, **counts) -> dict:
+    return {"outcome": result["outcome"], "pages": result["pages"],
+            "last_result_code": result["last_code"], "items": len(result["items"]),
+            "unique_items": result["unique_items"],
+            "total_count": result["total_count"], "error_msg": result["error_msg"],
+            **({"truncated": True} if result.get("truncated") else {}),
+            **counts, "retry_count": result["retry_count"]}
+
+
 def collect_window(
-    window_bgn: datetime,
-    window_end: datetime,
-    trigger: str = "manual",
+    window_bgn: datetime, window_end: datetime, trigger: str = "manual",
 ) -> CollectionRun | None:
-    """주어진 윈도우로 12번 용역 공고를 수집·저장하고 CollectionRun(최종 상태)을 반환.
-
-    auto_halted=True 면 아무 것도 하지 않고 None 을 반환(게이트 본체는 3.4, 여기선 방어적).
-    """
+    """전체 용역·면허 일괄·누락 보정 후 저장·분류하고 최종 실행 이력을 반환한다."""
     session = SessionLocal()
     try:
         config = repository.get_config(session)
-
-        # halt 게이트(방어적) — 자동 중단 상태면 수집하지 않는다.
         if config.auto_halted:
-            logger.warning(
-                "auto_halted=True → 수집 건너뜀 (halt_code=%s, reason=%s)",
-                config.halt_code,
-                config.halt_reason,
-            )
+            logger.warning("auto_halted=True → 수집 건너뜀 (halt_code=%s, reason=%s)",
+                           config.halt_code, config.halt_reason)
             return None
-
-        cds = [c.strip() for c in (config.indstryty_cds or "").split(",") if c.strip()]
-        if not cds:
-            logger.warning("indstryty_cds 가 비어 있습니다 — 수집 대상 업종코드 없음.")
-
+        if not any(code.strip() for code in (config.indstryty_cds or "").split(",")):
+            logger.warning("매칭 업종코드 없음 — 업종 근거 표시 없음. 수집은 계속합니다.")
         snapshot = _ConfigSnapshot(
-            inqry_div=config.inqry_div,
-            intrntnl_div_cd=config.intrntnl_div_cd,
+            inqry_div=config.inqry_div, intrntnl_div_cd=config.intrntnl_div_cd,
             prtcpt_lmt_rgn_cd=config.prtcpt_lmt_rgn_cd,
-            num_of_rows=config.num_of_rows,
-            max_retries=config.max_retries,
+            num_of_rows=config.num_of_rows, max_retries=config.max_retries,
         )
-
-        # collected_at/updated_at 은 run 시작 시각 한 값으로 일관되게 채운다.
         meta_ts = datetime.now()
         run = repository.create_run(session, trigger, window_bgn, window_end)
+        logger.info("수집 시작: trigger=%s window=%s~%s",
+                    trigger, fmt_dt(window_bgn), fmt_dt(window_end))
+        by_call = {
+            "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
+                      "items": 0, "unique_items": 0, "notices": 0, "retry_count": 0,
+                      "page_size": _BULK_PAGE_SIZE, "total_count": None},
+            "license": {"outcome": "skipped", "pages": 0, "last_result_code": None,
+                        "items": 0, "unique_items": 0, "kept": 0, "retry_count": 0,
+                        "page_size": _BULK_PAGE_SIZE, "total_count": None},
+            "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
+                            "found": 0, "failed": [], "retry_count": 0, "total_count": None,
+                            "unique_items": 0},
+        }
+        failed: list[tuple[str, dict]] = []
 
-        logger.info(
-            "수집 시작: trigger=%s window=%s~%s cds=%s",
-            trigger,
-            fmt_dt(window_bgn),
-            fmt_dt(window_end),
-            cds,
-        )
-
-        # --- 4코드 병렬 호출(워커는 DB 비접근) ---
-        results: list[dict[str, Any]] = []
-        if cds:
-            with ThreadPoolExecutor(max_workers=len(cds)) as executor:
-                futures = {
-                    executor.submit(_fetch_cd, cd, window_bgn, window_end, snapshot): cd
-                    for cd in cds
-                }
-                for fut in as_completed(futures):
-                    results.append(fut.result())
-
-        total_retry = sum(r["retry_count"] for r in results)
-
-        # --- halt 발생: 저장하지 않고 중단(failed) ---
-        halt_results = [r for r in results if r["outcome"] == "halt"]
-        if halt_results:
-            h = halt_results[0]
-            halt_code = h["halt_code"]
-            halt_reason = (
-                f"indstrytyCd={h['cd']} 에서 비재시도 에러 {h['error_msg']} — 스케줄 자동 중단."
-            )
-            logger.error("halt: %s", halt_reason)
-            repository.set_halt(session, halt_code, halt_reason)
+        def halt(stage: str, result: dict) -> CollectionRun:
+            reason = f"{stage} 에서 비재시도 에러 {result['error_msg']} — 스케줄 자동 중단."
+            logger.error("halt: %s", reason)
+            repository.set_halt(session, result["halt_code"], reason)
             repository.finish_run(
-                session,
-                run,
-                status="failed",
-                total_fetched=0,
-                total_new=0,
-                total_updated=0,
-                retry_count=total_retry,
-                error_code=halt_code,
-                error_msg=halt_reason,
-                detail_json=_build_detail_json(results, []),
+                session, run, status="failed", total_fetched=0, total_new=0, total_updated=0,
+                retry_count=sum(detail["retry_count"] for detail in by_call.values()),
+                error_code=result["halt_code"], error_msg=reason,
+                detail_json=_build_detail_json(by_call, []),
             )
+            logger.info("수집 종료: status=failed 공고=%d 면허보존=%d 보정=%d 분류표시=0",
+                        by_call["servc"]["notices"], by_call["license"]["kept"],
+                        by_call["license_fix"]["found"])
             return _detach_run(session, run)
 
-        # --- 병합·dedup·transform·메타 부여 ---
-        results_by_cd = {r["cd"]: r["items"] for r in results}
-        deduped_items, matched_map = merge_and_dedup(results_by_cd)
+        # 조회 단계는 공고·면허에 쓰지 않는다. halt 면 이후 호출도 중단한다.
+        servc = _fetch_pages(OPERATION, _servc_params(window_bgn, window_end, snapshot), snapshot)
+        notices = dedup_notices(servc["items"])
+        notice_nos = {_text(item["bidNtceNo"]) for item in notices}
+        by_call["servc"] = _call_detail(servc, notices=len(notices), page_size=_BULK_PAGE_SIZE)
+        if servc["outcome"] == "halt":
+            return halt("servc", servc)
+        if servc["outcome"] == "failed":
+            failed.append(("servc", servc))
 
-        values_list: list[dict[str, Any]] = []
-        skipped = 0
-        for item in deduped_items:
+        license_result = _fetch_pages(LICENSE_OPERATION, {
+            "inqryDiv": "1", "inqryBgnDt": fmt_dt(window_bgn), "inqryEndDt": fmt_dt(window_end),
+        }, snapshot)
+        licenses = _keep_licenses(session, license_result["items"], notice_nos)
+        by_call["license"] = _call_detail(
+            license_result, kept=len(licenses), page_size=_BULK_PAGE_SIZE,
+        )
+        if license_result["outcome"] == "halt":
+            return halt("license", license_result)
+        if license_result["outcome"] == "failed":
+            failed.append(("license", license_result))
+
+        fix = by_call["license_fix"]
+        if servc["outcome"] == license_result["outcome"] == "ok":
+            targets = _missing_license_targets(session, notices, licenses)
+            if len(targets) >= 50:
+                logger.warning("면허 누락 보정 대상 %d건 — 이번 창 공고 %d건",
+                               len(targets), len(notices))
+            fix.update(outcome="ok", targets=len(targets), total_count=0)
+            for item in targets:
+                no = _text(item["bidNtceNo"])
+                result = _fetch_pages(LICENSE_OPERATION, {
+                    "inqryDiv": "2", "bidNtceNo": no, "bidNtceOrd": _text(item["bidNtceOrd"]),
+                }, snapshot)
+                fix["called"] += 1
+                fix["retry_count"] += result["retry_count"]
+                fix["unique_items"] += result["unique_items"]
+                # 보정 단계의 전체 건수는 공고별 첫 정상 응답 건수의 합(불명이 있으면 None).
+                fix["total_count"] = (fix["total_count"] + result["total_count"]
+                                      if fix["total_count"] is not None
+                                      and result["total_count"] is not None else None)
+                rows = [row for raw in result["items"] if (row := license_values(raw)) is not None]
+                licenses.update({_license_key(row): row for row in rows})
+                if rows:
+                    fix["found"] += 1
+                if result["outcome"] == "halt":
+                    fix["outcome"] = "failed"
+                    fix["error_msg"] = result["error_msg"]
+                    fix["failed"].append(no)
+                    return halt("license_fix", result)
+                if result["outcome"] == "failed":
+                    fix["outcome"] = "failed"
+                    fix["error_msg"] = "; ".join(filter(None, [fix.get("error_msg"), result["error_msg"]]))
+                    if result.get("truncated"):
+                        fix["truncated"] = True
+                    fix["failed"].append(no)
+                    failed.append(("license_fix", result))
+
+        # 공고·면허·분류는 finish_run 의 실행 종료 이력과 함께 커밋한다.
+        values_list = []
+        for item in notices:
             try:
                 values = item_to_bid_notice_values(item)
             except ValueError as exc:
-                skipped += 1
                 logger.warning("transform 건너뜀(PK 누락 등): %s", exc)
                 continue
-            no = str(item.get("bidNtceNo")).strip()
-            values["matched_indstryty_cds"] = matched_map.get(no)
-            values["collected_at"] = meta_ts
-            values["updated_at"] = meta_ts
-            # Phase 13.1: 업종 검색으로 수집한 공고는 모두 표시(13.3 에서 분류로 교체).
-            values["list_visible"] = True
-            values["match_basis"] = "업종"
-            values["match_detail"] = None
+            values.update(collected_at=meta_ts, updated_at=meta_ts)
             values_list.append(values)
-
         new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)
-        total_fetched = len(deduped_items)
-
-        # --- 차수변경 로그 ---
+        repository.upsert_license_limits(session, list(licenses.values()), meta_ts)
+        classify = classifier.reclassify_notices(
+            session, bid_ntce_nos=notice_nos | {row["bid_ntce_no"] for row in licenses.values()},
+            commit=False,
+        )
         for change in ord_changes:
             logger.info("차수변경 %s: %s -> %s", change["no"], change["old"], change["new"])
-
-        detail_json = _build_detail_json(results, ord_changes)
-
-        # --- 상태 판정 ---
-        failed_results = [r for r in results if r["outcome"] == "failed"]
-        if failed_results:
-            status = "partial"  # 일시 장애로 일부 실패 → last_success_dt 미갱신(다음 회차 재수집)
-            error_code = next(
-                (r["last_code"] for r in failed_results if r["last_code"]), None
-            )
-            error_msg = (
-                f"{len(failed_results)}개 업종코드 일시 장애로 실패: "
-                f"{[r['cd'] for r in failed_results]}"
-            )
-        else:
-            status = "success"
-            error_code = None
-            error_msg = None
-
+        status = "partial" if failed else "success"
+        error_code = next((result["last_code"] for _, result in failed if result["last_code"]), None)
+        error_msg = "; ".join(f"{stage}: {result['error_msg']}" for stage, result in failed) or None
+        total_retry = sum(detail["retry_count"] for detail in by_call.values())
         repository.finish_run(
-            session,
-            run,
-            status=status,
-            total_fetched=total_fetched,
-            total_new=new_count,
-            total_updated=updated_count,
-            retry_count=total_retry,
-            error_code=error_code,
-            error_msg=error_msg,
-            detail_json=detail_json,
+            session, run, status=status, total_fetched=len(notices),
+            total_new=new_count, total_updated=updated_count, retry_count=total_retry,
+            error_code=error_code, error_msg=error_msg,
+            detail_json=_build_detail_json(by_call, ord_changes, classify),
         )
-
         if status == "success":
             repository.update_last_success_dt(session, window_end)
-
-        logger.info(
-            "수집 종료: status=%s fetched=%d new=%d updated=%d skipped=%d retry=%d ord_changed=%d",
-            status,
-            total_fetched,
-            new_count,
-            updated_count,
-            skipped,
-            total_retry,
-            len(ord_changes),
-        )
+        logger.info("수집 종료: status=%s 공고=%d 면허보존=%d 면허저장=%d 보정=%d/%d 분류표시=%d "
+                    "new=%d updated=%d retry=%d ord_changed=%d",
+                    status, len(notices), by_call["license"]["kept"], len(licenses),
+                    fix["found"], fix["called"], classify["visible"],
+                    new_count, updated_count, total_retry, len(ord_changes))
         return _detach_run(session, run)
     finally:
         session.close()

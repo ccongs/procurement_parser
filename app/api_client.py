@@ -118,7 +118,7 @@ class EndpointSpec:
     no: int
     operation: str
     label: str            # 화면 표시용
-    kind: str             # "search" (검색조건) | "list" (기본 목록) | "prespec" (사전규격 검색조건)
+    kind: str             # "search" | "list" | "license" | "prespec"
     extra_params: list[ParamSpec] = field(default_factory=list)
     base_url: str | None = None     # None 이면 입찰 BASE_URL 사용(기존 동작 불변)
     # 공통 파라미터(COMMON_PARAMS) 중 이 op 에서 전송하지 않을 항목(허용목록에서 제외).
@@ -126,7 +126,7 @@ class EndpointSpec:
 
 
 # 화면에 등록할 엔드포인트: 검색조건 조회 11~14 (핵심) + 기본 목록조회 1~4 (보조)
-# + 사전규격 검색조건 15 (별도 서비스 베이스 URL).
+# + 입찰 면허제한 15 + 사전규격 검색조건 15 (별도 서비스 베이스 URL).
 ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(11, "getBidPblancListInfoCnstwkPPSSrch", "11 · 공사 (검색조건)", "search", SEARCH_PARAMS),
     EndpointSpec(12, "getBidPblancListInfoServcPPSSrch", "12 · 용역 (검색조건)", "search", SEARCH_PARAMS),
@@ -136,6 +136,10 @@ ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(2, "getBidPblancListInfoServc", "2 · 용역 (기본 목록)", "list"),
     EndpointSpec(3, "getBidPblancListInfoFrgcpt", "3 · 외자 (기본 목록)", "list"),
     EndpointSpec(4, "getBidPblancListInfoThng", "4 · 물품 (기본 목록)", "list"),
+    EndpointSpec(
+        15, "getBidPblancListInfoLicenseLimit", "15 · 입찰 면허제한", "license",
+        [ParamSpec("bidNtceOrd", "입찰공고차수", "", "inqryDiv=2 일 때 필수 (예: 000)")],
+    ),
     # 사전규격 용역 검색조건(별도 서비스). bidNtceNo 는 입찰 전용이라 이 op 허용목록에서 제외.
     EndpointSpec(
         15,

@@ -17,10 +17,10 @@ from app import api_client, collector, repository
 from app.collector import (
     classify_result_code,
     fmt_dt,
-    merge_and_dedup,
+    dedup_notices,
     total_pages,
 )
-from app.collector import _ConfigSnapshot, _fetch_cd
+from app.collector import _ConfigSnapshot, _fetch_pages, _servc_params
 from app.db import Base
 from app.models import BidNotice, BidNoticeRaw
 
@@ -57,33 +57,33 @@ def test_total_pages():
     assert total_pages("abc", 20) == 0
 
 
-# --- 3. merge_and_dedup ------------------------------------------------
-def test_merge_and_dedup_union():
-    results_by_cd = {
-        "1470": [{"bidNtceNo": "A", "x": 1}, {"bidNtceNo": "B"}],
-        "1468": [{"bidNtceNo": "A", "x": 2}, {"bidNtceNo": "C"}],
-    }
-    items, matched = merge_and_dedup(results_by_cd)
-
-    # 중복 제거 → 3건
-    assert {i["bidNtceNo"] for i in items} == {"A", "B", "C"}
-    assert len(items) == 3
-    # 같은 공고 A 는 처음 본 item("1470" 쪽) 유지
-    a_item = next(i for i in items if i["bidNtceNo"] == "A")
-    assert a_item["x"] == 1
-    # matched 는 두 코드 합집합(정렬 CSV)
-    assert matched["A"] == "1468,1470"
-    assert matched["B"] == "1470"
-    assert matched["C"] == "1468"
+# --- 3. 최신 차수 중복 제거 --------------------------------------------
+@pytest.mark.parametrize("orders", [("000", "001"), ("9", "10"), ("A", "00B")])
+def test_dedup_notices_keeps_highest_order(orders):
+    items = dedup_notices([
+        {"bidNtceNo": "A", "bidNtceOrd": orders[0]},
+        {"bidNtceNo": "B"},
+        {"bidNtceNo": "A", "bidNtceOrd": orders[1]},
+    ])
+    assert len(items) == 2
+    assert items[0]["bidNtceOrd"] == orders[1]
 
 
-def test_merge_and_dedup_skips_blank_pk():
-    results_by_cd = {
-        "1426": [{"bidNtceNo": "  "}, {"bidNtceNo": None}, {"foo": "bar"}, {"bidNtceNo": "X"}],
-    }
-    items, matched = merge_and_dedup(results_by_cd)
+def test_dedup_notices_skips_blank_pk():
+    items = dedup_notices([
+        {"bidNtceNo": "  "}, {"bidNtceNo": None}, {"foo": "bar"}, {"bidNtceNo": "X"},
+    ])
     assert [i["bidNtceNo"] for i in items] == ["X"]
-    assert matched == {"X": "1426"}
+
+
+@pytest.mark.parametrize("orders", [
+    ("0001", "1", "001"), ("0001", "001", "1"),
+    ("1", "0001", "001"), ("1", "001", "0001"),
+    ("001", "0001", "1"), ("001", "1", "0001"),
+])
+def test_dedup_notices_recognizes_equivalent_order_notation(orders):
+    notices = [{"bidNtceNo": "SAME", "bidNtceOrd": order} for order in orders]
+    assert dedup_notices(notices) == [notices[0]]
 
 
 # --- 4. fmt_dt ---------------------------------------------------------
@@ -92,7 +92,7 @@ def test_fmt_dt():
     assert fmt_dt(datetime(2026, 12, 31, 23, 59)) == "202612312359"
 
 
-# --- 4.5 _fetch_cd base_params: 참가제한지역 prtcptLmtRgnCd (Phase 4.3) ---
+# --- 4.5 _fetch_pages base_params: 참가제한지역 prtcptLmtRgnCd (Phase 4.3) ---
 def _snapshot(prtcpt_lmt_rgn_cd):
     """테스트용 _ConfigSnapshot — 참가제한지역만 가변, 나머지는 고정."""
     return _ConfigSnapshot(
@@ -105,7 +105,7 @@ def _snapshot(prtcpt_lmt_rgn_cd):
 
 
 def _capture_base_params(monkeypatch, snapshot):
-    """_fetch_cd 가 만드는 첫 페이지 params(=base_params + pageNo)를 캡처.
+    """_fetch_pages 가 만드는 첫 페이지 params(=base_params + pageNo)를 캡처.
 
     네트워크 없이: _call_with_retry 를 가짜로 바꿔 params 를 기록하고
     result_code='03'(No Data) 을 돌려 즉시 종료시킨다.
@@ -126,16 +126,23 @@ def _capture_base_params(monkeypatch, snapshot):
         total_count="0",
     )
 
-    def _fake_call_with_retry(params, max_retries):
+    def _fake_call_with_retry(operation, params, max_retries):
         captured.update(params)
         return fake_result, 0, "ok"
 
     monkeypatch.setattr(collector, "_call_with_retry", _fake_call_with_retry)
-    _fetch_cd("1468", datetime(2026, 5, 1, 0, 0), datetime(2026, 6, 1, 0, 0), snapshot)
+    params = _servc_params(datetime(2026, 5, 1), datetime(2026, 6, 1), snapshot)
+    _fetch_pages(collector.OPERATION, params, snapshot)
+    assert "indstrytyCd" not in captured
+    assert captured["inqryDiv"] == snapshot.inqry_div
+    assert captured["intrntnlDivCd"] == snapshot.intrntnl_div_cd
+    assert captured["numOfRows"] == "999"
+    assert captured["inqryBgnDt"] == "202605010000"
+    assert captured["inqryEndDt"] == "202606010000"
     return captured
 
 
-def test_fetch_cd_base_params_includes_region_when_set(monkeypatch):
+def test_fetch_pages_base_params_includes_region_when_set(monkeypatch):
     """prtcpt_lmt_rgn_cd='00' 이면 base_params 에 prtcptLmtRgnCd='00' 포함."""
     params = _capture_base_params(monkeypatch, _snapshot("00"))
     assert params["prtcptLmtRgnCd"] == "00"
@@ -144,7 +151,7 @@ def test_fetch_cd_base_params_includes_region_when_set(monkeypatch):
     assert built["prtcptLmtRgnCd"] == "00"
 
 
-def test_fetch_cd_base_params_region_specific_code(monkeypatch):
+def test_fetch_pages_base_params_region_specific_code(monkeypatch):
     """특정 지역코드(예: 28=인천)도 그대로 base_params·build_params 에 들어간다."""
     params = _capture_base_params(monkeypatch, _snapshot("28"))
     assert params["prtcptLmtRgnCd"] == "28"
@@ -152,7 +159,7 @@ def test_fetch_cd_base_params_region_specific_code(monkeypatch):
     assert built["prtcptLmtRgnCd"] == "28"
 
 
-def test_fetch_cd_base_params_drops_region_when_blank(monkeypatch):
+def test_fetch_pages_base_params_drops_region_when_blank(monkeypatch):
     """prtcpt_lmt_rgn_cd 가 None/'' 이면 base_params 는 빈 문자열, build_params 통과 후 제거(=요청에서 빠짐)."""
     for blank in (None, ""):
         params = _capture_base_params(monkeypatch, _snapshot(blank))
@@ -428,45 +435,158 @@ def test_upsert_insert_not_counted_as_ord_change(session):
 from app.collector import _build_detail_json  # noqa: E402
 
 
-def _make_result(cd: str, outcome: str = "ok") -> dict:
-    return {
-        "cd": cd,
-        "outcome": outcome,
-        "pages": 1,
-        "last_code": "00",
-        "items": [{"bidNtceNo": "X"}],
-        "retry_count": 0,
-    }
-
-
 def test_build_detail_json_structure():
-    """_build_detail_json 이 by_cd / ord_changes / ord_changed_count 객체를 반환."""
     import json
-
-    results = [_make_result("1468"), _make_result("1470")]
-    ord_changes = [{"no": "ABC", "old": "1", "new": "2"}]
-    raw = _build_detail_json(results, ord_changes)
-    data = json.loads(raw)
-
-    assert "by_cd" in data
-    assert "ord_changes" in data
-    assert "ord_changed_count" in data
-    assert data["ord_changed_count"] == 1
-    assert data["ord_changes"] == [{"no": "ABC", "old": "1", "new": "2"}]
-    # by_cd 는 cd 기준 정렬된 리스트
-    assert [d["indstrytyCd"] for d in data["by_cd"]] == ["1468", "1470"]
-    # by_cd 각 원소 필드 확인
-    assert data["by_cd"][0]["outcome"] == "ok"
-    assert data["by_cd"][0]["items"] == 1
+    calls = {"servc": {"outcome": "ok", "items": 1, "notices": 1}}
+    changes = [{"no": "ABC", "old": "1", "new": "2"}]
+    stats = {"visible": 1}
+    data = json.loads(_build_detail_json(calls, changes, stats))
+    assert data == {"by_call": calls, "classify": stats,
+                    "ord_changes": changes, "ord_changed_count": 1}
 
 
 def test_build_detail_json_empty_ord_changes():
-    """ord_changes 빈 배열 → ord_changed_count=0."""
     import json
-
-    results = [_make_result("1426")]
-    raw = _build_detail_json(results, [])
-    data = json.loads(raw)
+    data = json.loads(_build_detail_json({}, []))
     assert data["ord_changes"] == []
     assert data["ord_changed_count"] == 0
-    assert len(data["by_cd"]) == 1
+    assert data["classify"] is None
+
+
+# --- Phase 13.3 면허 변환·저장 -----------------------------------------
+@pytest.mark.parametrize("name, code, expected_name", [
+    (" 소프트웨어사업자/1468 ", "1468", "소프트웨어사업자"),
+    (" 이름만 ", None, "이름만"),
+    ("이름/분야 / 1468", "1468", "이름/분야"),
+])
+def test_license_values(name, code, expected_name):
+    row = collector.license_values({
+        "bidNtceNo": " A ", "bidNtceOrd": " 000 ", "lmtGrpNo": " 1 ", "lmtSno": " 2 ",
+        "lcnsLmtNm": name, "permsnIndstrytyList": "[A/1253],[B/1143],[C/1253]",
+        "rgstDt": "2026-05-01 09:10:11",
+    })
+    assert row == {
+        "bid_ntce_no": "A", "bid_ntce_ord": "000", "lmt_grp_no": "1", "lmt_sno": "2",
+        "lcns_cd": code, "lcns_nm": expected_name, "permsn_cds": "1253,1143",
+        "rgst_dt": datetime(2026, 5, 1, 9, 10, 11),
+    }
+
+
+def test_license_values_missing_fields():
+    for item in ({}, {"bidNtceNo": "A"}, {"bidNtceNo": " ", "bidNtceOrd": "000"}):
+        assert collector.license_values(item) is None
+    for date in (None, "bad date"):
+        row = collector.license_values({"bidNtceNo": "A", "bidNtceOrd": "000", "rgstDt": date})
+        assert row["rgst_dt"] is None and row["permsn_cds"] is None
+
+
+@pytest.mark.parametrize("fields, expected_group, expected_sequence", [
+    ({}, "", "hca738a74f"),
+    ({"lmtGrpNo": None, "lmtSno": "  "}, "", "hca738a74f"),
+    ({"lmtGrpNo": "1"}, "1", "h9ca985a7c"),
+    ({"lmtSno": "2"}, "", "hda3c40e7c"),
+    ({"lcnsLmtNm": "면허/9999"}, "", "hab5757036"),
+    ({"lcnsLmtNm": "다른 면허/1468"}, "", "h3395c4384"),
+    ({"permsnIndstrytyList": "[허용/9999]"}, "", "h041691ff9"),
+    ({"lmtGrpNo": "2"}, "2", "h4735eb080"),
+    ({"lmtSno": "3"}, "", "h893a849d0"),
+    ({"lmtGrpNo": " 1 ", "lmtSno": " 2 "}, "1", "2"),
+])
+def test_license_values_content_key_for_optional_fields(fields, expected_group, expected_sequence):
+    row = collector.license_values({
+        "bidNtceNo": "A", "bidNtceOrd": "000", "lcnsLmtNm": "면허/1468", **fields,
+    })
+    assert (row["lmt_grp_no"], row["lmt_sno"]) == (expected_group, expected_sequence)
+    assert len(row["lmt_sno"]) <= 10
+
+
+def test_upsert_notice_defaults_hidden_and_preserves_classification(session):
+    now = datetime(2026, 5, 1)
+    repository.upsert_bid_notices(session, [{
+        "bid_ntce_no": "NEW", "collected_at": now, "updated_at": now,
+    }])
+    assert session.get(BidNotice, "NEW").list_visible is False
+    row = session.get(BidNotice, "NEW")
+    row.list_visible, row.match_basis, row.matched_indstryty_cds = True, "업종", "1468"
+    repository.upsert_bid_notices(session, [{"bid_ntce_no": "NEW", "bid_ntce_nm": "갱신"}])
+    assert (row.list_visible, row.match_basis, row.matched_indstryty_cds) == (True, "업종", "1468")
+    session.rollback()
+    assert session.get(BidNotice, "NEW") is None
+
+
+def test_upsert_license_limits_batched_last_wins_and_preserves_timestamp(session):
+    from app.models import BidLicenseLimit
+    t1, t2 = datetime(2026, 5, 1), datetime(2026, 5, 2)
+    rows = [collector.license_values({
+        "bidNtceNo": f"A-{i}", "bidNtceOrd": "000", "lcnsLmtNm": "이름/1468",
+    }) for i in range(501)]
+    assert repository.upsert_license_limits(session, rows, t1) == (501, 0)
+    session.commit()
+    selects = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append((statement, parameters))
+
+    event.listen(session.bind, "before_cursor_execute", capture)
+    try:
+        result = repository.upsert_license_limits(session, rows + [{**rows[0], "lcns_cd": "1470"}], t2)
+    finally:
+        event.remove(session.bind, "before_cursor_execute", capture)
+    assert result == (0, 501)
+    assert len(selects) == 3
+    assert all(" IN " in sql and len(params) <= 800 for sql, params in selects)
+    key = collector._license_key(rows[0])
+    row = session.get(BidLicenseLimit, key)
+    assert row.collected_at == t1 and row.lcns_cd == "1470"
+    session.rollback()
+    assert session.get(BidLicenseLimit, key).lcns_cd == "1468"
+    assert repository.upsert_license_limits(session, [], t2) == (0, 0)
+
+
+def test_keep_licenses_queries_candidates_in_batches(session):
+    now = datetime(2026, 5, 1)
+    session.add(BidNotice(bid_ntce_no="OLD", collected_at=now, updated_at=now))
+    session.commit()
+    items = [{"bidNtceNo": f"OTHER-{i}", "bidNtceOrd": "000"} for i in range(1001)]
+    items += [{"bidNtceNo": no, "bidNtceOrd": "000"} for no in ("OLD", "NEW")]
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        queries.append((statement, parameters))
+
+    event.listen(session.bind, "before_cursor_execute", capture)
+    try:
+        kept = collector._keep_licenses(session, items, {"NEW"})
+    finally:
+        event.remove(session.bind, "before_cursor_execute", capture)
+    assert {row["bid_ntce_no"] for row in kept.values()} == {"OLD", "NEW"}
+    assert len(queries) == 3
+    assert all(" IN " in sql and len(params) <= 500 for sql, params in queries)
+
+
+def test_license_endpoint_params_and_base_url():
+    raw = {"inqryDiv": "2", "inqryBgnDt": "202605010000", "inqryEndDt": "202606010000",
+           "bidNtceNo": "A", "bidNtceOrd": "000", "pageNo": "1", "numOfRows": "20"}
+    built = api_client.build_params(collector.LICENSE_OPERATION, {**raw, "indstrytyCd": "1468",
+                                                              "intrntnlDivCd": "1"}, "json")
+    assert built == {**raw, "type": "json"}
+    assert api_client.base_url_for(collector.LICENSE_OPERATION) == api_client.BASE_URL
+
+
+@pytest.mark.parametrize("source", ["bulk", "db"])
+@pytest.mark.parametrize("notice_order", ["0001", "1", "001"])
+@pytest.mark.parametrize("license_order", ["0001", "1", "001"])
+def test_missing_license_targets_recognizes_padded_current_order(
+    session, source, notice_order, license_order,
+):
+    from app.models import BidLicenseLimit
+    notices = [{"bidNtceNo": "SAME", "bidNtceOrd": notice_order, "indstrytyLmtYn": "Y"}]
+    row = collector.license_values({"bidNtceNo": "SAME", "bidNtceOrd": license_order})
+    licenses = {}
+    if source == "bulk":
+        licenses[collector._license_key(row)] = row
+    else:
+        session.add(BidLicenseLimit(**row, collected_at=datetime(2026, 5, 1)))
+        session.commit()
+    assert collector._missing_license_targets(session, notices, licenses) == []

@@ -127,6 +127,15 @@ def _split_codes(value: str | None) -> set[str]:
     return {code.strip() for code in (value or "").split(",") if code.strip()}
 
 
+def normalize_order(value: str) -> int | str:
+    """차수 표기 차이를 흡수한다(정수 우선, 아니면 3자리 0채움)."""
+    value = value.strip()
+    try:
+        return int(value)
+    except ValueError:
+        return value.zfill(3)
+
+
 def load_rule_set(session: Session) -> RuleSet:
     """켜진 규칙만 id 순으로 읽고 알 수 없는 종류는 무시한다."""
     values: dict[str, list[str]] = {"clsfc": [], "keyword": [], "negative": []}
@@ -195,12 +204,19 @@ def iter_classifications(
                 legacy = not rows and bool(notice.matched_indstryty_cds)
                 license_codes = set()
                 if rows:
-                    current_ord = notice.bid_ntce_ord.zfill(3) if notice.bid_ntce_ord else None
-                    selected_ord = current_ord if any(
-                        row.bid_ntce_ord.zfill(3) == current_ord for row in rows
-                    ) else max(row.bid_ntce_ord.zfill(3) for row in rows)
+                    current_ord = (notice.bid_ntce_ord or "").strip()
+                    if current_ord:
+                        # 현재 차수가 없으면 이전 차수로 참가 가능 여부를 추정하지 않는다.
+                        selected_ord = normalize_order(current_ord)
+                    else:
+                        try:
+                            selected_ord = max(int(row.bid_ntce_ord) for row in rows)
+                        except ValueError:
+                            selected_ord = normalize_order(max(
+                                row.bid_ntce_ord.strip().zfill(3) for row in rows
+                            ))
                     for row in rows:
-                        if row.bid_ntce_ord.zfill(3) == selected_ord:
+                        if normalize_order(row.bid_ntce_ord) == selected_ord:
                             license_codes.update(_split_codes(row.lcns_cd))
                             license_codes.update(_split_codes(row.permsn_cds))
                 elif legacy:
@@ -223,8 +239,9 @@ def iter_classifications(
 
 def reclassify_notices(
     session: Session, *, bid_ntce_nos: Iterable[str] | None = None,
+    commit: bool = True,
 ) -> dict:
-    """변경된 분류 컬럼만 갱신하고 전체 대상의 판정 통계와 함께 1회 커밋한다."""
+    """변경된 분류 컬럼만 갱신하고 판정 통계를 반환한다(기본 1회 커밋)."""
     session.flush()
     rules = load_rule_set(session)
     codes = load_match_codes(session)
@@ -244,5 +261,6 @@ def reclassify_notices(
             for column in columns:
                 setattr(notice, column, getattr(result, column))
             stats["changed"] += 1
-    session.commit()
+    if commit:
+        session.commit()
     return stats
