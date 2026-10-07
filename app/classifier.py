@@ -5,9 +5,10 @@ from __future__ import annotations
 import re
 import threading
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -141,15 +142,22 @@ def normalize_order(value: str) -> int | str:
         return value.zfill(3)
 
 
-def load_rule_set(session: Session) -> RuleSet:
-    """켜진 규칙만 id 순으로 읽고 알 수 없는 종류는 무시한다."""
+def rule_set_from_rows(rows: Iterable[Mapping[str, Any] | ListRule]) -> RuleSet:
+    """켜진 규칙을 id 순·종류별로 묶고 id 없는 새 규칙은 뒤에 붙인다."""
+    def field(row, name):
+        return row.get(name) if isinstance(row, Mapping) else getattr(row, name)
+
     values: dict[str, list[str]] = {"clsfc": [], "keyword": [], "negative": []}
-    for row in session.scalars(
-        select(ListRule).where(ListRule.enabled.is_(True)).order_by(ListRule.id)
-    ):
-        if row.rule_type in values:
-            values[row.rule_type].append(row.value)
+    for row in sorted(rows, key=lambda row: (field(row, "id") is None, field(row, "id") or 0)):
+        kind = field(row, "rule_type")
+        if field(row, "enabled") and kind in values:
+            values[kind].append(field(row, "value"))
     return RuleSet(tuple(values["clsfc"]), tuple(values["keyword"]), tuple(values["negative"]))
+
+
+def load_rule_set(session: Session) -> RuleSet:
+    """DB 규칙을 공용 구성 함수로 읽는다."""
+    return rule_set_from_rows(session.scalars(select(ListRule)))
 
 
 def load_match_codes(session: Session) -> frozenset[str]:

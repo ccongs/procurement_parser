@@ -11,6 +11,9 @@ bid_notice upsert, halt 플래그·last_success_dt 갱신.
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -922,12 +925,22 @@ def set_default_exclude_keywords(session: Session, keyword_ids: list[int]) -> No
 
 # --- 목록 표시 규칙 ------------------------------------------------------
 
+def list_rule_fingerprint(row: Mapping[str, Any] | ListRule) -> str:
+    """행의 불변 필드 지문으로 삭제 후 재사용된 SQLite id를 구분한다."""
+    fields = ("id", "rule_type", "value", "created_at")
+    values = [row[field] if isinstance(row, Mapping) else getattr(row, field) for field in fields]
+    if isinstance(values[-1], datetime):
+        values[-1] = values[-1].isoformat()
+    payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def list_list_rules(session: Session) -> list[dict[str, Any]]:
     """종류별·id 순으로 목록 표시 규칙 전체를 반환한다."""
     rows = session.scalars(select(ListRule).order_by(ListRule.rule_type, ListRule.id))
     return [
         {"id": row.id, "rule_type": row.rule_type, "value": row.value,
-         "enabled": bool(row.enabled)}
+         "enabled": bool(row.enabled), "created_at": row.created_at.isoformat()}
         for row in rows
     ]
 

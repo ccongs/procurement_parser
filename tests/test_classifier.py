@@ -13,7 +13,7 @@ from app import db
 from app.classifier import (
     DEFAULT_LIST_RULES, Classification, RuleSet, _compile_terms,
     classify_notice, iter_classifications, load_match_codes, load_rule_set, match_terms,
-    reclassify_notices,
+    reclassify_notices, rule_set_from_rows,
 )
 from app.models import AppConfig, BidLicenseLimit, BidNotice, ListRule, SchemaMigration
 
@@ -188,6 +188,29 @@ def test_load_rule_set_filters_and_orders_by_id(database):
         ])
         session.commit()
         assert load_rule_set(session) == RuleSet(("분류",), ("선순위", "후순위"), ("제외",))
+
+
+@pytest.mark.parametrize("as_models", [False, True])
+def test_rule_set_from_rows_orders_filters_and_appends_new_rules(as_models):
+    rows = [
+        {"rule_type": "keyword", "value": "새 규칙 1", "enabled": True},
+        {"id": 9, "rule_type": "keyword", "value": "후순위", "enabled": True},
+        {"id": 2, "rule_type": "keyword", "value": "선순위", "enabled": True},
+        {"id": 3, "rule_type": "keyword", "value": "꺼짐", "enabled": False},
+        {"id": 4, "rule_type": "unknown", "value": "무시", "enabled": True},
+        {"id": 5, "rule_type": "clsfc", "value": "분류", "enabled": True},
+        {"id": 6, "rule_type": "negative", "value": "제외", "enabled": True},
+        {"id": None, "rule_type": "keyword", "value": "새 규칙 2", "enabled": True},
+        {"rule_type": "clsfc", "value": "새 분류", "enabled": True},
+        {"rule_type": "negative", "value": "새 제외", "enabled": True},
+    ]
+    source = [ListRule(**row) for row in rows] if as_models else rows
+    assert rule_set_from_rows(iter(source)) == RuleSet(
+        ("분류", "새 분류"), ("선순위", "후순위", "새 규칙 1", "새 규칙 2"), ("제외", "새 제외"),
+    )
+    assert (source[0].id if as_models else source[0].get("id")) is None
+    assert (source[1].id if as_models else source[1]["id"]) == 9
+    assert rule_set_from_rows([]) == RuleSet((), (), ())
 
 
 @pytest.mark.parametrize("codes,expected", [

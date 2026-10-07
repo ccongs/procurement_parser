@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import math
+import re
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime
@@ -4711,6 +4712,7 @@ def _render_rule_card(
     sections = []
     message = (f'<div class="msg err">{_e(err)}</div>' if err else
                f'<div class="msg ok">{_e(msg)}</div>' if msg else "")
+    references = {rule["id"]: f'{rule["id"]}:{repository.list_rule_fingerprint(rule)}' for rule in rules}
     for rule_type, title, help_text in (
         ("clsfc", "IT 공공조달분류", "정식 분류명과 정확히 같을 때"),
         ("keyword", "SW 키워드", "공고명 부분 일치, 영문·숫자 약어는 앞뒤가 영문·숫자가 아닐 때, 공백은 있어도 없어도 일치"),
@@ -4718,11 +4720,11 @@ def _render_rule_card(
     ):
         rows = "".join(
             f'<tr><td><label class="chk" style="padding-bottom:0;white-space:nowrap;">'
-            f'<input type="checkbox" name="enabled_ids" value="{int(rule["id"])}"'
+            f'<input type="checkbox" name="enabled_ids" value="{references[rule["id"]]}"'
             f'{" checked" if rule["enabled"] else ""}> 사용</label></td>'
             f'<td>{_e(rule["value"])}</td>'
             f'<td><button type="submit" class="kw-del" name="delete_id" '
-            f'value="{int(rule["id"])}">삭제</button></td></tr>'
+            f'value="{references[rule["id"]]}">삭제</button></td></tr>'
             for rule in rules if rule["rule_type"] == rule_type
         )
         if not rows:
@@ -4746,7 +4748,7 @@ def _render_rule_card(
         </div>""")
     options = "".join(f'<option value="{_e(name)}"></option>' for name in clsfc_names)
     rule_ids = "".join(
-        f'<input type="hidden" name="rule_ids" value="{int(rule["id"])}">' for rule in rules
+        f'<input type="hidden" name="rule_ids" value="{references[rule["id"]]}">' for rule in rules
     ) or '<input type="hidden" name="rule_ids" value="">'
     return f"""
     <div class="card" id="rules">
@@ -5211,12 +5213,12 @@ async def config_rules_save(request: Request):
     try:
         if action not in {"save", "add_clsfc", "add_keyword", "add_negative"}:
             raise ValueError("알 수 없는 규칙 작업입니다.")
-        delete_id = _parse_rule_id(form["delete_id"]) if "delete_id" in form else None
-        enabled_ids = [_parse_rule_id(value) for value in form.getlist("enabled_ids")]
+        delete_ref = _parse_rule_id(form["delete_id"]) if "delete_id" in form else None
+        enabled_refs = [_parse_rule_id(value) for value in form.getlist("enabled_ids")]
         if "rule_ids" not in form:
             raise ValueError("규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.")
         rendered_ids = form.getlist("rule_ids")
-        rule_ids = [] if rendered_ids == [""] else [_parse_rule_id(value) for value in rendered_ids]
+        rule_refs = [] if rendered_ids == [""] else [_parse_rule_id(value) for value in rendered_ids]
     except ValueError as exc:
         return _rules_error_redirect(str(exc))
     rule_type = action.removeprefix("add_")
@@ -5227,12 +5229,16 @@ async def config_rules_save(request: Request):
         with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session, session.no_autoflush:
             try:
                 draft = repository.list_list_rules(session)
-                current_ids = {rule["id"] for rule in draft}
-                if (not set(rule_ids).issubset(current_ids)
-                        or not set(enabled_ids).issubset(current_ids)
-                        or not set(enabled_ids).issubset(rule_ids)
-                        or (delete_id is not None and delete_id not in current_ids)):
+                current_refs = {(rule["id"], repository.list_rule_fingerprint(rule)) for rule in draft}
+                submitted_refs = [*rule_refs, *enabled_refs]
+                if delete_ref is not None:
+                    submitted_refs.append(delete_ref)
+                if (not set(submitted_refs).issubset(current_refs)
+                        or not set(enabled_refs).issubset(rule_refs)):
                     return None, "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요."
+                rule_ids = [rule_id for rule_id, _ in rule_refs]
+                enabled_ids = [rule_id for rule_id, _ in enabled_refs]
+                delete_id = delete_ref[0] if delete_ref is not None else None
                 match_codes = classifier.load_match_codes(session)
                 repository.set_list_rules_enabled(session, rule_ids, enabled_ids, commit=False)
                 for rule in draft:
@@ -5252,11 +5258,7 @@ async def config_rules_save(request: Request):
                     except ValueError as exc:
                         err = str(exc)
                 # 추가 입력 오류여도 체크 편집분과 재분류는 함께 커밋한다.
-                rules = classifier.RuleSet(*(
-                    tuple(rule["value"] for rule in draft
-                          if rule["rule_type"] == kind and rule["enabled"])
-                    for kind in ("clsfc", "keyword", "negative")
-                ))
+                rules = classifier.rule_set_from_rows(draft)
                 stats = classifier.reclassify_notices(session, rules=rules, match_codes=match_codes)
             except Exception:
                 session.rollback()
@@ -5274,12 +5276,13 @@ async def config_rules_save(request: Request):
     return RedirectResponse(url=f"/config?{urlencode(params)}#rules", status_code=303)
 
 
-def _parse_rule_id(raw: Any) -> int:
-    """규칙 ID는 ASCII 숫자로만 해석한다(잘못된 값은 저장 전에 거부)."""
+def _parse_rule_id(raw: Any) -> tuple[int, str]:
+    """규칙 참조는 ASCII 숫자 id와 12자리 16진 지문만 허용한다."""
     value = str(raw)
-    if not value or not value.isascii() or not value.isdecimal():
-        raise ValueError("규칙 ID는 ASCII 숫자여야 합니다.")
-    return int(value)
+    if re.fullmatch(r"[0-9]+:[0-9a-fA-F]{12}", value) is None:
+        raise ValueError("규칙 ID는 ASCII 숫자:16진 지문 12자리여야 합니다.")
+    rule_id, fingerprint = value.split(":")
+    return int(rule_id), fingerprint.lower()
 
 
 def _rules_error_redirect(err: str) -> RedirectResponse:

@@ -3,7 +3,7 @@
 import html
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import api_client, classifier, collector, main, repository
 from app.db import Base, _register_sqlite_pragmas
-from app.models import AppConfig, BidNotice, CollectionRun
+from app.models import AppConfig, BidNotice, CollectionRun, ListRule
 
 
 @pytest.fixture
@@ -56,8 +56,21 @@ def _state(no):
 
 
 def _post(client, data):
-    data = {"rule_ids": [r["id"] for r in _rules()] or "", **data}
+    references = {r["id"]: _rule_ref(r) for r in _rules()}
+    data = {"rule_ids": list(references.values()) or "", **data}
+    # 기존 CRUD 테스트의 정수 id를 현재 화면에서 제출할 참조로 바꾼다.
+    def reference(value):
+        return references.get(value, f"{value}:000000000000") if isinstance(value, int) else value
+
+    for field in ("rule_ids", "enabled_ids", "delete_id"):
+        if field in data:
+            value = data[field]
+            data[field] = [reference(item) for item in value] if isinstance(value, list) else reference(value)
     return client.post("/config/rules", data=data, follow_redirects=False)
+
+
+def _rule_ref(row):
+    return f'{row["id"]}:{repository.list_rule_fingerprint(row)}'
 
 
 def _rules():
@@ -167,8 +180,11 @@ def test_config_rule_tables_check_state_datalist_and_position(client):
     for title in ["IT 공공조달분류", "SW 키워드", "판별 제외어"]:
         assert title in card
     for rule in rules:
-        assert f'<input type="hidden" name="rule_ids" value="{rule["id"]}">' in card
-        field = f'name="enabled_ids" value="{rule["id"]}"'
+        reference = _rule_ref(rule)
+        assert re.fullmatch(r"[0-9]+:[0-9a-f]{12}", reference)
+        assert f'<input type="hidden" name="rule_ids" value="{reference}">' in card
+        assert f'name="delete_id" value="{reference}"' in card
+        field = f'name="enabled_ids" value="{reference}"'
         assert field + (" checked>" if rule["rule_type"] != "keyword" else ">") in card
     assert 'name="new_clsfc" maxlength="100" list="clsfc-names"' in card
     assert card.index('<option value="빈도 높은 분류">') < card.index('<option value="&lt;분류&amp;&quot;명&gt;">')
@@ -596,8 +612,8 @@ def test_rule_save_serializes_collector_storage_in_file_sqlite(client, monkeypat
 
 
 @pytest.mark.parametrize("data", [
-    {"delete_id": "999999"}, {"enabled_ids": ["999999"]},
-    {"rule_ids": ["999999"]}, {"rule_ids": ["²"]}, {"rule_ids": ["1", "x"]},
+    {"delete_id": "999999:000000000000"}, {"enabled_ids": ["999999:000000000000"]},
+    {"rule_ids": ["999999:000000000000"]}, {"rule_ids": ["²"]}, {"rule_ids": ["1", "x"]},
 ])
 def test_nonexistent_or_invalid_rule_ids_do_not_change_any_table(client, monkeypatch, data):
     _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
@@ -627,7 +643,8 @@ def test_missing_rule_ids_is_rejected_without_changes(client):
 def test_old_form_only_updates_rendered_rules(client, new_enabled):
     _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
     page_a = client.get("/config").text
-    rendered = re.findall(r'<input type="hidden" name="rule_ids" value="(\d+)">', page_a)
+    rendered = re.findall(r'<input type="hidden" name="rule_ids" value="([0-9]+:[0-9a-f]{12})">', page_a)
+    assert len(rendered) == 1
     _post(client, {"action": "add_negative", "new_negative": "전산화단층",
                    "enabled_ids": rendered})
     negative_id = next(r["id"] for r in _rules() if r["rule_type"] == "negative")
@@ -636,10 +653,119 @@ def test_old_form_only_updates_rendered_rules(client, new_enabled):
     response = _post(client, {"action": "save", "rule_ids": rendered})
     assert "rules=1" in response.headers["location"]
     rules = {r["id"]: r for r in _rules()}
-    assert not rules[int(rendered[0])]["enabled"]
+    assert not rules[int(rendered[0].split(":")[0])]["enabled"]
     assert rules[negative_id]["enabled"] is new_enabled
     with main.SessionLocal() as session:
         assert classifier.reclassify_notices(session)["changed"] == 0
+
+
+@pytest.mark.parametrize("operation", ["delete", "save_off", "save_on"])
+def test_reused_max_id_rejects_old_rendered_form_without_changes(client, monkeypatch, operation):
+    _post(client, {"action": "add_negative", "new_negative": "전산화단층"})
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼",
+                   "enabled_ids": [r["id"] for r in _rules()]})
+    page_a = client.get("/config").text
+    rendered = re.findall(r'<input type="hidden" name="rule_ids" value="([0-9]+:[0-9a-f]{12})">', page_a)
+    old = max(_rules(), key=lambda row: row["id"])
+    old_ref = _rule_ref(old)
+    assert old_ref in rendered
+    _post(client, {"delete_id": old["id"], "enabled_ids": [r["id"] for r in _rules()]})
+    _post(client, {"action": "add_keyword", "new_keyword": "개발",
+                   "enabled_ids": [r["id"] for r in _rules()]})
+    new = max(_rules(), key=lambda row: row["id"])
+    assert new["id"] == old["id"]  # SQLite의 최대 id 재사용을 실제 파일 DB에서 확인.
+    assert _rule_ref(new) != old_ref
+    before = _database_state()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("오래된 규칙 참조는 재분류 전에 거부해야 합니다")
+
+    monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
+    data = {"rule_ids": rendered, "action": "save"}
+    if operation == "delete":
+        data["delete_id"] = old_ref
+    elif operation == "save_on":
+        data["enabled_ids"] = rendered
+    response = client.post("/config/rules", data=data, follow_redirects=False)
+    assert response.status_code == 303
+    assert parse_qs(urlsplit(response.headers["location"]).query)["rules_err"] == [
+        "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.",
+    ]
+    assert _database_state() == before
+
+
+@pytest.mark.parametrize("field", ["rule_ids", "enabled_ids", "delete_id"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_stale_reference_in_each_field_rejected_before_changes(client, monkeypatch, field, missing):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    old = _rules()[0]
+    old_ref = _rule_ref(old)
+    with main.SessionLocal() as session:
+        if missing:
+            repository.delete_list_rule(session, old["id"])
+        else:
+            row = session.get(ListRule, old["id"])
+            row.created_at += timedelta(seconds=1)
+            session.commit()
+    before = _database_state()
+    monkeypatch.setattr(classifier, "reclassify_notices", lambda *a, **kw: pytest.fail("재분류 금지"))
+    data = {field: old_ref if field == "delete_id" else [old_ref]}
+    response = _post(client, data)
+    assert parse_qs(urlsplit(response.headers["location"]).query)["rules_err"] == [
+        "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.",
+    ]
+    assert _database_state() == before
+
+
+@pytest.mark.parametrize("field", ["rule_ids", "enabled_ids", "delete_id"])
+@pytest.mark.parametrize("reference", [
+    "1", "1:", "1:abcdef01234", "1:abcdef0123456", "1:abcdef01234g",
+    "１:abcdef012345", "²:abcdef012345", " 1:abcdef012345", "+1:abcdef012345",
+    "1:abcdef012345\n", "1:abcdef012345:0", "1:ａｂｃｄｅｆ012345",
+])
+def test_invalid_fingerprint_format_rejected_without_changes(client, monkeypatch, field, reference):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    before = _database_state()
+    monkeypatch.setattr(classifier, "reclassify_notices", lambda *a, **kw: pytest.fail("재분류 금지"))
+    response = _post(client, {field: reference if field == "delete_id" else [reference]})
+    assert response.status_code == 303
+    assert "rules_err=" in response.headers["location"]
+    assert _database_state() == before
+
+
+def test_fresh_rendered_references_save_and_delete_successfully(client):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    for checked in (False, True):
+        page = client.get("/config").text
+        references = re.findall(r'name="rule_ids" value="([0-9]+:[0-9a-f]{12})"', page)
+        assert len(references) == 1
+        data = {"rule_ids": references, "enabled_ids": references if checked else [], "action": "save"}
+        response = client.post("/config/rules", data=data, follow_redirects=False)
+        assert "rules=1" in response.headers["location"]
+        assert _rules()[0]["enabled"] is checked
+        assert _state("K")[0] is checked
+    page = client.get("/config").text
+    delete_ref = re.search(r'name="delete_id" value="([0-9]+:[0-9a-f]{12})"', page)[1]
+    response = client.post("/config/rules", data={
+        "rule_ids": references, "enabled_ids": references, "delete_id": delete_ref,
+    }, follow_redirects=False)
+    assert "rules=1" in response.headers["location"]
+    assert _rules() == [] and _state("K")[0] is False
+
+
+def test_rule_fingerprint_uses_identity_fields_and_iso_timestamp(client):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    row = _rules()[0]
+    fingerprint = repository.list_rule_fingerprint(row)
+    assert re.fullmatch(r"[0-9a-f]{12}", fingerprint)
+    with main.SessionLocal() as session:
+        model = session.get(ListRule, row["id"])
+        assert row["created_at"] == model.created_at.isoformat()
+        assert repository.list_rule_fingerprint(model) == fingerprint
+    assert repository.list_rule_fingerprint({**row, "enabled": False}) == fingerprint
+    for field, value in (("id", row["id"] + 1), ("rule_type", "negative"),
+                         ("value", "다른 값"), ("created_at", "2026-10-08T00:00:00")):
+        assert repository.list_rule_fingerprint({**row, field: value}) != fingerprint
 
 
 @pytest.mark.parametrize("action", ["add_clsfc", "add_keyword", "add_negative", "delete", "save"])
