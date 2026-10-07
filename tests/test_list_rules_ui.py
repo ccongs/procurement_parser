@@ -173,6 +173,7 @@ def test_config_rule_tables_check_state_datalist_and_position(client):
         session.get(BidNotice, "K").pub_prcrmnt_clsfc_nm = "빈도 높은 분류"
         session.get(BidNotice, "N").pub_prcrmnt_clsfc_nm = "빈도 높은 분류"
         session.commit()
+        rules = repository.list_list_rules(session)
     page = client.get("/config").text
     assert page.index('action="/config"') < page.index('id="rules"') < page.index('id="keywords"')
     card = page.split('id="rules"', 1)[1].split('id="keywords"', 1)[0]
@@ -660,6 +661,44 @@ def test_old_form_only_updates_rendered_rules(client, new_enabled):
 
 
 @pytest.mark.parametrize("operation", ["delete", "save_off", "save_on"])
+def test_other_tab_enabled_change_rejects_old_form_without_changes(client, monkeypatch, operation):
+    _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
+    _post(client, {"action": "add_negative", "new_negative": "전산화단층",
+                   "enabled_ids": [r["id"] for r in _rules()]})
+    page_a = client.get("/config").text
+    rendered = re.findall(r'name="rule_ids" value="([0-9]+:[0-9a-f]{12})"', page_a)
+    assert len(rendered) == 2
+    keyword = next(r for r in _rules() if r["rule_type"] == "keyword")
+    negative = next(r for r in _rules() if r["rule_type"] == "negative")
+    negative_ref = _rule_ref(negative)
+    assert _state("K") == (True, "키워드", "새 플랫폼")
+
+    # 탭 B에서 키워드만 끈다. 체크 편집 시에도 폼의 지문은 렌더 당시 값이다.
+    response_b = client.post("/config/rules", data={
+        "rule_ids": rendered, "enabled_ids": [negative_ref], "action": "save",
+    }, follow_redirects=False)
+    assert "rules=1" in response_b.headers["location"]
+    assert not next(r for r in _rules() if r["id"] == keyword["id"])["enabled"]
+    assert _state("K")[:2] == (False, None)
+    before = _database_state()
+    monkeypatch.setattr(classifier, "reclassify_notices", lambda *a, **kw: pytest.fail("재분류 금지"))
+
+    data = {"rule_ids": rendered, "action": "save"}
+    if operation == "delete":
+        data.update(delete_id=negative_ref, enabled_ids=rendered)
+    elif operation == "save_on":
+        data["enabled_ids"] = rendered
+    response_a = client.post("/config/rules", data=data, follow_redirects=False)
+    assert response_a.status_code == 303
+    location = response_a.headers["location"]
+    assert location.endswith("#rules")
+    assert parse_qs(urlsplit(location).query)["rules_err"] == [
+        "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.",
+    ]
+    assert _database_state() == before
+
+
+@pytest.mark.parametrize("operation", ["delete", "save_off", "save_on"])
 def test_reused_max_id_rejects_old_rendered_form_without_changes(client, monkeypatch, operation):
     _post(client, {"action": "add_negative", "new_negative": "전산화단층"})
     _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼",
@@ -729,7 +768,9 @@ def test_invalid_fingerprint_format_rejected_without_changes(client, monkeypatch
     monkeypatch.setattr(classifier, "reclassify_notices", lambda *a, **kw: pytest.fail("재분류 금지"))
     response = _post(client, {field: reference if field == "delete_id" else [reference]})
     assert response.status_code == 303
-    assert "rules_err=" in response.headers["location"]
+    assert parse_qs(urlsplit(response.headers["location"]).query)["rules_err"] == [
+        "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.",
+    ]
     assert _database_state() == before
 
 
@@ -745,6 +786,7 @@ def test_fresh_rendered_references_save_and_delete_successfully(client):
         assert _rules()[0]["enabled"] is checked
         assert _state("K")[0] is checked
     page = client.get("/config").text
+    references = re.findall(r'name="rule_ids" value="([0-9]+:[0-9a-f]{12})"', page)
     delete_ref = re.search(r'name="delete_id" value="([0-9]+:[0-9a-f]{12})"', page)[1]
     response = client.post("/config/rules", data={
         "rule_ids": references, "enabled_ids": references, "delete_id": delete_ref,
@@ -753,7 +795,7 @@ def test_fresh_rendered_references_save_and_delete_successfully(client):
     assert _rules() == [] and _state("K")[0] is False
 
 
-def test_rule_fingerprint_uses_identity_fields_and_iso_timestamp(client):
+def test_rule_fingerprint_uses_identity_enabled_and_iso_timestamp(client):
     _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
     row = _rules()[0]
     fingerprint = repository.list_rule_fingerprint(row)
@@ -762,9 +804,9 @@ def test_rule_fingerprint_uses_identity_fields_and_iso_timestamp(client):
         model = session.get(ListRule, row["id"])
         assert row["created_at"] == model.created_at.isoformat()
         assert repository.list_rule_fingerprint(model) == fingerprint
-    assert repository.list_rule_fingerprint({**row, "enabled": False}) == fingerprint
     for field, value in (("id", row["id"] + 1), ("rule_type", "negative"),
-                         ("value", "다른 값"), ("created_at", "2026-10-08T00:00:00")):
+                         ("value", "다른 값"), ("enabled", False),
+                         ("created_at", "2026-10-08T00:00:00")):
         assert repository.list_rule_fingerprint({**row, field: value}) != fingerprint
 
 

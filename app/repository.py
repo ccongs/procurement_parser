@@ -926,8 +926,11 @@ def set_default_exclude_keywords(session: Session, keyword_ids: list[int]) -> No
 # --- 목록 표시 규칙 ------------------------------------------------------
 
 def list_rule_fingerprint(row: Mapping[str, Any] | ListRule) -> str:
-    """행의 불변 필드 지문으로 삭제 후 재사용된 SQLite id를 구분한다."""
-    fields = ("id", "rule_type", "value", "created_at")
+    """렌더 당시 행 상태로 재사용된 SQLite id와 다른 탭의 변경을 구분한다.
+
+    위조 방지용이 아니라 id 재사용·다른 탭 변경 구분용(비밀값 없음, SHA-1 앞 12자).
+    """
+    fields = ("id", "rule_type", "value", "enabled", "created_at")
     values = [row[field] if isinstance(row, Mapping) else getattr(row, field) for field in fields]
     if isinstance(values[-1], datetime):
         values[-1] = values[-1].isoformat()

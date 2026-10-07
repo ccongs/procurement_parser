@@ -5280,7 +5280,7 @@ def _parse_rule_id(raw: Any) -> tuple[int, str]:
     """규칙 참조는 ASCII 숫자 id와 12자리 16진 지문만 허용한다."""
     value = str(raw)
     if re.fullmatch(r"[0-9]+:[0-9a-fA-F]{12}", value) is None:
-        raise ValueError("규칙 ID는 ASCII 숫자:16진 지문 12자리여야 합니다.")
+        raise ValueError("규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요.")
     rule_id, fingerprint = value.split(":")
     return int(rule_id), fingerprint.lower()
 
