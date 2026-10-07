@@ -181,6 +181,15 @@ class ListRule(Base):
     )
 
 
+class SchemaMigration(Base):
+    """데이터 보정 완료 기록 — 중단 후 재시도·완료 후 재실행 방지용."""
+
+    __tablename__ = "schema_migration"
+
+    name = Column(String(100), primary_key=True)
+    applied_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
 class CollectionRun(Base):
     """스케줄 실행 이력. 실패 점검은 status in (failed, partial)로 조회."""
 

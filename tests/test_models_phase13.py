@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app import db
-from app.models import BidLicenseLimit, BidNotice, BidNoticeRaw, ListRule
+from app.models import BidLicenseLimit, BidNotice, BidNoticeRaw, ListRule, SchemaMigration
 
 
 NEW_COLUMNS = {
@@ -22,6 +22,7 @@ INDEXES = {
     "ix_bid_notice_indstryty_lmt_yn": ["indstryty_lmt_yn"],
 }
 NOW = datetime(2026, 10, 7, 12)
+BACKFILL_NAME = "phase13_match_basis_backfill"
 
 
 @pytest.fixture
@@ -36,7 +37,7 @@ def database(tmp_path, monkeypatch):
 
 def _assert_notice_schema(engine):
     inspector = inspect(engine)
-    assert {"bid_notice_raw", "bid_license_limit", "list_rule"} <= set(inspector.get_table_names())
+    assert {"bid_notice_raw", "bid_license_limit", "list_rule", "schema_migration"} <= set(inspector.get_table_names())
     columns = {c["name"]: c for c in inspector.get_columns("bid_notice")}
     assert NEW_COLUMNS <= columns.keys()
     assert columns["list_visible"]["nullable"] is False
@@ -50,6 +51,11 @@ def test_new_schema_tables_columns_indexes_and_rule_unique(database):
     db.init_db()
     _assert_notice_schema(engine)
     inspector = inspect(engine)
+    assert inspector.get_pk_constraint("schema_migration")["constrained_columns"] == ["name"]
+    migration_columns = {c["name"]: c for c in inspector.get_columns("schema_migration")}
+    assert migration_columns["name"]["type"].length == 100
+    assert isinstance(migration_columns["applied_at"]["type"], type(SchemaMigration.applied_at.type))
+    assert migration_columns["applied_at"]["nullable"] is False
     assert inspector.get_pk_constraint("bid_notice_raw")["constrained_columns"] == ["bid_ntce_no"]
     assert inspector.get_foreign_keys("bid_notice_raw") == []
     assert inspector.get_pk_constraint("bid_license_limit")["constrained_columns"] == [
@@ -66,6 +72,9 @@ def test_new_schema_tables_columns_indexes_and_rule_unique(database):
         cols = {c["name"]: c for c in inspector.get_columns(table)}
         assert all(cols[field]["nullable"] is False for field in fields)
     with local() as session:
+        marker = session.execute(select(SchemaMigration)).scalar_one()
+        assert marker.name == BACKFILL_NAME and marker.applied_at is not None
+        assert session.execute(select(BidNotice)).scalars().all() == []
         assert session.execute(select(ListRule)).scalars().all() == []
         assert session.execute(select(BidLicenseLimit)).scalars().all() == []
         session.add_all([
@@ -98,6 +107,7 @@ def _snapshot(engine):
         return (
             conn.execute(select(BidNotice.__table__).order_by(BidNotice.bid_ntce_no)).all(),
             conn.execute(select(BidNoticeRaw.__table__).order_by(BidNoticeRaw.bid_ntce_no)).all(),
+            conn.execute(select(SchemaMigration.__table__).order_by(SchemaMigration.name)).all(),
         )
 
 
@@ -139,6 +149,7 @@ def test_old_schema_migration_twice_and_batch_boundaries(database, count):
         assert 500 in transaction_sizes and 501 in transaction_sizes
     _assert_notice_schema(engine)
     with local() as session:
+        assert session.get(SchemaMigration, BACKFILL_NAME).applied_at is not None
         for i, original in enumerate(originals):
             row = session.get(BidNotice, f"OLD-{i:04}")
             raw = session.get(BidNoticeRaw, row.bid_ntce_no)
@@ -206,9 +217,11 @@ def test_classification_migrates_without_any_legacy_raw(database):
     assert _snapshot(engine) == first
 
 
-def test_existing_classification_columns_preserve_null_basis_after_two_inits(database):
+def test_completed_backfill_preserves_null_basis_after_two_inits(database):
     engine, local = database
     db.init_db()
+    with local() as session:
+        assert session.get(SchemaMigration, BACKFILL_NAME).applied_at is not None
     with local() as session:
         session.add_all([
             BidNotice(
@@ -223,13 +236,15 @@ def test_existing_classification_columns_preserve_null_basis_after_two_inits(dat
     db.init_db()
     assert _snapshot(engine) == before
     with local() as session:
-        row = session.get(BidNotice, "EXISTING-False")
-        assert row.list_visible is False and row.match_basis is None
+        for visible in (False, True):
+            row = session.get(BidNotice, f"EXISTING-{visible}")
+            assert row.list_visible is visible and row.match_basis is None
 
 
-def test_new_match_basis_column_only_backfills_visible_notices(database):
+@pytest.mark.parametrize("retained_columns", [{"list_visible"}, NEW_COLUMNS])
+def test_missing_backfill_marker_only_backfills_visible_notices(database, retained_columns):
     engine, local = database
-    table = _old_notice_table(engine, retained_columns={"list_visible"})
+    table = _old_notice_table(engine, retained_columns=retained_columns)
     with engine.begin() as conn:
         conn.execute(table.insert(), [
             {"bid_ntce_no": f"LEGACY-{visible}", "list_visible": visible,
@@ -238,6 +253,7 @@ def test_new_match_basis_column_only_backfills_visible_notices(database):
         ])
     db.init_db()
     with local() as session:
+        assert session.get(SchemaMigration, BACKFILL_NAME).applied_at is not None
         hidden = session.get(BidNotice, "LEGACY-False")
         visible = session.get(BidNotice, "LEGACY-True")
         assert hidden.list_visible is False and hidden.match_basis is None
@@ -245,6 +261,50 @@ def test_new_match_basis_column_only_backfills_visible_notices(database):
     before = _snapshot(engine)
     db.init_db()
     assert _snapshot(engine) == before
+
+
+@pytest.mark.parametrize("failure_point", ["alter", "update", "marker_insert"])
+def test_backfill_failure_rolls_back_dml_and_retries(database, failure_point):
+    engine, local = database
+    table = _old_notice_table(engine)
+    with engine.begin() as conn:
+        conn.execute(table.insert(), {
+            "bid_ntce_no": "RETRY-13", "collected_at": NOW, "updated_at": NOW,
+        })
+
+    def fail_after_statement(conn, cursor, statement, parameters, context, executemany):
+        target = {
+            "alter": "ALTER TABLE bid_notice ADD COLUMN match_basis ",
+            "update": "UPDATE bid_notice SET match_basis=",
+            "marker_insert": "INSERT INTO schema_migration ",
+        }[failure_point]
+        if statement.startswith(target):
+            raise RuntimeError("분류값 보정 실패 주입")
+
+    event.listen(engine, "after_cursor_execute", fail_after_statement)
+    try:
+        with pytest.raises(RuntimeError, match="분류값 보정 실패 주입"):
+            db.init_db()
+    finally:
+        event.remove(engine, "after_cursor_execute", fail_after_statement)
+
+    # SQLite ALTER 는 남지만 보정 UPDATE·완료 INSERT 는 예외 시 함께 롤백된다.
+    assert "match_basis" in {c["name"] for c in inspect(engine).get_columns("bid_notice")}
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT list_visible, match_basis FROM bid_notice WHERE bid_ntce_no='RETRY-13'"
+        )).one() == (True, None)
+        assert conn.execute(select(SchemaMigration)).all() == []
+
+    db.init_db()
+    with local() as session:
+        row = session.get(BidNotice, "RETRY-13")
+        assert row.list_visible is True and row.match_basis == "업종"
+        marker = session.execute(select(SchemaMigration)).scalar_one()
+        assert marker.name == BACKFILL_NAME and marker.applied_at is not None
+    first = _snapshot(engine)
+    db.init_db()
+    assert _snapshot(engine) == first
 
 
 def test_list_rule_sql_insert_uses_enabled_server_default(database):

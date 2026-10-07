@@ -101,6 +101,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _migrate_add_columns()
+    _migrate_match_basis_backfill()
     _migrate_bid_notice_indexes()
     _migrate_bid_notice_raw()
     _seed_app_config()
@@ -110,9 +111,9 @@ def _migrate_add_columns() -> None:
     """기존(구 스키마) DB 에 신규 컬럼이 없으면 ALTER TABLE ADD COLUMN.
 
     멱등·inspector 가드: 신규 DB 는 create_all 이 이미 컬럼을 만들었으므로 inspector 가
-    present 로 보고 ALTER 를 스킵(no-op)한다. 기존 DB 만 ADD COLUMN 하며 **기존 행은 무손상**
-    (`collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다). init_db() 를 여러 번 호출해도
-    안전하다.
+    present 로 보고 ALTER 를 스킵(no-op)한다. 기존 DB 만 ADD COLUMN 하며
+    `collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다. 기존 표시 공고의 NULL 분류값은
+    별도 보정 함수에서 완료 기록을 기준으로 1회 보정한다. init_db() 반복 호출은 안전하다.
 
     list_visible 기본값 TRUE 는 SQLite·PostgreSQL 공통 표기다.
     기존 pre_spec_enabled 의 DEFAULT 1 은 PostgreSQL 이전 시 true 로 조정해야 한다.
@@ -124,7 +125,6 @@ def _migrate_add_columns() -> None:
         return {c["name"] for c in insp.get_columns(t)}
 
     stmts: list[str] = []
-    match_basis_added = False
     if "bid_notice" in tables:
         bn = colset("bid_notice")
         additions = {
@@ -137,8 +137,6 @@ def _migrate_add_columns() -> None:
         for name, definition in additions.items():
             if name not in bn:
                 stmts.append(f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}")
-                if name == "match_basis":
-                    match_basis_added = True
     if "collection_run" in tables and "source" not in colset("collection_run"):
         stmts.append(
             "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
@@ -168,12 +166,23 @@ def _migrate_add_columns() -> None:
         with engine.begin() as conn:
             for s in stmts:
                 conn.execute(text(s))
-            if match_basis_added:
-                # 컬럼을 새로 추가한 이번 실행에서만 기존 표시 공고의 분류값을 보정한다.
-                conn.execute(text(
-                    "UPDATE bid_notice SET match_basis='업종', list_visible=true "
-                    "WHERE match_basis IS NULL AND list_visible = true"
-                ))
+
+
+def _migrate_match_basis_backfill() -> None:
+    """완료 기록이 없으면 기존 표시 공고의 NULL 분류값만 1회 보정·완료 기록."""
+    from app.models import SchemaMigration
+
+    migration = SchemaMigration.__table__
+    name = "phase13_match_basis_backfill"
+    # ALTER 와 분리된 DML 트랜잭션: 보정·완료 기록이 함께 커밋되거나 함께 롤백된다.
+    with engine.begin() as conn:
+        if conn.execute(select(migration.c.name).where(migration.c.name == name)).first():
+            return
+        conn.execute(text(
+            "UPDATE bid_notice SET match_basis='업종' "
+            "WHERE list_visible = true AND match_basis IS NULL"
+        ))
+        conn.execute(migration.insert().values(name=name))
 
 
 def _migrate_bid_notice_indexes() -> None:
