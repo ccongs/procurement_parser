@@ -443,8 +443,11 @@ def test_target_batches_bound_parameters_and_only_process_existing_notices(datab
         assert all(result == Classification(True, "업종", None, "1468") for _, result in results)
         assert all(len(parameters) <= batch_size for _, parameters in queries)
         batch_count = (len(targets) + batch_size - 1) // batch_size
+        existing_batch_count = len({
+            index // batch_size for index, no in enumerate(targets) if no in existing
+        })
         assert sum("FROM bid_notice \n" in query for query, _ in queries) == batch_count
-        assert sum("FROM bid_license_limit" in query for query, _ in queries) == batch_count
+        assert sum("FROM bid_license_limit" in query for query, _ in queries) == existing_batch_count
         assert all(query.startswith("SELECT") for query, _ in queries)
         assert not session.dirty and _snapshot(session) == before
 
@@ -477,6 +480,40 @@ def test_preview_does_not_autoflush_pending_changes(database):
         assert list(iter_classifications(session, rules=DEFAULT_RULES, match_codes=())) == []
         with engine.connect() as conn:
             assert conn.execute(select(BidNotice)).all() == []
+
+
+@pytest.mark.parametrize("argument", ["bid_ntce_nos", "match_codes"])
+def test_preview_does_not_autoflush_while_consuming_lazy_arguments(database, argument):
+    engine, _ = database
+    with sessionmaker(bind=engine, autoflush=True)() as session:
+        session.add(_notice("EXISTING", matched_indstryty_cds="1468"))
+        session.commit()
+        pending = _notice("PENDING")
+        session.add(pending)
+        queries = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            queries.append(statement)
+
+        def delayed_values():
+            column = (BidNotice.bid_ntce_no if argument == "bid_ntce_nos"
+                      else BidNotice.matched_indstryty_cds)
+            yield from session.scalars(select(column).where(BidNotice.bid_ntce_no == "EXISTING"))
+
+        arguments = {"match_codes": ("1468",), argument: delayed_values()}
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            preview = iter_classifications(session, rules=DEFAULT_RULES, **arguments)
+            assert queries == []
+            results = list(preview)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+
+        assert not any(query.startswith("INSERT") for query in queries)
+        assert all(query.startswith("SELECT") for query in queries)
+        assert pending in session.new
+        assert [row.bid_ntce_no for row, _ in results] == ["EXISTING"]
+        assert results[0][1] == Classification(True, "업종", None, "1468")
 
 
 @pytest.mark.parametrize("batch_size", [0, -1])

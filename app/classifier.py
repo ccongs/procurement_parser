@@ -157,17 +157,17 @@ def iter_classifications(
     """
     if batch_size <= 0:
         raise ValueError("batch_size 는 양수여야 합니다.")
-    targets = (
-        tuple(sorted({no.strip() for no in bid_ntce_nos if no.strip()}))
-        if bid_ntce_nos is not None else None
-    )
-    if targets == ():
-        return
-    codes = set(match_codes)
-    last_no = None
-    target_offset = 0
     # 호출자의 autoflush 설정과 무관하게 미리보기 중 DB 쓰기를 막는다.
     with session.no_autoflush:
+        targets = (
+            tuple(sorted({no.strip() for no in bid_ntce_nos if no.strip()}))
+            if bid_ntce_nos is not None else None
+        )
+        if targets == ():
+            return
+        codes = set(match_codes)
+        last_no = None
+        target_offset = 0
         while True:
             query = select(BidNotice).order_by(BidNotice.bid_ntce_no)
             if targets is not None:
@@ -181,8 +181,10 @@ def iter_classifications(
                 if last_no is not None:
                     query = query.where(BidNotice.bid_ntce_no > last_no)
             notices = session.scalars(query).all()
-            if not notices and targets is None:
-                break
+            if not notices:
+                if targets is None:
+                    break
+                continue
             licenses: dict[str, list[BidLicenseLimit]] = defaultdict(list)
             for row in session.scalars(select(BidLicenseLimit).where(
                 BidLicenseLimit.bid_ntce_no.in_([notice.bid_ntce_no for notice in notices])
