@@ -2047,21 +2047,20 @@ def test_list_notice_cell_link_and_escape(client, url):
 
 
 @pytest.mark.parametrize(
-    ("kind", "raw_json", "current", "expected"),
+    ("kind", "related", "current", "expected"),
     [
-        ("재공고", '{"befBidBbancNo":" R26-OLD "}', "R26-NEW", "R26-OLD"),
-        ("변경공고", '{"befBidBbancNo":"R26-OLD"}', "R26-NEW", "R26-OLD"),
-        ("등록공고", '{"befBidBbancNo":"R26-OLD"}', "R26-NEW", None),
-        ("재공고", '{"befBidBbancNo":"  "}', "R26-NEW", None),
-        ("재공고", '{bad json', "R26-NEW", None),
+        ("재공고", " R26-OLD ", "R26-NEW", "R26-OLD"),
+        ("변경공고", "R26-OLD", "R26-NEW", "R26-OLD"),
+        ("등록공고", "R26-OLD", "R26-NEW", None),
+        ("재공고", "  ", "R26-NEW", None),
         ("재공고", None, "R26-NEW", None),
-        ("재공고", "{}", "R26-NEW", None),
-        ("재공고", "[]", "R26-NEW", None),
-        ("재공고", '{"befBidBbancNo":"R26-NEW"}', "R26-NEW", None),
+        ("재공고", "", "R26-NEW", None),
+        ("재공고", "R26-NEW", "R26-NEW", None),
+        ("변경공고", " R26-NEW ", " R26-NEW ", None),
     ],
 )
-def test_related_notice_number_helper(kind, raw_json, current, expected):
-    assert main._related_ntce_no(kind, raw_json, current) == expected
+def test_related_notice_number_helper(kind, related, current, expected):
+    assert main._related_ntce_no(kind, related, current) == expected
 
 
 def test_related_notice_number_is_escaped_in_notice_cell():
@@ -2070,7 +2069,7 @@ def test_related_notice_number_is_escaped_in_notice_cell():
         "관련번호 이스케이프",
         None,
         kind="재공고",
-        raw_json=json.dumps({"befBidBbancNo": '<old&"no>'}),
+        bef_bid_bbanc_no='<old&"no>',
     )
     assert (
         '<span class="ntcenum">R26-NEW</span><span class="relntce" title="관련공고(이전 공고번호)"> '
@@ -2117,7 +2116,7 @@ def test_render_changed_notice_order_before_related_notice():
         "변경공고 관련번호",
         None,
         kind="변경공고",
-        raw_json='{"befBidBbancNo":" R26BK01742000 "}',
+        bef_bid_bbanc_no=" R26BK01742000 ",
         bid_ntce_ord="001",
     )
     assert (
@@ -2130,7 +2129,7 @@ def test_render_changed_notice_order_before_related_notice():
 def test_list_renders_related_notice_number_for_reannouncement(client):
     notice = _bn("R26BK01743383", "관련공고 라우트 검증", datetime(2026, 5, 8), None)
     notice.ntce_kind_nm = "재공고"
-    notice.raw_json = '{"befBidBbancNo":" R26BK01725789 "}'
+    notice.bef_bid_bbanc_no = " R26BK01725789 "
     with main.SessionLocal() as session:
         session.add(notice)
         session.commit()
@@ -2152,7 +2151,7 @@ def test_list_renders_change_notice_order_but_keeps_checkbox_id(client):
     )
     notice.ntce_kind_nm = "변경공고"
     notice.bid_ntce_ord = "002"
-    notice.raw_json = '{"befBidBbancNo":"R26BK01742000"}'
+    notice.bef_bid_bbanc_no = "R26BK01742000"
     with main.SessionLocal() as session:
         session.add(notice)
         session.commit()

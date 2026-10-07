@@ -1225,18 +1225,11 @@ def _render_matched_inds(csv: Any) -> str:
     return f'<td class="matchind">[{",<wbr>".join(spans)}]</td>'
 
 
-def _related_ntce_no(kind: Any, raw_json: Any, bid_ntce_no: Any) -> str | None:
-    """재공고·변경공고 원문에서 공백·중복이 아닌 이전 공고번호를 읽는다."""
-    if kind not in {"재공고", "변경공고"} or not raw_json:
+def _related_ntce_no(kind: Any, bef_bid_bbanc_no: Any, bid_ntce_no: Any) -> str | None:
+    """재공고·변경공고 컬럼에서 공백·중복이 아닌 이전 공고번호를 읽는다."""
+    if kind not in {"재공고", "변경공고"}:
         return None
-    try:
-        item = json.loads(str(raw_json))
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(item, dict):
-        return None
-    related = item.get("befBidBbancNo")
-    related_no = "" if related is None else str(related).strip()
+    related_no = "" if bef_bid_bbanc_no is None else str(bef_bid_bbanc_no).strip()
     current_no = "" if bid_ntce_no is None else str(bid_ntce_no).strip()
     if not related_no or related_no == current_no:
         return None
@@ -1259,13 +1252,13 @@ def _render_ntce(
     url: Any,
     *,
     kind: Any = None,
-    raw_json: Any = None,
+    bef_bid_bbanc_no: Any = None,
     bid_ntce_ord: Any = None,
 ) -> str:
     """공고번호/공고명 통합 셀. 관련공고번호와 상세 링크를 조건에 따라 표시한다."""
     number = _display_ntce_no(kind, no, bid_ntce_ord)
     name = "" if name is None else str(name).strip()
-    related = _related_ntce_no(kind, raw_json, no)
+    related = _related_ntce_no(kind, bef_bid_bbanc_no, no)
     number_line = f'<span class="ntcenum">{_e(number or "-")}</span>'
     if related:
         number_line += (
@@ -1535,7 +1528,7 @@ def _render_list_rows(
                     r.get("bid_ntce_nm"),
                     r.get("bid_ntce_dtl_url"),
                     kind=r.get("ntce_kind_nm"),
-                    raw_json=r.get("raw_json"),
+                    bef_bid_bbanc_no=r.get("bef_bid_bbanc_no"),
                     bid_ntce_ord=r.get("bid_ntce_ord"),
                 ))
             elif kind == "sucsf":
@@ -3558,7 +3551,7 @@ def list_page(
             + [field for fields in _LIST_TIME_FIELDS.values() for field, _label in fields]
             + [
                 "bid_ntce_nm", "bid_ntce_ord", "dminstt_nm",
-                "bid_ntce_dtl_url", "bid_methd_nm", "raw_json",
+                "bid_ntce_dtl_url", "bid_methd_nm", "bef_bid_bbanc_no",
             ]
             + _SPEC_URL_COLUMNS
         )

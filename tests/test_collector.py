@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app import api_client, collector, repository
@@ -22,7 +22,7 @@ from app.collector import (
 )
 from app.collector import _ConfigSnapshot, _fetch_cd
 from app.db import Base
-from app.models import BidNotice
+from app.models import BidNotice, BidNoticeRaw
 
 
 # --- 1. classify_result_code -------------------------------------------
@@ -230,6 +230,55 @@ def test_upsert_empty_list(session):
     new, updated, ord_changes = repository.upsert_bid_notices(session, [])
     assert (new, updated, ord_changes) == (0, 0, [])
     assert _count(session) == 0
+
+
+def test_upsert_raw_insert_update_and_duplicate_pk(session):
+    t1 = datetime(2026, 6, 1, 10)
+    t2 = datetime(2026, 6, 1, 11)
+    base = {"bid_ntce_no": "RAW-13", "collected_at": t1, "updated_at": t1}
+    assert repository.upsert_bid_notices(session, [{**base, "raw_json": "first"}])[:2] == (1, 0)
+    session.commit()
+    assert session.get(BidNotice, "RAW-13").raw_json is None
+    assert session.get(BidNoticeRaw, "RAW-13").raw_json == "first"
+    assert session.get(BidNoticeRaw, "RAW-13").updated_at == t1
+
+    # 각 테이블을 IN 한 번으로 조회하고, 같은 배치 중복은 마지막 원문으로 갱신.
+    selects = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    event.listen(session.bind, "before_cursor_execute", capture)
+    try:
+        result = repository.upsert_bid_notices(session, [
+            {**base, "updated_at": t2, "raw_json": "second"},
+            {**base, "updated_at": t2, "raw_json": "last"},
+            {**base, "bid_ntce_no": "RAW-NEW", "raw_json": "new-first"},
+            {**base, "bid_ntce_no": "RAW-NEW", "raw_json": "new-last"},
+        ])
+    finally:
+        event.remove(session.bind, "before_cursor_execute", capture)
+    assert result[:2] == (1, 3)
+    assert len(selects) == 2 and all(" IN " in sql for sql in selects)
+    session.commit()
+    row = session.get(BidNotice, "RAW-13")
+    raw = session.get(BidNoticeRaw, "RAW-13")
+    assert row.raw_json is None and row.collected_at == t1
+    assert raw.raw_json == "last" and raw.updated_at == t2
+    assert session.get(BidNotice, "RAW-NEW").raw_json is None
+    assert session.get(BidNoticeRaw, "RAW-NEW").raw_json == "new-last"
+
+
+def test_upsert_notice_and_raw_rollback_together(session):
+    now = datetime(2026, 6, 1)
+    repository.upsert_bid_notices(session, [{
+        "bid_ntce_no": "ROLLBACK-13", "raw_json": "original",
+        "collected_at": now, "updated_at": now,
+    }])
+    session.rollback()
+    assert session.get(BidNotice, "ROLLBACK-13") is None
+    assert session.get(BidNoticeRaw, "ROLLBACK-13") is None
 
 
 def test_upsert_mixed_new_and_existing(session):

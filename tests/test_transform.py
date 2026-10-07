@@ -113,6 +113,15 @@ def test_email_irregular_mapping():
     assert values["ntce_instt_ofcl_email"] == "officer@example.go.kr"
 
 
+@pytest.mark.parametrize("value, expected", [("  분류/번호  ", "분류/번호"), ("   ", None), (None, None)])
+def test_classification_and_previous_notice_mapping(value, expected):
+    values = item_to_bid_notice_values(_base_item(
+        pubPrcrmntClsfcNm=value, befBidBbancNo=value,
+    ))
+    assert values["pub_prcrmnt_clsfc_nm"] == expected
+    assert values["bef_bid_bbanc_no"] == expected
+
+
 # --- 8. raw_json 보존·복원 ----------------------------------------------
 def test_raw_json_preserves_and_roundtrips():
     item = _base_item(
@@ -157,6 +166,9 @@ def test_meta_columns_excluded():
     assert "matched_indstryty_cds" not in values
     assert "collected_at" not in values
     assert "updated_at" not in values
+    assert "list_visible" not in values
+    assert "match_basis" not in values
+    assert "match_detail" not in values
 
 
 # --- 11. bid_ntce_no 누락 → ValueError ----------------------------------

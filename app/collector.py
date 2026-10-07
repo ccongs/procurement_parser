@@ -392,6 +392,10 @@ def collect_window(
             values["matched_indstryty_cds"] = matched_map.get(no)
             values["collected_at"] = meta_ts
             values["updated_at"] = meta_ts
+            # Phase 13.1: 업종 검색으로 수집한 공고는 모두 표시(13.3 에서 분류로 교체).
+            values["list_visible"] = True
+            values["match_basis"] = "업종"
+            values["match_detail"] = None
             values_list.append(values)
 
         new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)

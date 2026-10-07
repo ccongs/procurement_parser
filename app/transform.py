@@ -29,7 +29,10 @@ from app.models import BidNotice, PreSpec
 
 # 호출자(3.3 collector/repository)가 채우는 수집 메타데이터 — 여기서는 채우지 않는다.
 META_COLUMNS: frozenset[str] = frozenset(
-    {"matched_indstryty_cds", "collected_at", "updated_at"}
+    {
+        "matched_indstryty_cds", "collected_at", "updated_at",
+        "list_visible", "match_basis", "match_detail",
+    }
 )
 
 # 사전규격(pre_spec) 수집 메타데이터 — 호출자(5.3 collector)가 부여(여기서 스킵).
@@ -98,6 +101,8 @@ COLUMN_TO_API: dict[str, str] = {
     "pub_prcrmnt_lrgclsfc_nm": "pubPrcrmntLrgclsfcNm",
     "pub_prcrmnt_midclsfc_nm": "pubPrcrmntMidclsfcNm",
     "pub_prcrmnt_clsfc_no": "pubPrcrmntClsfcNo",
+    "pub_prcrmnt_clsfc_nm": "pubPrcrmntClsfcNm",
+    "bef_bid_bbanc_no": "befBidBbancNo",
     "bid_ntce_url": "bidNtceUrl",
     "bid_ntce_dtl_url": "bidNtceDtlUrl",
     "std_ntce_doc_url": "stdNtceDocUrl",
