@@ -31,6 +31,8 @@ def database(tmp_path, monkeypatch):
     local = sessionmaker(bind=engine, autoflush=False, future=True)
     monkeypatch.setattr(db, "engine", engine)
     monkeypatch.setattr(db, "SessionLocal", local)
+    # Phase 13.1 스키마 검증은 이후 추가된 기본 규칙 시드와 격리한다.
+    monkeypatch.setattr(db, "_seed_list_rules", lambda: None)
     yield engine, local
     engine.dispose()
 

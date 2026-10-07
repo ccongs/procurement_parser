@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event, inspect, select, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # .env 로드 (프로젝트 루트의 .env)
@@ -89,11 +92,12 @@ _register_sqlite_pragmas(engine)
 
 
 def init_db() -> None:
-    """모델 테이블 생성 + 자동 마이그레이션 + app_config 기본행 시드.
+    """모델 테이블 생성 + 자동 마이그레이션 + 설정·표시 규칙 기본값 시드.
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
       create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
-    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관 → 기존 시드.
+    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관
+      → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회).
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
@@ -105,6 +109,7 @@ def init_db() -> None:
     _migrate_bid_notice_indexes()
     _migrate_bid_notice_raw()
     _seed_app_config()
+    _seed_list_rules()
 
 
 def _migrate_add_columns() -> None:
@@ -168,21 +173,39 @@ def _migrate_add_columns() -> None:
                 conn.execute(text(s))
 
 
-def _migrate_match_basis_backfill() -> None:
-    """완료 기록이 없으면 기존 표시 공고의 NULL 분류값만 1회 보정·완료 기록."""
+def _run_once(name: str, work: Callable[[Connection], None]) -> None:
+    """작업·완료 기록을 함께 커밋하고, DB 오류 시 완료 여부 확인 후 1회 재시도."""
     from app.models import SchemaMigration
 
     migration = SchemaMigration.__table__
-    name = "phase13_match_basis_backfill"
-    # ALTER 와 분리된 DML 트랜잭션: 보정·완료 기록이 함께 커밋되거나 함께 롤백된다.
-    with engine.begin() as conn:
-        if conn.execute(select(migration.c.name).where(migration.c.name == name)).first():
+    completed = select(migration.c.name).where(migration.c.name == name)
+    for attempt in range(2):
+        try:
+            with engine.begin() as conn:
+                if conn.execute(completed).first():
+                    return
+                work(conn)
+                conn.execute(migration.insert().values(name=name))
             return
+        except (IntegrityError, OperationalError):
+            # 실패한 트랜잭션은 이미 롤백됨. 새 트랜잭션에서 경쟁자의 완료를 확인한다.
+            with engine.begin() as conn:
+                if conn.execute(completed).first():
+                    return
+            if attempt == 1:
+                raise
+
+
+def _migrate_match_basis_backfill() -> None:
+    """완료 기록이 없으면 기존 표시 공고의 NULL 분류값만 1회 보정·완료 기록."""
+    # ALTER 와 분리된 DML 트랜잭션: 보정·완료 기록이 함께 커밋되거나 함께 롤백된다.
+    def work(conn: Connection) -> None:
         conn.execute(text(
             "UPDATE bid_notice SET match_basis='업종' "
             "WHERE list_visible = true AND match_basis IS NULL"
         ))
-        conn.execute(migration.insert().values(name=name))
+
+    _run_once("phase13_match_basis_backfill", work)
 
 
 def _migrate_bid_notice_indexes() -> None:
@@ -284,6 +307,22 @@ def _seed_app_config() -> None:
             )
         )
         session.commit()
+
+
+def _seed_list_rules() -> None:
+    """완료 기록이 없을 때 누락된 기본 표시 규칙만 추가한다(재분류 없음)."""
+    from app.classifier import DEFAULT_LIST_RULES
+    from app.models import ListRule
+
+    rule = ListRule.__table__
+    # 규칙 INSERT·완료 기록은 함께 커밋되거나 함께 롤백된다.
+    def work(conn: Connection) -> None:
+        existing = set(conn.execute(select(rule.c.rule_type, rule.c.value)).all())
+        for rule_type, value in DEFAULT_LIST_RULES:
+            if (rule_type, value) not in existing:
+                conn.execute(rule.insert().values(rule_type=rule_type, value=value, enabled=True))
+
+    _run_once("phase13_list_rule_seed", work)
 
 
 def _print_summary() -> None:
