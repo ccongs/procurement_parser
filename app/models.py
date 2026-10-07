@@ -208,7 +208,7 @@ class CollectionRun(Base):
     retry_count = Column(Integer)           # 누적 재시도 횟수
     error_code = Column(String(2))          # 마지막 에러 resultCode
     error_msg = Column(Text)                # 실패 메시지
-    detail_json = Column(Text)              # 업종코드별 결과(페이지수·resultCode·건수)
+    detail_json = Column(Text)              # 호출 종류별 결과(페이지수·resultCode·건수)
     source = Column(String(10), nullable=True, default="bid")  # 수집원: bid|pre_spec (Phase 5.4)
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용

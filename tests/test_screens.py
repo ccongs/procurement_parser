@@ -355,6 +355,16 @@ def test_api_test_page_ok(client):
     assert "엔드포인트" in resp.text
 
 
+def test_api_test_license_inquiry_labels(client):
+    resp = client.get("/api-test?operation=getBidPblancListInfoLicenseLimit")
+    assert resp.status_code == 200
+    options = re.search(r'<select name="inqryDiv">(.*?)</select>', resp.text, re.S).group(1)
+    assert re.findall(r'<option value="(.*?)"[^>]*>(.*?)</option>', options) == [
+        ("1", "등록일시"), ("2", "입찰공고번호"),
+    ]
+    assert '조회구분 <code>inqryDiv</code>' in resp.text
+
+
 def test_config_save_valid(client):
     resp = client.post(
         "/config",

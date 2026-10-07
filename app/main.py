@@ -223,6 +223,8 @@ def _render_datetime_block(operation: str | None, values: dict[str, str]) -> str
     if spec is not None and spec.kind == "prespec":
         inqry_label = "조회구분"
         inqry_options = (("1", "접수일시"), ("2", "사전규격등록번호"), ("3", "참조번호"))
+    elif spec is not None and spec.kind == "license":
+        inqry_label, inqry_options = "조회구분", (("1", "등록일시"), ("2", "입찰공고번호"))
     else:
         inqry_label = "공고/개찰일자"
         inqry_options = (("1", "게시일자"), ("2", "개찰일시"))

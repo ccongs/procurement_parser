@@ -146,8 +146,8 @@ def upsert_bid_notices(
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """bid_ntce_no(PK) 기준 upsert. (new_count, updated_count, ord_changes) 반환.
 
-    - 각 원소는 transform 결과 + 메타(matched_indstryty_cds/collected_at/updated_at)가 합쳐진
-      컬럼값 dict.
+    - 각 원소는 transform 결과 + 수집 시각(collected_at/updated_at)이 합쳐진 컬럼값 dict.
+      matched_indstryty_cds 등 분류값은 분류 엔진이 갱신한다.
     - 공고·원문 각각 기존 PK 를 `IN` 한 번으로 조회해 N+1 을 피한다.
       raw_json 은 같은 세션의 bid_notice_raw 에만 저장한다.
     - 신규 행은 list_visible 이 없으면 False 로 시작하며, 기존 분류값은 없는 키로 덮지 않는다.

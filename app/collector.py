@@ -30,6 +30,7 @@ _OK_CODES: frozenset[str] = frozenset({"00", "03"})
 _RETRY_CODES: frozenset[str] = frozenset({"01", "02", "04", "05"})
 _RETRY_BACKOFF_SECONDS = 2.0
 _MAX_PAGES_SAFETY = 1000
+_LICENSE_BULK_PAGE_SIZE = 1000
 _MAX_LICENSE_FIX_TARGETS = 200
 
 
@@ -189,7 +190,10 @@ def _call_with_retry(
 
 def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSnapshot) -> dict[str, Any]:
     """operation 을 끝까지 페이징한다. 조회 결과만 모으고 DB 는 쓰지 않는다."""
-    base_params = {**base_params, "numOfRows": str(config.num_of_rows)}
+    page_size = (_LICENSE_BULK_PAGE_SIZE
+                 if operation == LICENSE_OPERATION and base_params.get("inqryDiv") == "1"
+                 else config.num_of_rows)
+    base_params = {**base_params, "numOfRows": str(page_size)}
     items: list[dict] = []
     retry_count = 0
     pages_fetched = 0
@@ -235,7 +239,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             items.extend(result.items)
 
             if max_page is None:
-                max_page = total_pages(result.total_count, config.num_of_rows)
+                max_page = total_pages(result.total_count, page_size)
 
             if page >= max_page:
                 break
@@ -246,7 +250,12 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     _MAX_PAGES_SAFETY,
                     result.total_count,
                 )
-                break
+                return {
+                    "items": items, "pages": pages_fetched, "last_code": last_code,
+                    "retry_count": retry_count, "outcome": "failed", "halt_code": None,
+                    "truncated": True,
+                    "error_msg": f"안전 상한({_MAX_PAGES_SAFETY}페이지) 도달 — 잘린 수집",
+                }
             page += 1
     except api_client.ApiClientError as exc:
         # 파라미터/키 등 클라이언트 측 오류 — 일시 장애로 보지 않고 실패 처리.
@@ -294,6 +303,7 @@ def _build_detail_json(by_call: dict, ord_changes: list[dict], classify: dict | 
 def _call_detail(result: dict, **counts) -> dict:
     return {"outcome": result["outcome"], "pages": result["pages"],
             "last_result_code": result["last_code"], "items": len(result["items"]),
+            **({"truncated": True} if result.get("truncated") else {}),
             **counts, "retry_count": result["retry_count"]}
 
 
@@ -317,13 +327,14 @@ def collect_window(
         )
         meta_ts = datetime.now()
         run = repository.create_run(session, trigger, window_bgn, window_end)
-        logger.info("수집 시작: trigger=%s window=%s~%s 공고=0 면허보존=0 보정=0 분류표시=0 보정상한=%d",
+        logger.info("수집 시작: trigger=%s window=%s~%s 보정상한=%d",
                     trigger, fmt_dt(window_bgn), fmt_dt(window_end), _MAX_LICENSE_FIX_TARGETS)
         by_call = {
             "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
                       "items": 0, "notices": 0, "retry_count": 0},
             "license": {"outcome": "skipped", "pages": 0, "last_result_code": None,
-                        "items": 0, "kept": 0, "retry_count": 0},
+                        "items": 0, "kept": 0, "retry_count": 0,
+                        "page_size": _LICENSE_BULK_PAGE_SIZE},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
                             "found": 0, "skipped": 0, "failed": [], "retry_count": 0},
         }
@@ -358,7 +369,9 @@ def collect_window(
             "inqryDiv": "1", "inqryBgnDt": fmt_dt(window_bgn), "inqryEndDt": fmt_dt(window_end),
         }, snapshot)
         licenses = _keep_licenses(session, license_result["items"], notice_nos)
-        by_call["license"] = _call_detail(license_result, kept=len(licenses))
+        by_call["license"] = _call_detail(
+            license_result, kept=len(licenses), page_size=_LICENSE_BULK_PAGE_SIZE,
+        )
         if license_result["outcome"] == "halt":
             return halt("license", license_result)
         if license_result["outcome"] == "failed":
@@ -369,6 +382,12 @@ def collect_window(
             targets = _missing_license_targets(session, notices, licenses)
             fix.update(outcome="ok", targets=len(targets),
                        skipped=max(0, len(targets) - _MAX_LICENSE_FIX_TARGETS))
+            if fix["skipped"]:
+                fix["outcome"] = "failed"
+                failed.append(("license_fix", {
+                    "last_code": None,
+                    "error_msg": f"보정 상한({_MAX_LICENSE_FIX_TARGETS}건) 초과 — {fix['skipped']}건 건너뜀",
+                }))
             for item in targets[:_MAX_LICENSE_FIX_TARGETS]:
                 no = _text(item["bidNtceNo"])
                 result = _fetch_pages(LICENSE_OPERATION, {
@@ -386,10 +405,12 @@ def collect_window(
                     return halt("license_fix", result)
                 if result["outcome"] == "failed":
                     fix["outcome"] = "failed"
+                    if result.get("truncated"):
+                        fix["truncated"] = True
                     fix["failed"].append(no)
                     failed.append(("license_fix", result))
 
-        # 공고·면허 upsert 는 flush 만, 분류 함수에서 함께 1회 커밋한다.
+        # 공고·면허·분류는 finish_run 의 실행 종료 이력과 함께 커밋한다.
         values_list = []
         for item in notices:
             try:
@@ -403,6 +424,7 @@ def collect_window(
         repository.upsert_license_limits(session, list(licenses.values()), meta_ts)
         classify = classifier.reclassify_notices(
             session, bid_ntce_nos=notice_nos | {row["bid_ntce_no"] for row in licenses.values()},
+            commit=False,
         )
         for change in ord_changes:
             logger.info("차수변경 %s: %s -> %s", change["no"], change["old"], change["new"])

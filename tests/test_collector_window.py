@@ -421,19 +421,28 @@ def test_legacy_industry_preserved_when_fix_finds_no_rows(monkeypatch, db_engine
         assert row.match_basis == "업종"
 
 
-def test_missing_license_fix_cap(monkeypatch, db_engine):
+@pytest.mark.parametrize("count", [199, 200, 205])
+def test_missing_license_fix_cap(monkeypatch, db_engine, count):
     _, Local = db_engine
     with Local() as session:
         session.get(AppConfig, 1).num_of_rows = 300
+        session.get(AppConfig, 1).last_success_dt = WIN_BGN
         session.commit()
-    notices = [_notice(f"A-{i}") for i in range(205)]
-    calls = _fake_api(monkeypatch, lambda op, params: _ok_result(notices, "205")
+    notices = [_notice(f"A-{i}") for i in range(count)]
+    calls = _fake_api(monkeypatch, lambda op, params: _ok_result(notices, str(count))
                       if op == collector.OPERATION else _ok_result())
     run = collector.collect_window(WIN_BGN, WIN_END)
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert collector._MAX_LICENSE_FIX_TARGETS == 200
-    assert fix["targets"] == 205 and fix["called"] == 200 and fix["skipped"] == 5
-    assert len(calls) == 202 and run.status == "success"
+    skipped = max(0, count - 200)
+    assert fix["targets"] == count and fix["called"] == min(count, 200) and fix["skipped"] == skipped
+    assert len(calls) == min(count, 200) + 2
+    assert run.status == ("partial" if skipped else "success")
+    assert fix["outcome"] == ("failed" if skipped else "ok")
+    if skipped:
+        assert "license_fix" in run.error_msg and "상한" in run.error_msg and "5건" in run.error_msg
+    with Local() as session:
+        assert session.get(AppConfig, 1).last_success_dt == (WIN_BGN if skipped else WIN_END)
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -483,7 +492,8 @@ def test_failed_stage_partial_keeps_received_rows_and_retry_sum(monkeypatch, db_
             failures.append(current)
             return _failed_result()
         rows = [_notice("NEW")] if current == "servc" else [_license("NEW", "001")]
-        return _ok_result(rows, "2" if current == stage else "1")
+        total = int(params["numOfRows"]) + 1 if current == stage else 1
+        return _ok_result(rows, str(total))
 
     calls = _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
@@ -523,7 +533,7 @@ def test_all_stages_page_and_retry_and_config_params(monkeypatch, db_engine):
         if stage == "servc":
             return _ok_result([_notice("FIX" if page == 1 else "BULK")], "2")
         if stage == "license":
-            return _ok_result([_license("BULK", lmtSno=str(page))], "2")
+            return _ok_result([_license("BULK", lmtSno=str(page))], "1001")
         return _ok_result([_license("FIX", lmtSno=str(page))], "2")
 
     calls = _fake_api(monkeypatch, responder)
@@ -538,6 +548,10 @@ def test_all_stages_page_and_retry_and_config_params(monkeypatch, db_engine):
         assert params["inqryBgnDt"] == "202605010000" and params["inqryEndDt"] == "202606010000"
     data = json.loads(run.detail_json)
     assert data["by_call"]["servc"]["pages"] == data["by_call"]["license"]["pages"] == 2
+    assert data["by_call"]["license"]["page_size"] == 1000
+    license_calls = [params for op, params in calls if op == collector.LICENSE_OPERATION]
+    assert all(params["numOfRows"] == ("1000" if params["inqryDiv"] == "1" else "1")
+               for params in license_calls)
     assert data["by_call"]["license_fix"]["retry_count"] == 1
     with Local() as session:
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 4
@@ -593,7 +607,8 @@ def test_halt_after_received_pages_preserves_existing_data(monkeypatch, db_engin
             return result
         rows = [_notice("NEW", "001")] if current == "servc" else [
             _license("NEW", "001" if current == "license_fix" else "000")]
-        return _ok_result(rows, "2" if current == stage else "1")
+        total = int(params["numOfRows"]) + 1 if current == stage else 1
+        return _ok_result(rows, str(total))
 
     calls = _fake_api(monkeypatch, responder)
     monkeypatch.setattr(classifier, "reclassify_notices", lambda *a, **kw: pytest.fail("halt 이후 분류"))
@@ -636,3 +651,128 @@ def test_classification_failure_rolls_back_notices_raw_and_licenses(monkeypatch,
         assert session.get(BidNotice, "NEW") is None
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 0
         assert session.scalar(select(func.count()).select_from(BidNoticeRaw)) == 0
+
+
+def test_previous_license_with_no_current_fix_is_hidden(monkeypatch, db_engine):
+    _, Local = db_engine
+    _seed(Local, _existing_notice("OLD", indstryty_lmt_yn="Y", list_visible=True,
+                                 match_basis="업종", matched_indstryty_cds="1468"),
+          BidLicenseLimit(bid_ntce_no="OLD", bid_ntce_ord="000", lmt_grp_no="", lmt_sno="",
+                          lcns_cd="1468", collected_at=WIN_BGN))
+    calls = _fake_api(monkeypatch, lambda op, params: _ok_result([
+        _notice("OLD", "001", bidNtceNm="홈페이지"),
+    ], "1") if op == collector.OPERATION else _ok_result())
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    assert run.status == "success"
+    fixes = [params for op, params in calls
+             if op == collector.LICENSE_OPERATION and params["inqryDiv"] == "2"]
+    assert len(fixes) == 1 and fixes[0]["bidNtceOrd"] == "001"
+    assert fixes[0]["numOfRows"] == "20"
+    bulk = next(params for op, params in calls if op == collector.LICENSE_OPERATION)
+    assert bulk["numOfRows"] == "1000"
+    detail = json.loads(run.detail_json)
+    assert detail["by_call"]["license"]["page_size"] == 1000
+    assert detail["by_call"]["license_fix"]["found"] == 0
+    with Local() as session:
+        row = session.get(BidNotice, "OLD")
+        assert row.list_visible is False and row.match_basis is None
+        assert row.matched_indstryty_cds is None
+        assert session.get(BidLicenseLimit, ("OLD", "000", "", "")) is not None
+
+
+@pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
+def test_safety_limit_is_partial_and_preserves_received_data(monkeypatch, db_engine, stage):
+    _, Local = db_engine
+    monkeypatch.setattr(collector, "_MAX_PAGES_SAFETY", 2)
+    with Local() as session:
+        session.get(AppConfig, 1).last_success_dt = WIN_BGN
+        session.commit()
+
+    def responder(op, params):
+        current = "servc" if op == collector.OPERATION else (
+            "license" if params["inqryDiv"] == "1" else "license_fix")
+        if current == "servc":
+            rows = [_notice("NEW", "001")]
+        elif stage == "license_fix" and current == "license":
+            return _ok_result()
+        else:
+            rows = [_license("NEW", "000" if stage == "license" else "001",
+                             lmtSno=params["pageNo"])]
+        total = int(params["numOfRows"]) * 2 + 1 if current == stage else 1
+        return _ok_result(rows, str(total))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    detail = json.loads(run.detail_json)
+    assert run.status == "partial" and stage in run.error_msg and "안전 상한" in run.error_msg
+    assert detail["by_call"][stage]["outcome"] == "failed"
+    assert detail["by_call"][stage]["truncated"] is True
+    if stage in ("servc", "license"):
+        assert detail["by_call"][stage]["pages"] == 2
+        assert detail["by_call"]["license_fix"]["outcome"] == "skipped"
+        assert all(params["inqryDiv"] != "2" for _, params in calls)
+        assert any(op == collector.LICENSE_OPERATION for op, _ in calls)
+    assert all(int(params["pageNo"]) <= 2 for _, params in calls)
+    with Local() as session:
+        assert session.get(AppConfig, 1).last_success_dt == WIN_BGN
+        assert session.get(AppConfig, 1).auto_halted is False
+        notice = session.get(BidNotice, "NEW")
+        assert notice.list_visible is (stage != "license")
+        assert session.get(BidNoticeRaw, "NEW") is not None
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
+            1 if stage == "servc" else 2
+        )
+
+
+@pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
+def test_complete_last_page_at_safety_limit_is_not_truncated(monkeypatch, stage):
+    monkeypatch.setattr(collector, "_MAX_PAGES_SAFETY", 2)
+    operation = collector.OPERATION if stage == "servc" else collector.LICENSE_OPERATION
+    params = {"inqryDiv": "2" if stage == "license_fix" else "1"}
+    page_size = 1000 if stage == "license" else 20
+    calls = _fake_api(monkeypatch, lambda op, params: _ok_result([
+        {"page": params["pageNo"]},
+    ], str(page_size * 2)))
+    snapshot = collector._ConfigSnapshot("1", "1", None, 20, 0)
+    result = collector._fetch_pages(operation, params, snapshot)
+    assert result["outcome"] == "ok" and result["pages"] == 2
+    assert not result.get("truncated")
+    assert len(result["items"]) == len(calls) == 2
+    assert all(params["numOfRows"] == str(page_size) for _, params in calls)
+
+
+def test_finish_run_commit_failure_rolls_back_notices_licenses_and_classification(monkeypatch, db_engine):
+    _, Local = db_engine
+    _seed(Local, _existing_notice("OLD", bid_ntce_nm="기존", list_visible=False,
+                                 matched_indstryty_cds="9999"))
+    _fake_api(monkeypatch, lambda op, params: _ok_result([
+        _notice("OLD", bidNtceNm="변경"), _notice("NEW"),
+    ], "2") if op == collector.OPERATION else _ok_result([_license("OLD"), _license("NEW")], "2"))
+    original_finish = repository.finish_run
+
+    def finish_with_failure(session, run, **kwargs):
+        def fail_before_commit(session):
+            session.flush()
+            assert session.get(BidNotice, "OLD").bid_ntce_nm == "변경"
+            assert session.get(BidNotice, "OLD").matched_indstryty_cds == "1468"
+            assert session.get(BidNotice, "NEW").list_visible is True
+            assert session.get(BidLicenseLimit, ("NEW", "000", "", "")) is not None
+            assert run.status == "success" and run.run_finished_at is not None
+            raise RuntimeError("가짜 finish_run 커밋 직전 실패")
+
+        event.listen(session, "before_commit", fail_before_commit, once=True)
+        original_finish(session, run, **kwargs)
+
+    monkeypatch.setattr(repository, "finish_run", finish_with_failure)
+    with pytest.raises(RuntimeError, match="가짜 finish_run 커밋 직전 실패"):
+        collector.collect_window(WIN_BGN, WIN_END)
+    with Local() as session:
+        old = session.get(BidNotice, "OLD")
+        assert old.bid_ntce_nm == "기존" and old.list_visible is False
+        assert old.matched_indstryty_cds == "9999" and old.match_basis is None
+        assert session.get(BidNotice, "NEW") is None
+        for model in (BidLicenseLimit, BidNoticeRaw):
+            assert session.scalar(select(func.count()).select_from(model)) == 0
+        run = session.scalar(select(CollectionRun))
+        assert run.status == "running" and run.run_finished_at is None
+        assert session.get(AppConfig, 1).last_success_dt is None

@@ -13,7 +13,8 @@
     그 외(String·Text) → clean_str.
   - 리스트성 Text(원문 보존: purchsObjPrdctList·prdctDtlList·bidNtceNoList)는
     `_preserve_list_or_str` 로 별도 처리.
-- 수집 메타데이터(matched_indstryty_cds·collected_at·updated_at·list_visible·match_basis·match_detail)는 호출자가 부여한다.
+- 수집 시각(collected_at·updated_at)은 호출자가 부여하고,
+  분류값(matched_indstryty_cds·list_visible·match_basis·match_detail)은 분류 엔진이 갱신한다.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from sqlalchemy import DateTime, Integer, Numeric
 
 from app.models import BidNotice, PreSpec
 
-# 호출자(3.3 collector/repository)가 채우는 수집 메타데이터 — 여기서는 채우지 않는다.
+# 호출자가 부여하는 수집 시각·분류 엔진이 갱신하는 분류값 — 여기서는 채우지 않는다.
 META_COLUMNS: frozenset[str] = frozenset(
     {
         "matched_indstryty_cds", "collected_at", "updated_at",

@@ -541,3 +541,17 @@ def test_license_endpoint_params_and_base_url():
                                                               "intrntnlDivCd": "1"}, "json")
     assert built == {**raw, "type": "json"}
     assert api_client.base_url_for(collector.LICENSE_OPERATION) == api_client.BASE_URL
+
+
+@pytest.mark.parametrize("source", ["bulk", "db"])
+def test_missing_license_targets_recognizes_padded_current_order(session, source):
+    from app.models import BidLicenseLimit
+    notices = [{"bidNtceNo": "SAME", "bidNtceOrd": "1", "indstrytyLmtYn": "Y"}]
+    row = collector.license_values({"bidNtceNo": "SAME", "bidNtceOrd": "001"})
+    licenses = {}
+    if source == "bulk":
+        licenses[collector._license_key(row)] = row
+    else:
+        session.add(BidLicenseLimit(**row, collected_at=datetime(2026, 5, 1)))
+        session.commit()
+    assert collector._missing_license_targets(session, notices, licenses) == []

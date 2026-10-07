@@ -325,25 +325,59 @@ def test_license_order_and_permission_codes(database):
             session, rules=DEFAULT_RULES, match_codes=("1468", "1470"),
         )}
         assert results["CURRENT"].match_basis is None
-        assert results["LATEST"].matched_indstryty_cds == "1468"
+        assert results["LATEST"] == Classification(False, None, None, None)
         assert results["PERMISSION"].matched_indstryty_cds == "1468,1470"
         assert results["UNPADDED"].match_basis is None
-        assert results["FALLBACK"].matched_indstryty_cds == "1468"
+        assert results["FALLBACK"] == Classification(False, None, None, None)
         assert results["UNION"].matched_indstryty_cds == "1468,1470"
 
 
-@pytest.mark.parametrize("order", [None, ""])
+@pytest.mark.parametrize("order", [None, "", " "])
 def test_missing_notice_order_uses_latest_license_order(database, order):
     _, local = database
     with local() as session:
         session.add_all([
             _notice("NO-ORDER", bid_ntce_ord=order),
-            _license("NO-ORDER", "9999", order="000"),
-            _license("NO-ORDER", "1468", order="001"),
+            _license("NO-ORDER", "9999", order="2"),
+            _license("NO-ORDER", "1468", order="010"),
         ])
         session.commit()
         _, result = next(iter_classifications(session, rules=DEFAULT_RULES, match_codes=("1468",)))
         assert result == Classification(True, "업종", None, "1468")
+
+
+@pytest.mark.parametrize("notice_order,license_order", [
+    ("1", "001"), ("001", "1"), ("+1", "001"), ("A", "00A"),
+])
+def test_current_license_order_normalizes_notation(database, notice_order, license_order):
+    _, local = database
+    with local() as session:
+        session.add_all([
+            _notice("SAME-ORDER", bid_ntce_ord=notice_order, indstryty_lmt_yn="Y"),
+            _license("SAME-ORDER", "1468", order=license_order),
+        ])
+        session.commit()
+        _, result = next(iter_classifications(session, rules=DEFAULT_RULES, match_codes=("1468",)))
+        assert result == Classification(True, "업종", None, "1468")
+
+
+def test_reclassification_without_commit_can_be_rolled_back(database):
+    _, local = database
+    with local() as session:
+        session.add(AppConfig(id=1, indstryty_cds="1468"))
+        session.commit()
+        commits = []
+        event.listen(session, "after_commit", lambda session: commits.append(True))
+        session.add_all([_notice("NEW", indstryty_lmt_yn="Y"), _license("NEW", "1468")])
+        stats = reclassify_notices(session, commit=False)
+        assert stats["visible"] == stats["changed"] == 1
+        assert session.get(BidNotice, "NEW").match_basis == "업종"
+        assert commits == []
+        session.flush()
+        session.rollback()
+    with local() as verifier:
+        assert verifier.get(BidNotice, "NEW") is None
+        assert verifier.get(BidLicenseLimit, ("NEW", "001", "1", "1")) is None
 
 
 def test_preview_batches_no_n_plus_one_and_reclassification_statistics(database):
