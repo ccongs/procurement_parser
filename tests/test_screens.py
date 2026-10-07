@@ -1379,6 +1379,7 @@ def test_list_matched_industry_codes_and_tooltips(client):
                 bid_ntce_dt=datetime(2026, 5, 4, 9, 0),
                 openg_dt=None,
                 matched_indstryty_cds="1426,1468",
+                match_basis="업종",
                 collected_at=datetime(2026, 6, 1, 12, 0),
                 updated_at=datetime(2026, 6, 1, 12, 0),
             )

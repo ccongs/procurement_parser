@@ -26,6 +26,7 @@ from app.models import (
     CollectionRun,
     ExcludeKeyword,
     ExportCartItem,
+    ListRule,
     PreSpec,
 )
 
@@ -916,6 +917,63 @@ def set_default_exclude_keywords(session: Session, keyword_ids: list[int]) -> No
     for row in rows:
         row.is_default = row.id in wanted
     session.commit()
+
+
+# --- 목록 표시 규칙 ------------------------------------------------------
+
+def list_list_rules(session: Session) -> list[dict[str, Any]]:
+    """종류별·id 순으로 목록 표시 규칙 전체를 반환한다."""
+    rows = session.scalars(select(ListRule).order_by(ListRule.rule_type, ListRule.id))
+    return [
+        {"id": row.id, "rule_type": row.rule_type, "value": row.value,
+         "enabled": bool(row.enabled)}
+        for row in rows
+    ]
+
+
+def add_list_rule(session: Session, rule_type: str, value: str) -> bool:
+    """공백을 정규화해 규칙을 추가한다. 같은 종류의 중복이면 False."""
+    if rule_type not in {"clsfc", "keyword", "negative"}:
+        raise ValueError("알 수 없는 규칙 종류입니다.")
+    value = " ".join(value.split())
+    if not value:
+        raise ValueError("추가할 규칙 값을 입력하세요.")
+    if len(value) > 100:
+        raise ValueError("규칙 값은 100자 이하여야 합니다.")
+    exists = session.scalar(select(ListRule.id).where(
+        ListRule.rule_type == rule_type, ListRule.value == value,
+    ))
+    if exists is not None:
+        return False
+    session.add(ListRule(rule_type=rule_type, value=value, enabled=True))
+    session.commit()
+    return True
+
+
+def delete_list_rule(session: Session, rule_id: int) -> bool:
+    """규칙 1건 삭제. 없으면 False."""
+    row = session.get(ListRule, rule_id)
+    if row is None:
+        return False
+    session.delete(row)
+    session.commit()
+    return True
+
+
+def set_list_rules_enabled(session: Session, enabled_ids: list[int]) -> None:
+    """전달된 id 만 사용하도록 전체 규칙의 체크 상태를 저장한다."""
+    wanted = set(enabled_ids)
+    for row in session.scalars(select(ListRule)):
+        row.enabled = row.id in wanted
+    session.commit()
+
+
+def list_clsfc_names(session: Session, limit: int = 200) -> list[str]:
+    """저장된 공공조달분류명을 공고 수 내림차순으로 제안한다."""
+    name = BidNotice.pub_prcrmnt_clsfc_nm
+    stmt = (select(name).where(name.is_not(None), func.trim(name) != "")
+            .group_by(name).order_by(func.count().desc(), name.asc()).limit(limit))
+    return list(session.scalars(stmt))
 
 
 # --- Phase 7.1: 검토 목록 장바구니 -----------------------------------------

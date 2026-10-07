@@ -32,7 +32,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, 
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
-from app import __version__, api_client, industry_codes, region_codes, repository, scheduler
+from app import __version__, api_client, classifier, industry_codes, region_codes, repository, scheduler
 from app.db import SessionLocal, init_db
 from app.logging_config import setup_logging
 from app.models import BidNotice, PreSpec
@@ -168,6 +168,8 @@ def _list_preset_date_range(
 
 def _render_field(p: ParamSpec, value: str = "") -> str:
     help_html = f'<span class="help">{_e(p.help)}</span>' if p.help else ""
+    if p.name == "numOfRows":
+        help_html += '<span class="help">최대 999 — 1000 이상이면 API 가 기본 10행만 돌려줍니다</span>'
     return f"""
       <label class="field">
         <span class="flabel">{_e(p.label)} <code>{_e(p.name)}</code></span>
@@ -972,6 +974,8 @@ BASE_CSS = """
 # /list 매칭업종 코드 전용 힌트와 툴팁 스타일.
 _LIST_MATCHIND_TIP_CSS = """
   .indcode[data-tip] { cursor: help; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .indcode.nolimit { display: inline-block; padding: 2px 7px; border-radius: 12px;
+                     background: #e9eef2; color: #455b6b; font-size: inherit; white-space: nowrap; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
              clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
   .ind-tip { position: fixed; z-index: 90; padding: 4px 8px; border-radius: 4px;
@@ -1227,6 +1231,25 @@ def _render_matched_inds(csv: Any) -> str:
     return f'<td class="matchind">[{",<wbr>".join(spans)}]</td>'
 
 
+def _render_list_match(row: dict, match_codes: frozenset[str]) -> str:
+    """현재 표시 근거로 업종 교집합 또는 제한없음 배지를 표시한다."""
+    basis = row.get("match_basis")
+    if basis == "업종":
+        codes = industry_codes.parse_matched_codes(row.get("matched_indstryty_cds"))
+        return _render_matched_inds(",".join(code for code in codes if code in match_codes))
+    if basis in {"분류", "키워드"}:
+        label = "공공조달분류" if basis == "분류" else "공고명 키워드"
+        detail = row.get("match_detail")
+        tip = f"업종 제한 없음 · 표시 근거: {label}"
+        if detail:
+            tip += f" '{detail}'"
+        return (
+            f'<td class="matchind"><span class="indcode nolimit" data-tip="{_e(tip)}" '
+            f'tabindex="0">제한없음<span class="sr-only">({_e(tip)})</span></span></td>'
+        )
+    return '<td class="matchind">-</td>'
+
+
 def _related_ntce_no(kind: Any, bef_bid_bbanc_no: Any, bid_ntce_no: Any) -> str | None:
     """재공고·변경공고 컬럼에서 공백·중복이 아닌 이전 공고번호를 읽는다."""
     if kind not in {"재공고", "변경공고"}:
@@ -1473,6 +1496,7 @@ def _render_list_rows(
     sort: str,
     qs: dict[str, str],
     status_map: dict[str, str] | None = None,
+    match_codes: frozenset[str] = frozenset(),
 ) -> str:
     if not rows:
         return '<p class="muted">조건에 맞는 공고가 없습니다.</p>'
@@ -1517,7 +1541,7 @@ def _render_list_rows(
             elif kind == "dt":
                 cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
             elif kind == "matchind":
-                cells.append(_render_matched_inds(val))
+                cells.append(_render_list_match(r, match_codes))
             elif kind == "ntcekind":
                 cells.append(_render_ntce_kind(
                     val, r.get("bid_methd_nm"), cell_class="kind-col kindcell"
@@ -3515,6 +3539,7 @@ def list_page(
         cfg = repository.get_config(session)
         cfg_price_bgn = cfg.presmpt_prce_bgn
         cfg_price_end = cfg.presmpt_prce_end
+        match_codes = classifier.load_match_codes(session)
 
         price_min_in = price_min if (price_min is not None and str(price_min).strip()) else None
         price_max_in = price_max if (price_max is not None and str(price_max).strip()) else None
@@ -3554,6 +3579,7 @@ def list_page(
             + [
                 "bid_ntce_nm", "bid_ntce_ord", "dminstt_nm",
                 "bid_ntce_dtl_url", "bid_methd_nm", "bef_bid_bbanc_no",
+                "match_basis", "match_detail",
             ]
             + _SPEC_URL_COLUMNS
         )
@@ -3689,7 +3715,7 @@ def list_page(
         <h2>수집된 공고</h2>
         <span class="rangeinfo">{'개찰일' if date_field == 'openg_dt' else '공고일'} {_e(dt_from_eff)} ~ {_e(dt_to_eff)}</span>
       </div>
-      {_render_list_rows(rows, sort, qs, status_map)}
+      {_render_list_rows(rows, sort, qs, status_map, match_codes)}
       {_render_pager(total, page, page_size, qs)}
     </div>
 
@@ -4573,7 +4599,7 @@ _CONFIG_INT_FIELDS: list[tuple[str, str, int, int]] = [
     ("interval_minutes", "수집 주기(분)", 1, 100000),
     ("window_overlap_minutes", "윈도우 겹침(분)", 0, 100000),
     ("backfill_days", "백필 기간(일)", 1, 366),
-    ("num_of_rows", "페이지 크기", 1, 1000),
+    ("num_of_rows", "누락 보정 조회 페이지 크기", 1, 999),
     ("max_retries", "재시도 한도", 0, 10),
 ]
 
@@ -4676,6 +4702,59 @@ def _render_keyword_card(keywords: list[dict[str, Any]]) -> str:
     </div>"""
 
 
+def _render_rule_card(rules: list[dict], clsfc_names: list[str]) -> str:
+    """/config — 목록 표시 규칙 세 종류를 한 폼에서 편집한다."""
+    sections = []
+    for rule_type, title, help_text in (
+        ("clsfc", "IT 공공조달분류", "정식 분류명과 정확히 같을 때"),
+        ("keyword", "SW 키워드", "공고명 부분 일치, 영문·숫자 약어는 앞뒤가 영문·숫자가 아닐 때, 공백은 있어도 없어도 일치"),
+        ("negative", "판별 제외어", "공고명에 일치하면 키워드에 의한 표시에서 제외합니다."),
+    ):
+        rows = "".join(
+            f'<tr><td><label class="chk" style="padding-bottom:0;white-space:nowrap;">'
+            f'<input type="checkbox" name="enabled_ids" value="{int(rule["id"])}"'
+            f'{" checked" if rule["enabled"] else ""}> 사용</label></td>'
+            f'<td>{_e(rule["value"])}</td>'
+            f'<td><button type="submit" class="kw-del" name="delete_id" '
+            f'value="{int(rule["id"])}">삭제</button></td></tr>'
+            for rule in rules if rule["rule_type"] == rule_type
+        )
+        if not rows:
+            rows = '<tr><td colspan="3" class="muted">등록된 규칙이 없습니다</td></tr>'
+        datalist = ' list="clsfc-names"' if rule_type == "clsfc" else ""
+        sections.append(f"""
+        <div class="row" style="margin-top:18px;gap:12px;">
+          <h3 style="white-space:nowrap;">{title}</h3>
+          <input type="text" name="new_{rule_type}" maxlength="100"{datalist}
+                 aria-label="{title} 추가" placeholder="{title} 추가">
+          <button type="submit" class="submit" name="action" value="add_{rule_type}">추가</button>
+        </div>
+        <p class="muted">{help_text}</p>
+        <div class="table-wrap">
+          <table class="kwtable">
+            <thead><tr><th>사용</th><th>값</th><th>삭제</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>""")
+    options = "".join(f'<option value="{_e(name)}"></option>' for name in clsfc_names)
+    return f"""
+    <div class="card" id="rules">
+      <h2>목록 표시 규칙</h2>
+      <p class="muted">
+        ① 매칭 업종코드와 면허제한 일치 → ② 업종 제한 없는 공고 중 공공조달분류 일치 →<br>
+        ③ 업종 제한 없는 공고 중 공고명 키워드 일치(판별 제외어가 있으면 ③ 제외).<br>
+        저장 시 저장된 전체 공고를 다시 분류합니다.
+      </p>
+      <form method="post" action="/config/rules">
+        <datalist id="clsfc-names">{options}</datalist>
+        {''.join(sections)}
+        <div style="margin-top:12px;">
+          <button type="submit" class="submit" name="action" value="save">표시 규칙 저장</button>
+        </div>
+      </form>
+    </div>"""
+
+
 def _render_config_page(
     cfg: dict,
     runs: list[dict],
@@ -4683,6 +4762,8 @@ def _render_config_page(
     msg: str | None,
     err: str | None,
     keywords: list[dict[str, Any]] | None = None,
+    rules: list[dict[str, Any]] | None = None,
+    clsfc_names: list[str] | None = None,
 ) -> str:
     msg_html = ""
     if err:
@@ -4696,6 +4777,7 @@ def _render_config_page(
         <label class="field">
           <span class="flabel">{_e(lbl)} <code>{_e(name)}</code></span>
           <input type="number" name="{_e(name)}" value="{_e(cfg.get(name))}" min="{lo}" max="{hi}">
+          {'<span class="help">공고·면허 일괄 조회는 999행 고정, 이 값은 면허 누락 보정 조회에만 쓰입니다.</span>' if name == 'num_of_rows' else ''}
         </label>"""
         for name, lbl, lo, hi in _CONFIG_INT_FIELDS
     )
@@ -4816,8 +4898,9 @@ def _render_config_page(
               <span class="help">00=전국(지역제한 없는 공고만), 빈값=전체(필터 안 함). 다음 수집부터 적용.</span>
             </label>
             <label class="field" style="min-width:260px;">
-              <span class="flabel">업종코드 CSV <code>indstryty_cds</code></span>
+              <span class="flabel">매칭 업종코드 CSV <code>indstryty_cds</code></span>
               <input type="text" name="indstryty_cds" value="{_e(cfg.get('indstryty_cds'))}" placeholder="예: 1426,1468,1469,1470">
+              <span class="help">목록 표시 판정 기준(면허제한 코드와 비교) — 수집 조건이 아닙니다.</span>
             </label>
           </div>
           <div class="note" style="margin-top:8px;">입찰공고 검색 기본값(배정예산)</div>
@@ -4856,6 +4939,8 @@ def _render_config_page(
         <div><button type="submit" class="submit">설정 저장</button></div>
       </form>
     </div>
+
+    {_render_rule_card(rules or [], clsfc_names or [])}
 
     {_render_keyword_card(keywords or [])}
 
@@ -4917,6 +5002,18 @@ def _load_keywords() -> list[dict[str, Any]]:
         return repository.list_exclude_keywords(session)
 
 
+def _load_rules_view() -> tuple[list[dict], list[str]]:
+    with SessionLocal() as session:
+        return repository.list_list_rules(session), repository.list_clsfc_names(session)
+
+
+def _classification_params(stats: dict) -> dict[str, int]:
+    """재분류 통계를 저장 메시지용 쿼리 파라미터로 변환한다."""
+    basis = stats["by_basis"]
+    return {"vis": stats["visible"], "u": basis["업종"],
+            "c": basis["분류"], "k": basis["키워드"]}
+
+
 def _sched_view() -> dict:
     return {
         "running": scheduler.is_running(),
@@ -4927,11 +5024,19 @@ def _sched_view() -> dict:
 
 
 @app.get("/config", response_class=HTMLResponse)
-def config_page(saved: str | None = None, err: str | None = None) -> HTMLResponse:
+def config_page(
+    saved: str | None = None, err: str | None = None, rules: str | None = None,
+    vis: int | None = None, u: int = 0, c: int = 0, k: int = 0,
+) -> HTMLResponse:
     cfg, runs = _load_config_view()
     msg = "설정을 저장했습니다." if saved else None
+    if rules:
+        msg = "표시 규칙을 저장했습니다"
+    if msg and vis is not None:
+        msg = f"{msg.rstrip('.')} — 표시 {vis}건(업종 {u} · 분류 {c} · 키워드 {k})"
+    list_rules, clsfc_names = _load_rules_view()
     return HTMLResponse(
-        _render_config_page(cfg, runs, _sched_view(), msg, err, _load_keywords())
+        _render_config_page(cfg, runs, _sched_view(), msg, err, _load_keywords(), list_rules, clsfc_names)
     )
 
 
@@ -5023,19 +5128,54 @@ async def config_save(request: Request):
         cfg, runs = _load_config_view()
         # 입력값을 화면에 되살려 사용자가 고치게 한다.
         cfg.update({k: v for k, v in updates.items()})
+        list_rules, clsfc_names = _load_rules_view()
         html_page = _render_config_page(
-            cfg, runs, _sched_view(), None, " / ".join(errors), _load_keywords()
+            cfg, runs, _sched_view(), None, " / ".join(errors), _load_keywords(), list_rules, clsfc_names
         )
         return HTMLResponse(html_page, status_code=400)
 
+    params = {"saved": "1"}
     with SessionLocal() as session:
+        codes_changed = repository.get_config(session).indstryty_cds != updates["indstryty_cds"]
         repository.update_config(session, **updates)
+        if codes_changed:
+            params.update(_classification_params(classifier.reclassify_notices(session)))
 
     # interval 변경을 실행 중 스케줄러에 즉시 반영.
     if scheduler.is_running():
         scheduler.reschedule(updates["interval_minutes"])
 
-    return RedirectResponse(url="/config?saved=1", status_code=303)
+    return RedirectResponse(url=f"/config?{urlencode(params)}", status_code=303)
+
+
+@app.post("/config/rules")
+async def config_rules_save(request: Request):
+    """체크 상태를 먼저 저장하고 추가·삭제 후 전체 공고를 재분류한다."""
+    form = await request.form()
+    action = str(form.get("action") or "save")
+    delete_raw = str(form.get("delete_id") or "").strip()
+    enabled_ids = [int(v) for v in form.getlist("enabled_ids") if str(v).strip().isdigit()]
+    err = None
+    with SessionLocal() as session:
+        repository.set_list_rules_enabled(session, enabled_ids)
+        if delete_raw.isdigit():
+            repository.delete_list_rule(session, int(delete_raw))
+        elif action in {"add_clsfc", "add_keyword", "add_negative"}:
+            rule_type = action.removeprefix("add_")
+            value = str(form.get(f"new_{rule_type}") or "")
+            try:
+                if not repository.add_list_rule(session, rule_type, value):
+                    err = f"이미 등록된 규칙입니다('{' '.join(value.split())}')."
+            except ValueError as exc:
+                err = str(exc)
+        elif action != "save":
+            err = "알 수 없는 규칙 작업입니다."
+        # 추가 오류가 나도 먼저 저장한 체크 상태에 맞게 재분류한다.
+        stats = classifier.reclassify_notices(session)
+    if err:
+        return RedirectResponse(url=f"/config?err={quote(err)}#rules", status_code=303)
+    params = {"rules": "1", **_classification_params(stats)}
+    return RedirectResponse(url=f"/config?{urlencode(params)}#rules", status_code=303)
 
 
 @app.post("/config/keywords")
