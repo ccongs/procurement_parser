@@ -4,41 +4,61 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import select
+from starlette.datastructures import FormData
 
 from app import classifier, repository
 from app.models import BidNotice
 
 
-RULE_FIELDS = (
-    ("clsfc", "IT 공공조달분류", "정식 분류명과 정확히 같을 때"),
-    ("keyword", "SW 키워드", "공고명 부분 일치, 영문·숫자 약어는 앞뒤가 영문·숫자가 아닐 때, 공백은 있어도 없어도 일치"),
-    ("negative", "판별 제외어", "공고명에 일치하면 키워드에 의한 표시에서 제외합니다."),
-)
-STALE_MESSAGE = "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요."
+MAX_RULES_PER_KIND = 300
+MAX_DRAFT_CHARS = 20_000
+STALE_MESSAGE = "다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌어 현재 규칙을 다시 불러왔습니다. 초안을 다시 입력한 뒤 미리보기하세요."
 
 
-def rules_fingerprint(rows: list[dict]) -> str:
-    """꺼진 규칙·추가·삭제까지 포함한 전체 집합 지문."""
+class DraftValidationError(ValueError):
+    """사용자가 수정할 수 있는 초안·기간 입력 오류."""
+
+
+class StaleRulesError(Exception):
+    """렌더 시점 규칙·매칭 업종코드와 현재 상태의 불일치."""
+
+
+def rules_fingerprint(rows: list[dict], match_codes: frozenset[str]) -> str:
+    """꺼진 규칙·추가·삭제와 매칭 업종코드를 포함한 전체 집합 지문."""
     references = [(row["id"], repository.list_rule_fingerprint(row))
                   for row in sorted(rows, key=lambda row: row["id"])]
-    return hashlib.sha256(json.dumps(references).encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps([references, sorted(match_codes)]).encode("utf-8")).hexdigest()
 
 
-def draft_values(data: dict[str, str]) -> dict[str, list[str]]:
-    """빈 줄을 무시하고 종류별 길이·중복을 검증한다."""
+def draft_values(data: Mapping[str, str] | FormData) -> dict[str, list[str]]:
+    """필드 제출 횟수·총 크기를 먼저 검사하고 빈 줄을 뺀 규칙을 검증한다."""
+    inputs = {}
+    for kind, title, _ in repository.RULE_FIELDS:
+        items = data.getlist(kind) if isinstance(data, FormData) else ([data[kind]] if kind in data else [])
+        if len(items) != 1 or not isinstance(items[0], str):
+            raise DraftValidationError(f"{title}: 초안 입력칸을 각각 정확히 한 번 제출해야 합니다.")
+        inputs[kind] = items[0]
+    if sum(len(value) for value in inputs.values()) > MAX_DRAFT_CHARS:
+        raise DraftValidationError(f"세 초안 입력 합계는 {MAX_DRAFT_CHARS:,}자 이하여야 합니다.")
     result = {}
-    for kind, title, _ in RULE_FIELDS:
+    for kind, title, _ in repository.RULE_FIELDS:
         values, seen = [], set()
-        for raw in data.get(kind, "").splitlines():
+        for raw in inputs[kind].splitlines():
             if not repository.normalize_rule_value(raw):
                 continue
-            value = repository.validate_list_rule_value(kind, raw)
+            if len(values) >= MAX_RULES_PER_KIND:
+                raise DraftValidationError(f"{title}: 규칙은 종류별 {MAX_RULES_PER_KIND}개 이하여야 합니다.")
+            try:
+                value = repository.validate_list_rule_value(kind, raw)
+            except ValueError as exc:
+                raise DraftValidationError(str(exc)) from exc
             key = repository.list_rule_value_key(kind, value)
             if key in seen:
-                raise ValueError(f"{title}: 중복된 규칙입니다('{value}').")
+                raise DraftValidationError(f"{title}: 중복된 규칙입니다('{value}').")
             seen.add(key)
             values.append(value)
         result[kind] = values
@@ -69,7 +89,7 @@ def apply_plan(session, plan: list[dict]) -> None:
     for row in plan:
         if "id" not in row:
             if not repository.add_list_rule(session, row["rule_type"], row["value"], commit=False):
-                raise ValueError(STALE_MESSAGE)
+                raise StaleRulesError
 
 
 def date_bounds(data: dict[str, str]) -> tuple[datetime | None, datetime | None]:
@@ -82,7 +102,7 @@ def date_bounds(data: dict[str, str]) -> tuple[datetime | None, datetime | None]
         return (datetime.combine(start, time.min) if start else None,
                 datetime.combine(end + timedelta(days=1), time.min) if end else None)
     except (ValueError, OverflowError):
-        raise ValueError("공고일 시작·끝 날짜를 확인하세요.") from None
+        raise DraftValidationError("공고일 시작·끝 날짜를 확인하세요.") from None
 
 
 def preview(session, plan: list[dict], match_codes, data: dict[str, str]) -> dict:

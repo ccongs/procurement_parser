@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app import api_client, classifier, collector, main, repository
+from app import api_client, classifier, collector, main, repository, rule_test
 from app.db import Base, _register_sqlite_pragmas
 from app.models import AppConfig, BidNotice, CollectionRun, ListRule
 
@@ -192,7 +192,7 @@ def test_config_rule_tables_check_state_datalist_and_position(client):
     assert "저장된 전체 공고를 다시 분류" in card
     assert "정식 분류명과 정확히 같을 때" in card
     assert "앞뒤가 영문·숫자가 아닐 때" in card
-    assert "공백은 있어도 없어도 일치" in card
+    assert "값에 공백을 넣으면 공고명의 공백 유무와 관계없이 일치" in card
 
 
 def test_empty_rule_tables(client):
@@ -418,7 +418,7 @@ def test_invalid_ids_and_actions_never_change_state(client, monkeypatch, data):
 @pytest.mark.parametrize("rule_type,existing,duplicate", [
     (rule_type, existing, duplicate)
     for rule_type in ("keyword", "negative")
-    for existing, duplicate in (("SW", "sw"), ("SW", "S W"), ("시스템 구축", "시스템구축"))
+    for existing, duplicate in (("SW", "sw"), ("Straße", "STRASSE"), ("시스템 구축", "시스템  구축"))
 ])
 def test_duplicate_terms_use_existing_value_in_error(client, rule_type, existing, duplicate):
     _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": existing})
@@ -430,6 +430,17 @@ def test_duplicate_terms_use_existing_value_in_error(client, rule_type, existing
     error = parse_qs(urlsplit(response.headers["location"]).query)["rules_err"][0]
     assert error == f"이미 등록된 규칙입니다('{existing}')."
     assert len(_rules()) == 1
+
+
+@pytest.mark.parametrize("rule_type", ["keyword", "negative"])
+@pytest.mark.parametrize("existing,new", [("홈페이지", "홈 페이지"), ("SW", "S W"),
+                                         ("시스템 구축", "시스템구축")])
+def test_rule_card_allows_distinct_spacing_values(client, rule_type, existing, new):
+    _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": existing})
+    response = _post(client, {"action": f"add_{rule_type}", f"new_{rule_type}": new,
+                             "enabled_ids": [_rules()[0]["id"]]})
+    assert response.status_code == 303 and "rules=1" in response.headers["location"]
+    assert [(r["value"], r["enabled"]) for r in _rules()] == [(existing, True), (new, True)]
 
 
 def test_clsfc_duplicate_comparison_keeps_case_and_spaces(client):
@@ -1024,7 +1035,7 @@ def test_rule_test_preview_row_caps_and_search_cap(client, removed):
     (kind, value) for kind in ("clsfc", "keyword", "negative")
     for value in ("가" * 101, "중복\n 중복 ")
 ] + [(kind, value) for kind in ("keyword", "negative")
-     for value in ("SW\nsw", "시스템 구축\n시스템구축", "S W\nsw")])
+    for value in ("SW\nsw", "시스템 구축\n시스템  구축", "S W\ns  w")])
 def test_rule_test_invalid_draft_never_classifies_or_writes(client, monkeypatch, kind, value):
     data = _test_form(client, **{kind: value})
     before = _database_state()
@@ -1035,7 +1046,8 @@ def test_rule_test_invalid_draft_never_classifies_or_writes(client, monkeypatch,
     for response in (_preview(client, data), _apply(client, data)):
         assert response.status_code == 400
         assert "100자" in response.text or "중복된 규칙" in response.text
-        assert 'id="preview"' not in response.text
+        assert "미리보기 결과" not in response.text
+        assert 'id="preview"' in response.text
         assert _database_state() == before
 
 
@@ -1056,7 +1068,7 @@ def test_rule_test_apply_enables_adds_disables_without_delete_and_matches_previe
         rows = repository.list_list_rules(session)
         repository.set_list_rules_enabled(session, [r["id"] for r in rows], [rows[0]["id"]])
         classifier.reclassify_notices(session)
-    data = _test_form(client, clsfc="", keyword="새플랫폼\n경계키워드", negative="전산화단층",
+    data = _test_form(client, clsfc="", keyword="새 플랫폼\n경계키워드", negative="전산화단층",
                       search='<검색&"값>', dt_from="2026-10-01", dt_to="2026-10-07")
     preview = _preview(client, data).text
     assert "현재 표시 2건 → 초안 표시 2건" in preview
@@ -1067,7 +1079,7 @@ def test_rule_test_apply_enables_adds_disables_without_delete_and_matches_previe
     query = parse_qs(urlsplit(location).query)
     assert {key: query[key] for key in ("vis", "u", "c", "k")} == {
         "vis": ["2"], "u": ["1"], "c": ["0"], "k": ["1"]}
-    assert query["dt_from"] == ["2026-10-01"] and query["search"] == [data["search"]]
+    assert query["dt_from"] == ["2026-10-01"] and query["q"] == [data["search"]]
     after = _rules()
     assert {r["id"] for r in rows}.issubset({r["id"] for r in after})
     assert [(r["value"], r["enabled"]) for r in after] == [
@@ -1075,17 +1087,18 @@ def test_rule_test_apply_enables_adds_disables_without_delete_and_matches_previe
     assert _state("K") == (True, "키워드", "새 플랫폼")
     assert _state("N")[:2] == (False, None) and _state("C")[:2] == (False, None)
     page = client.get(location).text
-    assert "규칙을 적용했습니다 — 표시 2건(업종 1 · 분류 0 · 키워드 1)" in page
+    assert "규칙을 적용했습니다 — 표시 2건(업종 1 · 분류 0 · 키워드 1) (저장된 전체 공고 기준)" in page
     assert '<textarea name="clsfc" rows="10"></textarea>' in page
     assert '<textarea name="keyword" rows="10">새 플랫폼\n경계키워드</textarea>' in page
     assert '&lt;검색&amp;&quot;값&gt;' in page
     assert data["fingerprint"] not in page
 
 
-@pytest.mark.parametrize("change", ["add", "disable", "delete", "missing", "invalid"])
+@pytest.mark.parametrize("change", ["add", "disable", "delete", "missing", "invalid", "codes"])
 def test_rule_test_stale_whole_set_fingerprint_refuses_changes(client, monkeypatch, change):
     _post(client, {"action": "add_keyword", "new_keyword": "새 플랫폼"})
-    data = _test_form(client, keyword="새 플랫폼\n새규칙")
+    data = _test_form(client, keyword="새 플랫폼\n새규칙", dt_from="2026-10-01",
+                      dt_to="2026-10-07", search='<검색&"값>')
     with main.SessionLocal() as session:
         if change == "add":
             repository.add_list_rule(session, "negative", "끄거나추가한값")
@@ -1095,23 +1108,52 @@ def test_rule_test_stale_whole_set_fingerprint_refuses_changes(client, monkeypat
             repository.delete_list_rule(session, _rules()[0]["id"])
         elif change == "missing":
             data.pop("fingerprint")
+        elif change == "codes":
+            response = client.post("/config", data=_config_data(indstryty_cds="1426"),
+                                   follow_redirects=False)
+            assert response.status_code == 303
         else:
             data["fingerprint"] = "wrong"
     before = _database_state()
     def unexpected(*args, **kwargs):
         pytest.fail("지문 불일치 시 재분류 금지")
+    original = classifier.reclassify_notices
     monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
     # 미리보기를 거쳐도 옛 지문을 새 지문으로 바꾸어서는 안 된다.
     preview = _preview(client, data)
     fingerprint = re.search(r'name="fingerprint" value="([^"]*)"', preview.text)[1]
     assert fingerprint == data.get("fingerprint", "")
+    assert preview.status_code == 200
+    assert "미리보기 결과 (대상 기간 기준)" in preview.text
+    assert "현재 상태로 계산한 미리보기" in preview.text
+    reload_url = html.unescape(re.search(
+        r'<a href="([^"]+)">현재 규칙 다시 불러오기\(초안 버림\)</a>', preview.text)[1])
+    expected_filters = {"dt_from": [data["dt_from"]], "dt_to": [data["dt_to"]], "q": [data["search"]]}
+    assert parse_qs(urlsplit(reload_url).query) == expected_filters
     response = _apply(client, {**data, "fingerprint": fingerprint})
-    assert response.status_code == 400
-    assert "규칙 목록이 바뀌었습니다. 새로고침 후 다시 시도하세요." in response.text
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert parse_qs(urlsplit(location).query) == {"err": ["stale"], **expected_filters}
+    refreshed = client.get(location)
+    assert refreshed.status_code == 200
+    assert rule_test.STALE_MESSAGE in refreshed.text
+    new_fingerprint = re.search(r'name="fingerprint" value="([^"]*)"', refreshed.text)[1]
+    assert new_fingerprint != fingerprint
+    assert 'name="dt_from" value="2026-10-01"' in refreshed.text
+    assert 'name="dt_to" value="2026-10-07"' in refreshed.text
+    assert '&lt;검색&amp;&quot;값&gt;' in refreshed.text
+    assert "현재 상태로 계산한 미리보기" not in client.get(reload_url).text
+    assert client.get(location).text == refreshed.text  # 새로고침은 GET만 반복한다.
     assert _database_state() == before
+    monkeypatch.setattr(classifier, "reclassify_notices", original)
+    fresh_data = {kind: html.unescape(re.search(
+        rf'<textarea name="{kind}"[^>]*>(.*?)</textarea>', refreshed.text, re.S)[1])
+        for kind, _, _ in repository.RULE_FIELDS}
+    assert _apply(client, {**data, **fresh_data, "fingerprint": new_fingerprint}).status_code == 303
 
 
-def test_rule_test_apply_exception_rolls_back_everything(client, monkeypatch):
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_rule_test_apply_exception_rolls_back_everything(client, monkeypatch, error_type):
     data = _test_form(client, keyword="새 플랫폼")
     before = _database_state()
     original = classifier.reclassify_notices
@@ -1119,10 +1161,11 @@ def test_rule_test_apply_exception_rolls_back_everything(client, monkeypatch):
         assert kwargs.pop("commit") is True
         original(session, commit=False, **kwargs)
         session.flush()
-        raise RuntimeError("규칙 테스트 재분류 예외 주입")
+        raise error_type("규칙 테스트 재분류 예외 주입")
     monkeypatch.setattr(classifier, "reclassify_notices", fail)
     response = _apply(client, data)
     assert response.status_code == 400 and "변경을 취소" in response.text
+    assert "규칙 테스트 재분류 예외 주입" not in response.text
     assert _database_state() == before
     monkeypatch.setattr(classifier, "reclassify_notices", original)
     assert _apply(client, data).status_code == 303
@@ -1152,3 +1195,139 @@ def test_rule_test_preview_worker_thread_without_lock_and_apply_lock(client, mon
     assert locks == [True, False]
     assert len(loop_threads) == len(classify_threads) == 2
     assert all(worker != loop for worker, loop in zip(classify_threads, loop_threads))
+
+
+@pytest.mark.parametrize("kind", ["clsfc", "keyword", "negative"])
+@pytest.mark.parametrize("invalid", ["missing", "duplicate"])
+def test_rule_test_requires_each_draft_field_exactly_once(client, monkeypatch, kind, invalid):
+    assert _apply(client, _test_form(client, keyword="새 플랫폼")).status_code == 303
+    data = _test_form(client)
+    if invalid == "missing":
+        data.pop(kind)
+    else:
+        data[kind] = [data[kind], data[kind]]
+    before = _database_state()
+    def unexpected(*args, **kwargs):
+        pytest.fail("누락·중복 필드는 분류 전에 거부해야 합니다")
+    monkeypatch.setattr(classifier, "iter_classifications", unexpected)
+    monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
+    for response in (_preview(client, data), _apply(client, data)):
+        assert response.status_code == 400
+        assert "초안 입력칸을 각각 정확히 한 번 제출" in response.text
+        assert 'id="preview"' in response.text and "미리보기 결과" not in response.text
+        assert _database_state() == before
+
+
+def _sized_draft(client, size):
+    data = _test_form(client, clsfc="분류", keyword="새 플랫폼", negative="전산화단층")
+    for index, (kind, _, _) in enumerate(repository.RULE_FIELDS):
+        field_size = size // 3 + (1 if index < size % 3 else 0)
+        data[kind] += " " * (field_size - len(data[kind]))
+    assert sum(len(data[kind]) for kind, _, _ in repository.RULE_FIELDS) == size
+    return data
+
+
+@pytest.mark.parametrize("kind", ["clsfc", "keyword", "negative", "chars"])
+def test_rule_test_draft_limits_reject_before_classification_and_writes(client, monkeypatch, kind):
+    assert _apply(client, _test_form(client, keyword="새 플랫폼")).status_code == 303
+    data = (_sized_draft(client, 20_001) if kind == "chars" else
+            _test_form(client, **{kind: "\n".join(f"규칙{i:03}" for i in range(301))}))
+    before = _database_state()
+    def unexpected(*args, **kwargs):
+        pytest.fail("크기 초과 초안은 분류 전에 거부해야 합니다")
+    monkeypatch.setattr(classifier, "iter_classifications", unexpected)
+    monkeypatch.setattr(classifier, "reclassify_notices", unexpected)
+    for response in (_preview(client, data), _apply(client, data)):
+        assert response.status_code == 400
+        assert ("20,000자" if kind == "chars" else "종류별 300개") in response.text
+        assert "미리보기 결과" not in response.text
+        assert _database_state() == before
+
+
+@pytest.mark.parametrize("kind", ["clsfc", "keyword", "negative", "chars"])
+def test_rule_test_draft_limit_boundaries_allow_preview_and_apply(client, kind):
+    data = (_sized_draft(client, 20_000) if kind == "chars" else
+            _test_form(client, **{kind: "\n\n".join(f"규칙{i:03}" for i in range(300))}))
+    before = _database_state()
+    response = _preview(client, data)
+    assert response.status_code == 200 and "미리보기 결과" in response.text
+    assert _database_state() == before
+    assert _apply(client, data).status_code == 303
+    assert len(_rules()) == (3 if kind == "chars" else 300)
+    assert all(r["enabled"] for r in _rules())
+
+
+@pytest.mark.parametrize("kind", ["keyword", "negative"])
+def test_rule_test_spacing_values_remain_distinct_in_preview_and_apply(client, kind):
+    with main.SessionLocal() as session:
+        repository.add_list_rule(session, kind, "홈페이지")
+        repository.add_list_rule(session, kind, "시스템 구축")
+    data = _test_form(client, **{kind: "홈페이지\n홈 페이지\n시스템구축"})
+    before = _database_state()
+    assert _preview(client, data).status_code == 200
+    assert _database_state() == before
+    assert _apply(client, data).status_code == 303
+    assert [(r["value"], r["enabled"]) for r in _rules()] == [
+        ("홈페이지", True), ("시스템 구축", False), ("홈 페이지", True), ("시스템구축", True)]
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "date"])
+def test_rule_test_validation_error_preserves_input_and_fingerprint_for_retry(client, invalid):
+    data = _test_form(client, keyword="SW\nsw" if invalid == "duplicate" else "새 플랫폼",
+                      dt_from="bad" if invalid == "date" else "2026-10-01",
+                      dt_to="2026-10-07", search='<검색&"값>')
+    before = _database_state()
+    for response in (_preview(client, data), _apply(client, data)):
+        assert response.status_code == 400
+        assert f'name="fingerprint" value="{data["fingerprint"]}"' in response.text
+        assert f'<textarea name="keyword" rows="10">{data["keyword"]}</textarea>' in response.text
+        assert f'name="dt_from" value="{data["dt_from"]}"' in response.text
+        assert '&lt;검색&amp;&quot;값&gt;' in response.text
+        assert 'window.location.hash = "preview"' in response.text
+        assert _database_state() == before
+    data.update(keyword="새 플랫폼", dt_from="2026-10-01")
+    assert _apply(client, data).status_code == 303
+
+
+def test_rule_test_result_focus_date_format_and_apply_confirmation(client):
+    with main.SessionLocal() as session:
+        session.get(BidNotice, "K").bid_ntce_dt = datetime(2026, 10, 7, 12, 34, 56)
+        session.get(BidNotice, "C").bid_ntce_dt = None
+        session.commit()
+    data = _test_form(client, keyword="새 플랫폼", search="일반")
+    page = _preview(client, data).text
+    assert "미리보기 결과 (대상 기간 기준)" in page
+    assert '<div id="preview">' in page
+    assert 'window.location.hash = "preview"' in page
+    assert 'action="/config/rules/test#preview"' in page
+    assert 'formaction="/config/rules/test/apply#preview"' in page
+    assert "onclick=\"return confirm('규칙을 저장하고 저장된 전체 공고를 다시 분류합니다. 초안에 없는 켜진 규칙은 꺼집니다.');\"" in page
+    assert '<td>2026-10-07 12:34</td>' in page
+    assert "12:34:56" not in page
+    assert '<td>C</td><td>일반 용역</td><td></td>' in page
+
+
+def test_rule_test_fingerprint_ignores_match_code_order_and_duplicates(client):
+    data = _test_form(client)
+    with main.SessionLocal() as session:
+        repository.update_config(session, indstryty_cds=" 1468,1426,1468 ")
+    assert _test_form(client)["fingerprint"] == data["fingerprint"]
+    assert _apply(client, data).status_code == 303
+
+
+def test_rule_test_stale_invalid_preview_warns_without_claiming_a_result(client, monkeypatch):
+    data = _test_form(client, keyword="SW\nsw")
+    with main.SessionLocal() as session:
+        repository.add_list_rule(session, "negative", "새 규칙")
+    before = _database_state()
+    monkeypatch.setattr(classifier, "iter_classifications",
+                        lambda *args, **kwargs: pytest.fail("검증 오류 시 분류 금지"))
+    response = _preview(client, data)
+    assert response.status_code == 400
+    assert "중복된 규칙" in response.text
+    assert "다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌었습니다." in response.text
+    assert "현재 규칙 다시 불러오기(초안 버림)" in response.text
+    assert "현재 상태로 계산한 미리보기" not in response.text
+    assert "미리보기 결과" not in response.text
+    assert f'name="fingerprint" value="{data["fingerprint"]}"' in response.text
+    assert _database_state() == before

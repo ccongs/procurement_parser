@@ -23,6 +23,7 @@ import math
 import re
 import zipfile
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -4713,7 +4714,7 @@ def _render_rule_card(
     message = (f'<div class="msg err">{_e(err)}</div>' if err else
                f'<div class="msg ok">{_e(msg)}</div>' if msg else "")
     references = {rule["id"]: f'{rule["id"]}:{repository.list_rule_fingerprint(rule)}' for rule in rules}
-    for rule_type, title, help_text in rule_test.RULE_FIELDS:
+    for rule_type, title, help_text in repository.RULE_FIELDS:
         rows = "".join(
             f'<tr><td><label class="chk" style="padding-bottom:0;white-space:nowrap;">'
             f'<input type="checkbox" name="enabled_ids" value="{references[rule["id"]]}"'
@@ -5286,7 +5287,8 @@ def _rule_test_verdict(verdict: tuple, match_codes: frozenset[str]) -> str:
 def _rule_test_table(title: str, rows: list[dict], total: int, match_codes: frozenset[str]) -> str:
     body = "".join(
         f'<tr><td>{_e(row["no"])}</td><td>{_e(row["title"])}</td>'
-        f'<td>{_e(row["date"])}</td><td>{_rule_test_verdict(row["current"], match_codes)}</td>'
+        f'<td>{_e(row["date"].strftime("%Y-%m-%d %H:%M") if row["date"] else "")}</td>'
+        f'<td>{_rule_test_verdict(row["current"], match_codes)}</td>'
         f'<td>{_rule_test_verdict(row["draft"], match_codes)}</td></tr>' for row in rows
     ) or '<tr><td colspan="5" class="muted">해당 공고가 없습니다.</td></tr>'
     more = f'<p class="muted">외 {total - len(rows)}건</p>' if total > len(rows) else ""
@@ -5295,24 +5297,47 @@ def _rule_test_table(title: str, rows: list[dict], total: int, match_codes: froz
       <th>현재 근거</th><th>초안 근거</th></tr></thead><tbody>{body}</tbody></table></div>{more}</section>'''
 
 
-def _render_rule_test_page(data: dict[str, str], match_codes: frozenset[str],
-                           result: dict | None = None, err: str | None = None,
-                           msg: str | None = None) -> str:
+@dataclass
+class RuleTestView:
+    data: dict[str, str]
+    match_codes: frozenset[str]
+    result: dict | None = None
+    err: str | None = None
+    msg: str | None = None
+    stale: bool = False
+
+
+def _rule_test_filter_params(data) -> dict[str, str]:
+    return {"dt_from": data.get("dt_from", ""), "dt_to": data.get("dt_to", ""),
+            "q": data.get("search", "")}
+
+
+def _render_rule_test_page(view: RuleTestView) -> str:
+    data, match_codes = view.data, view.match_codes
+    result, err, msg = view.result, view.err, view.msg
     fields = "".join(
         f'<label class="field"><span class="flabel">{_e(title)} — 한 줄에 값 하나</span>'
         f'<textarea name="{kind}" rows="10">{_e(data.get(kind, ""))}</textarea>'
         f'<span class="help">{_e(help_text)}</span></label>'
-        for kind, title, help_text in rule_test.RULE_FIELDS
+        for kind, title, help_text in repository.RULE_FIELDS
     )
     message = (f'<div class="msg err">{_e(err)}</div>' if err else
                f'<div class="msg ok">{_e(msg)}</div>' if msg else "")
     results = ""
+    warning = ""
+    if view.stale:
+        reload_url = "/config/rules/test?" + urlencode(_rule_test_filter_params(data))
+        warning = '<div class="msg err">다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌었습니다.'
+        if result is not None:
+            warning += ' 현재 상태로 계산한 미리보기입니다.'
+        warning += '</div>'
+        warning += f'<a href="{_e(reload_url)}">현재 규칙 다시 불러오기(초안 버림)</a>'
     if result is not None:
         def basis_counts(key):
             counts = result[key + "_basis"]
             return f'업종 {counts["업종"]} · 분류 {counts["분류"]} · 키워드 {counts["키워드"]}'
 
-        results = f'''<section class="card" id="preview"><h2>미리보기 결과</h2>
+        results = f'''<section class="card"><h2>미리보기 결과 (대상 기간 기준)</h2>
           <p>대상 공고 {result["total"]}건</p>
           <p>현재 표시 {result["current"]}건 → 초안 표시 {result["draft"]}건</p>
           <p>현재: {basis_counts("current")}<br>초안: {basis_counts("draft")}</p>
@@ -5322,6 +5347,11 @@ def _render_rule_test_page(data: dict[str, str], match_codes: frozenset[str],
         if data.get("search", "").strip():
             results += _rule_test_table("공고명 검색 결과", result["search_rows"],
                                         result["search_total"], match_codes)
+    focus_script = ""
+    if result is not None or err or view.stale:
+        results = f'<div id="preview">{message}{warning}{results}</div>'
+        message = ""
+        focus_script = '<script>window.location.hash = "preview";</script>'
     return f'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>규칙 테스트</title><style>{BASE_CSS}
@@ -5333,7 +5363,7 @@ def _render_rule_test_page(data: dict[str, str], match_codes: frozenset[str],
       <main><section class="card"><h2>초안 편집</h2>{message}
       <p>현재 매칭 업종코드: <code>{_e(", ".join(sorted(match_codes)) or "없음")}</code>
       <span class="muted">(읽기 전용 · 변경은 설정에서)</span></p>
-      <form method="post" action="/config/rules/test">
+      <form method="post" action="/config/rules/test#preview">
       <input type="hidden" name="fingerprint" value="{_e(data.get("fingerprint", ""))}">
       <div class="draft-grid">{fields}</div>
       <div class="row" style="margin-top:18px;">
@@ -5344,40 +5374,47 @@ def _render_rule_test_page(data: dict[str, str], match_codes: frozenset[str],
       <label class="field"><span class="flabel">공고명 검색 (선택)</span>
         <input type="text" name="search" value="{_e(data.get("search", ""))}"></label>
       <button type="submit" class="submit">미리보기</button>
-      <button type="submit" class="submit go" formaction="/config/rules/test/apply">적용</button></div>
+      <button type="submit" class="submit go" formaction="/config/rules/test/apply#preview"
+        onclick="return confirm('규칙을 저장하고 저장된 전체 공고를 다시 분류합니다. 초안에 없는 켜진 규칙은 꺼집니다.');">적용</button></div>
       <p class="note">미리보기는 DB에 저장하지 않습니다. 날짜를 비우면 전체 기간을 조회합니다.
       공고명 검색은 선택 기간 안의 판정 확인 표를 보여줍니다.<br>
       적용하면 규칙을 저장하고 기간·검색 조건과 관계없이 저장된 전체 공고를 다시 분류합니다.
-      초안에서 뺀 규칙은 삭제하지 않고 끕니다.</p></form></section>{results}</main></body></html>'''
+      초안에서 뺀 규칙은 삭제하지 않고 끕니다.</p></form></section>{results}</main>{focus_script}</body></html>'''
 
 
-def _rule_test_view(data: dict[str, str] | None = None, *,
-                    preview: bool = False, err: str | None = None, msg: str | None = None):
+def _rule_test_view(data=None, *, preview: bool = False,
+                    err: str | None = None, msg: str | None = None) -> RuleTestView:
     with SessionLocal() as session, session.no_autoflush:
         rows = repository.list_list_rules(session)
         codes = classifier.load_match_codes(session)
+        fingerprint = rule_test.rules_fingerprint(rows, codes)
         if data is None:
-            data = {"fingerprint": rule_test.rules_fingerprint(rows)}
+            data = {"fingerprint": fingerprint}
             data.update({kind: "\n".join(row["value"] for row in rows
                                         if row["rule_type"] == kind and row["enabled"])
-                         for kind, _, _ in rule_test.RULE_FIELDS})
+                         for kind, _, _ in repository.RULE_FIELDS})
         result = None
+        stale = preview and data.get("fingerprint") != fingerprint
         if preview:
             try:
                 plan = rule_test.rule_plan(rows, rule_test.draft_values(data))
                 result = rule_test.preview(session, plan, codes, data)
-            except ValueError as exc:
+            except rule_test.DraftValidationError as exc:
                 err = str(exc)
-        return data, codes, result, err, msg
+            except Exception:
+                logger.exception("규칙 테스트 미리보기 실패")
+                err = "미리보기에 실패했습니다. 다시 시도해 주세요."
+        return RuleTestView(data=dict(data), match_codes=codes, result=result, err=err,
+                            msg=msg, stale=stale)
 
 
 @app.get("/config/rules/test", response_class=HTMLResponse)
 async def config_rules_test(request: Request):
-    data, codes, _, _, _ = await run_in_threadpool(_rule_test_view)
+    view = await run_in_threadpool(_rule_test_view)
     today = date.today()
-    data.update({"dt_from": request.query_params.get("dt_from", (today - timedelta(days=29)).isoformat()),
+    view.data.update({"dt_from": request.query_params.get("dt_from", (today - timedelta(days=29)).isoformat()),
                  "dt_to": request.query_params.get("dt_to", today.isoformat()),
-                 "search": request.query_params.get("search", "")})
+                 "search": request.query_params.get("q", request.query_params.get("search", ""))})
     msg = None
     if request.query_params.get("applied") == "1":
         msg = "규칙을 적용했습니다"
@@ -5385,31 +5422,36 @@ async def config_rules_test(request: Request):
         if all(re.fullmatch(r"[0-9]{1,12}", value) for value in counts):
             vis, u, c, k = map(int, counts)
             msg += f" — 표시 {vis}건(업종 {u} · 분류 {c} · 키워드 {k})"
-    return HTMLResponse(_render_rule_test_page(data, codes, msg=msg))
+        msg += " (저장된 전체 공고 기준)"
+    view.msg = msg
+    if request.query_params.get("err") == "stale":
+        view.err = rule_test.STALE_MESSAGE
+    return HTMLResponse(_render_rule_test_page(view))
 
 
 @app.post("/config/rules/test", response_class=HTMLResponse)
 async def config_rules_test_preview(request: Request):
-    data = {key: str(value) for key, value in (await request.form()).items()}
+    data = await request.form()
     view = await run_in_threadpool(_rule_test_view, data, preview=True)
-    return HTMLResponse(_render_rule_test_page(*view), status_code=400 if view[3] else 200)
+    return HTMLResponse(_render_rule_test_page(view), status_code=400 if view.err else 200)
 
 
 @app.post("/config/rules/test/apply")
 async def config_rules_test_apply(request: Request):
-    data = {key: str(value) for key, value in (await request.form()).items()}
+    data = await request.form()
 
     def save():
         with classifier.CLASSIFY_WRITE_LOCK, SessionLocal() as session, session.no_autoflush:
             try:
                 rows = repository.list_list_rules(session)
-                if data.get("fingerprint") != rule_test.rules_fingerprint(rows):
-                    raise ValueError(rule_test.STALE_MESSAGE)
+                codes = classifier.load_match_codes(session)
+                if data.get("fingerprint") != rule_test.rules_fingerprint(rows, codes):
+                    raise rule_test.StaleRulesError
                 values = rule_test.draft_values(data)
+                # 적용은 전체 공고를 재분류하지만 되돌려 줄 폼의 기간 입력도 검증한다.
                 rule_test.date_bounds(data)
                 plan = rule_test.rule_plan(rows, values)
                 rules = classifier.rule_set_from_rows(plan)
-                codes = classifier.load_match_codes(session)
                 rule_test.apply_plan(session, plan)
                 return classifier.reclassify_notices(session, rules=rules, match_codes=codes, commit=True)
             except Exception:
@@ -5418,17 +5460,20 @@ async def config_rules_test_apply(request: Request):
 
     try:
         stats = await run_in_threadpool(save)
-    except ValueError as exc:
+    except rule_test.StaleRulesError:
+        params = {"err": "stale", **_rule_test_filter_params(data)}
+        return RedirectResponse(url=f"/config/rules/test?{urlencode(params)}#preview", status_code=303)
+    except rule_test.DraftValidationError as exc:
         err = str(exc)
     except Exception:
         logger.exception("규칙 테스트 적용 실패 — 변경을 롤백했습니다.")
         err = "규칙 적용에 실패했습니다. 변경을 취소했습니다. 다시 시도해 주세요."
     else:
         params = {"applied": "1", **_classification_params(stats),
-                  **{key: data.get(key, "") for key in ("dt_from", "dt_to", "search")}}
+                  **_rule_test_filter_params(data)}
         return RedirectResponse(url=f"/config/rules/test?{urlencode(params)}", status_code=303)
     view = await run_in_threadpool(_rule_test_view, data, err=err)
-    return HTMLResponse(_render_rule_test_page(*view), status_code=400)
+    return HTMLResponse(_render_rule_test_page(view), status_code=400)
 
 
 def _parse_rule_id(raw: Any) -> tuple[int, str]:
