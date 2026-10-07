@@ -925,6 +925,12 @@ def set_default_exclude_keywords(session: Session, keyword_ids: list[int]) -> No
 
 # --- 목록 표시 규칙 ------------------------------------------------------
 
+RULE_FIELDS = (
+    ("clsfc", "IT 공공조달분류", "정식 분류명과 정확히 같을 때"),
+    ("keyword", "SW 키워드", "공고명 부분 일치(대소문자 무시). 영문·숫자 약어는 앞뒤가 영문·숫자가 아닐 때만. 값에 공백을 넣으면 공고명의 공백 유무와 관계없이 일치(예: '시스템 구축' → '시스템구축'·'시스템 구축')."),
+    ("negative", "판별 제외어", "공고명에 일치하면 키워드에 의한 표시에서 제외합니다."),
+)
+
 def list_rule_fingerprint(row: Mapping[str, Any] | ListRule) -> str:
     """렌더 당시 행 상태로 재사용된 SQLite id와 다른 탭의 변경을 구분한다.
 
@@ -953,15 +959,29 @@ def normalize_rule_value(raw: str) -> str:
     return " ".join(raw.split())
 
 
-def find_list_rule_duplicate(session: Session, rule_type: str, value: str) -> str | None:
-    """같은 종류에서 중복인 기존 값을 반환한다(키워드·제외어는 대소문자·공백 무시)."""
-    def key(raw: str) -> str:
-        normalized = normalize_rule_value(raw)
-        return normalized if rule_type == "clsfc" else "".join(normalized.split()).lower()
+def list_rule_value_key(rule_type: str, raw: str) -> str:
+    """공백을 정리한 값으로 비교하며 키워드·제외어는 대소문자를 무시한다."""
+    normalized = normalize_rule_value(raw)
+    return normalized if rule_type == "clsfc" else normalized.lower()
 
-    wanted = key(value)
+
+def validate_list_rule_value(rule_type: str, raw: str) -> str:
+    """카드 추가와 초안 편집에서 같은 값 검증을 사용한다."""
+    if rule_type not in {"clsfc", "keyword", "negative"}:
+        raise ValueError("알 수 없는 규칙 종류입니다.")
+    value = normalize_rule_value(raw)
+    if not value:
+        raise ValueError("추가할 규칙 값을 입력하세요.")
+    if len(value) > 100:
+        raise ValueError("규칙 값은 100자 이하여야 합니다.")
+    return value
+
+
+def find_list_rule_duplicate(session: Session, rule_type: str, value: str) -> str | None:
+    """같은 종류에서 중복인 기존 값을 반환한다(연속 공백 정리·대소문자 무시)."""
+    wanted = list_rule_value_key(rule_type, value)
     for existing in session.scalars(select(ListRule.value).where(ListRule.rule_type == rule_type)):
-        if key(existing) == wanted:
+        if list_rule_value_key(rule_type, existing) == wanted:
             return existing
     return None
 
@@ -970,13 +990,7 @@ def add_list_rule(
     session: Session, rule_type: str, value: str, *, commit: bool = True,
 ) -> bool:
     """공백을 정규화해 규칙을 추가한다. 같은 종류의 중복이면 False."""
-    if rule_type not in {"clsfc", "keyword", "negative"}:
-        raise ValueError("알 수 없는 규칙 종류입니다.")
-    value = normalize_rule_value(value)
-    if not value:
-        raise ValueError("추가할 규칙 값을 입력하세요.")
-    if len(value) > 100:
-        raise ValueError("규칙 값은 100자 이하여야 합니다.")
+    value = validate_list_rule_value(rule_type, value)
     if find_list_rule_duplicate(session, rule_type, value) is not None:
         return False
     session.add(ListRule(rule_type=rule_type, value=value, enabled=True))

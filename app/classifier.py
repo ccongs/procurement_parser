@@ -7,6 +7,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
@@ -171,11 +172,14 @@ def iter_classifications(
     rules: RuleSet,
     match_codes: Collection[str],
     bid_ntce_nos: Iterable[str] | None = None,
+    bid_ntce_dt_from: datetime | None = None,
+    bid_ntce_dt_to: datetime | None = None,
     batch_size: int = 500,
 ) -> Iterator[tuple[BidNotice, Classification]]:
     """공고·면허를 배치 조회해 판정만 내준다. 미리보기용으로 쓰기·커밋은 없다.
 
     flush 된 행만 대상이며, 호출자가 필요 시 flush 한다.
+    번호 미지정 시 공고일 시작 이상·끝 미만으로 키셋 배치를 조회한다.
     """
     if batch_size <= 0:
         raise ValueError("batch_size 는 양수여야 합니다.")
@@ -200,6 +204,10 @@ def iter_classifications(
                 query = query.where(BidNotice.bid_ntce_no.in_(batch))
             else:
                 query = query.limit(batch_size)
+                if bid_ntce_dt_from is not None:
+                    query = query.where(BidNotice.bid_ntce_dt >= bid_ntce_dt_from)
+                if bid_ntce_dt_to is not None:
+                    query = query.where(BidNotice.bid_ntce_dt < bid_ntce_dt_to)
                 if last_no is not None:
                     query = query.where(BidNotice.bid_ntce_no > last_no)
             notices = session.scalars(query).all()
