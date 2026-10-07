@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -332,7 +332,7 @@ def test_collect_latest_order_and_reclassify_all_bases(monkeypatch, db_engine):
 
     def classify(session, **kwargs):
         assert session.get(BidNotice, "IND").list_visible is False
-        assert session.get(BidLicenseLimit, ("IND", "001", "", "")) is not None
+        assert session.get(BidLicenseLimit, ("IND", "001", "", "hca738a74f")) is not None
         return original(session, **kwargs)
 
     monkeypatch.setattr(classifier, "reclassify_notices", classify)
@@ -364,10 +364,71 @@ def test_license_only_existing_notice_is_kept_and_reclassified(monkeypatch, db_e
     with Local() as session:
         assert session.get(BidNotice, "OLD").list_visible is True
         assert session.get(BidNotice, "OLD").match_basis == "업종"
-        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 1
-        assert session.get(BidLicenseLimit, ("OLD", "000", "", "")).lcns_cd == "1468"
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 2
+        assert session.get(BidLicenseLimit, ("OLD", "000", "", "hca738a74f")).lcns_cd == "1468"
     data = json.loads(run.detail_json)
-    assert data["by_call"]["license"]["kept"] == 1 and data["classify"]["total"] == 1
+    assert data["by_call"]["license"]["kept"] == 2 and data["classify"]["total"] == 1
+
+
+@pytest.mark.parametrize("stage", ["license", "license_fix"])
+@pytest.mark.parametrize("fields, codes, expected_keys", [
+    ({"lmtGrpNo": "", "lmtSno": ""}, ("1468", "9999"),
+     {("", "hca738a74f"), ("", "hab5757036")}),
+    ({"lmtGrpNo": "", "lmtSno": ""}, ("1468", "1468"), {("", "hca738a74f")}),
+    ({"lmtGrpNo": "1", "lmtSno": ""}, ("1468", "9999"), None),
+    ({"lmtGrpNo": "", "lmtSno": "2"}, ("1468", "9999"), None),
+    ({"lmtGrpNo": "1", "lmtSno": "2"}, ("1468",), {("1", "2")}),
+])
+def test_optional_license_keys_preserved_and_updated_on_recollection(
+    monkeypatch, db_engine, stage, fields, codes, expected_keys,
+):
+    _, Local = db_engine
+    rows = [_license("NEW", code=code, **fields, rgstDt="2026-05-01 09:00:00")
+            for code in codes]
+    replay = False
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("NEW")], "1")
+        if params["inqryDiv"] == "1" and stage == "license_fix" and not replay:
+            return _ok_result()
+        return _ok_result(rows, str(len(rows)))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    assert run.status == "success" and run.error_msg is None
+    detail = json.loads(run.detail_json)["by_call"][stage]
+    assert detail["total_count"] == detail["unique_items"] == len(rows)
+    assert sum(params["inqryDiv"] == "2" for _, params in calls) == (stage == "license_fix")
+    with Local() as session:
+        stored = session.scalars(select(BidLicenseLimit)).all()
+        keys = {(row.lmt_grp_no, row.lmt_sno) for row in stored}
+        timestamps = {(row.lmt_grp_no, row.lmt_sno): row.collected_at for row in stored}
+        assert len(stored) == len(set(codes))
+        assert {row.lcns_cd for row in stored} == set(codes)
+        if expected_keys is not None:
+            assert keys == expected_keys
+        else:
+            assert all(group == fields["lmtGrpNo"] and sequence.startswith("h")
+                       and len(sequence) == 10 for group, sequence in keys)
+        notice = session.get(BidNotice, "NEW")
+        assert (notice.list_visible, notice.match_basis, notice.matched_indstryty_cds) == (
+            True, "업종", "1468")
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+    # 다음 실행의 일괄 응답으로 같은 면허를 재수신하고, 등록일시만 갱신한다.
+    replay = True
+    rows = [{**row, "rgstDt": "2026-06-01 10:00:00"} for row in rows]
+    next_end = WIN_END + timedelta(days=1)
+    rerun = collector.collect_window(WIN_END, next_end)
+    assert rerun.status == "success" and rerun.error_msg is None
+    with Local() as session:
+        stored = session.scalars(select(BidLicenseLimit)).all()
+        assert len(stored) == len(keys)
+        assert {(row.lmt_grp_no, row.lmt_sno) for row in stored} == keys
+        assert all(row.rgst_dt == datetime(2026, 6, 1, 10) for row in stored)
+        assert {(row.lmt_grp_no, row.lmt_sno): row.collected_at for row in stored} == timestamps
+        assert session.get(AppConfig, 1).last_success_dt == next_end
 
 
 def test_missing_license_only_current_limited_notices_are_called(monkeypatch, db_engine):
@@ -587,7 +648,7 @@ def test_failed_stage_partial_keeps_received_rows_and_retry_sum(monkeypatch, db_
         assert data["by_call"]["license_fix"]["failed"] == ["NEW"]
     with Local() as session:
         assert session.get(BidNotice, "NEW") is not None
-        assert session.get(BidLicenseLimit, ("NEW", "001", "", "")) is not None
+        assert session.get(BidLicenseLimit, ("NEW", "001", "", "hca738a74f")) is not None
         assert session.get(AppConfig, 1).last_success_dt == WIN_BGN
 
 
@@ -727,7 +788,7 @@ def test_classification_failure_rolls_back_notices_raw_and_licenses(monkeypatch,
     def fail_before_commit(session, **kwargs):
         session.flush()
         assert session.get(BidNotice, "NEW").list_visible is False
-        assert session.get(BidLicenseLimit, ("NEW", "000", "", "")) is not None
+        assert session.get(BidLicenseLimit, ("NEW", "000", "", "hca738a74f")) is not None
         session.get(BidNotice, "OLD").list_visible = False
         session.flush()
         raise RuntimeError("가짜 분류 실패")
@@ -1186,7 +1247,7 @@ def test_finish_run_commit_failure_rolls_back_notices_licenses_and_classificatio
             assert session.get(BidNotice, "OLD").bid_ntce_nm == "변경"
             assert session.get(BidNotice, "OLD").matched_indstryty_cds == "1468"
             assert session.get(BidNotice, "NEW").list_visible is True
-            assert session.get(BidLicenseLimit, ("NEW", "000", "", "")) is not None
+            assert session.get(BidLicenseLimit, ("NEW", "000", "", "hca738a74f")) is not None
             assert run.status == "success" and run.run_finished_at is not None
             raise RuntimeError("가짜 finish_run 커밋 직전 실패")
 

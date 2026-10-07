@@ -461,12 +461,12 @@ def test_build_detail_json_empty_ord_changes():
 ])
 def test_license_values(name, code, expected_name):
     row = collector.license_values({
-        "bidNtceNo": " A ", "bidNtceOrd": " 000 ", "lmtGrpNo": " 1 ",
+        "bidNtceNo": " A ", "bidNtceOrd": " 000 ", "lmtGrpNo": " 1 ", "lmtSno": " 2 ",
         "lcnsLmtNm": name, "permsnIndstrytyList": "[A/1253],[B/1143],[C/1253]",
         "rgstDt": "2026-05-01 09:10:11",
     })
     assert row == {
-        "bid_ntce_no": "A", "bid_ntce_ord": "000", "lmt_grp_no": "1", "lmt_sno": "",
+        "bid_ntce_no": "A", "bid_ntce_ord": "000", "lmt_grp_no": "1", "lmt_sno": "2",
         "lcns_cd": code, "lcns_nm": expected_name, "permsn_cds": "1253,1143",
         "rgst_dt": datetime(2026, 5, 1, 9, 10, 11),
     }
@@ -478,6 +478,26 @@ def test_license_values_missing_fields():
     for date in (None, "bad date"):
         row = collector.license_values({"bidNtceNo": "A", "bidNtceOrd": "000", "rgstDt": date})
         assert row["rgst_dt"] is None and row["permsn_cds"] is None
+
+
+@pytest.mark.parametrize("fields, expected_group, expected_sequence", [
+    ({}, "", "hca738a74f"),
+    ({"lmtGrpNo": None, "lmtSno": "  "}, "", "hca738a74f"),
+    ({"lmtGrpNo": "1"}, "1", "h9ca985a7c"),
+    ({"lmtSno": "2"}, "", "hda3c40e7c"),
+    ({"lcnsLmtNm": "면허/9999"}, "", "hab5757036"),
+    ({"lcnsLmtNm": "다른 면허/1468"}, "", "h3395c4384"),
+    ({"permsnIndstrytyList": "[허용/9999]"}, "", "h041691ff9"),
+    ({"lmtGrpNo": "2"}, "2", "h4735eb080"),
+    ({"lmtSno": "3"}, "", "h893a849d0"),
+    ({"lmtGrpNo": " 1 ", "lmtSno": " 2 "}, "1", "2"),
+])
+def test_license_values_content_key_for_optional_fields(fields, expected_group, expected_sequence):
+    row = collector.license_values({
+        "bidNtceNo": "A", "bidNtceOrd": "000", "lcnsLmtNm": "면허/1468", **fields,
+    })
+    assert (row["lmt_grp_no"], row["lmt_sno"]) == (expected_group, expected_sequence)
+    assert len(row["lmt_sno"]) <= 10
 
 
 def test_upsert_notice_defaults_hidden_and_preserves_classification(session):
@@ -516,10 +536,11 @@ def test_upsert_license_limits_batched_last_wins_and_preserves_timestamp(session
     assert result == (0, 501)
     assert len(selects) == 3
     assert all(" IN " in sql and len(params) <= 800 for sql, params in selects)
-    row = session.get(BidLicenseLimit, ("A-0", "000", "", ""))
+    key = collector._license_key(rows[0])
+    row = session.get(BidLicenseLimit, key)
     assert row.collected_at == t1 and row.lcns_cd == "1470"
     session.rollback()
-    assert session.get(BidLicenseLimit, ("A-0", "000", "", "")).lcns_cd == "1468"
+    assert session.get(BidLicenseLimit, key).lcns_cd == "1468"
     assert repository.upsert_license_limits(session, [], t2) == (0, 0)
 
 

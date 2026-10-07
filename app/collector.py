@@ -6,6 +6,7 @@ API 조회 중에는 공고·면허를 쓰지 않고, 단일 세션에서 upsert
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -106,20 +107,26 @@ def license_values(item: dict) -> dict[str, Any] | None:
     no, ord_ = _text(item.get("bidNtceNo")), _text(item.get("bidNtceOrd"))
     if not no or not ord_:
         return None
+    group, sequence = _text(item.get("lmtGrpNo")), _text(item.get("lmtSno"))
     name = _text(item.get("lcnsLmtNm"))
+    allowed_list = _text(item.get("permsnIndstrytyList"))
+    if not group or not sequence:
+        # 선택 키가 비어도 서로 다른 면허는 보존하고, 같은 내용은 재수신 시 갱신한다.
+        content = "|".join((group, sequence, name, allowed_list))
+        sequence = "h" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:9]
     if "/" in name:
         name, code = (part.strip() for part in name.rsplit("/", 1))
     else:
         code = None
     codes = []
-    for entry in re.findall(r"\[([^\[\]]*)\]", _text(item.get("permsnIndstrytyList"))):
+    for entry in re.findall(r"\[([^\[\]]*)\]", allowed_list):
         if "/" in entry:
             allowed_code = entry.rsplit("/", 1)[1].strip()
             if allowed_code and allowed_code not in codes:
                 codes.append(allowed_code)
     return {
         "bid_ntce_no": no, "bid_ntce_ord": ord_,
-        "lmt_grp_no": _text(item.get("lmtGrpNo")), "lmt_sno": _text(item.get("lmtSno")),
+        "lmt_grp_no": group, "lmt_sno": sequence,
         "lcns_cd": code or None, "lcns_nm": name or None,
         "permsn_cds": ",".join(codes) or None, "rgst_dt": parse_datetime(item.get("rgstDt")),
     }
