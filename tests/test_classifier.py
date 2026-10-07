@@ -6,6 +6,7 @@ from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, event, select
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app import db
@@ -599,3 +600,135 @@ def test_seed_failure_rolls_back_rules_and_marker_then_retries(database, failure
     with local() as session:
         assert len(session.scalars(select(ListRule)).all()) == 40
         assert session.get(SchemaMigration, SEED_NAME) is not None
+
+
+ONCE_JOBS = [
+    ("_seed_list_rules", SEED_NAME, "SELECT list_rule.rule_type"),
+    ("_migrate_match_basis_backfill", "phase13_match_basis_backfill", "UPDATE bid_notice SET match_basis="),
+]
+
+
+def _prepare_once_notices(local):
+    with local() as session:
+        session.add_all([
+            _notice("VISIBLE", list_visible=True),
+            _notice("HIDDEN"),
+            _notice("FILLED", list_visible=True, match_basis="분류", match_detail="기존 근거"),
+        ])
+        session.commit()
+
+
+def _assert_once_result(local, name, *, completed=True):
+    with local() as session:
+        markers = session.scalars(select(SchemaMigration)).all()
+        assert [row.name for row in markers] == ([name] if completed else [])
+        assert all(row.applied_at is not None for row in markers)
+        rules = session.scalars(select(ListRule).order_by(ListRule.id)).all()
+        expected_rules = DEFAULT_LIST_RULES if completed and name == SEED_NAME else ()
+        assert tuple((row.rule_type, row.value) for row in rules) == expected_rules
+        assert all(row.enabled for row in rules)
+        basis = "업종" if completed and name != SEED_NAME else None
+        assert session.get(BidNotice, "VISIBLE").match_basis == basis
+        assert session.get(BidNotice, "HIDDEN").match_basis is None
+        filled = session.get(BidNotice, "FILLED")
+        assert filled.match_basis == "분류" and filled.match_detail == "기존 근거"
+        assert all(row.collected_at == NOW and row.updated_at == NOW
+                   for row in session.scalars(select(BidNotice)))
+
+
+@pytest.mark.parametrize("function_name,name,work_start", ONCE_JOBS)
+@pytest.mark.parametrize("race_error", ["integrity", "operational"])
+def test_once_other_connection_commits_after_missing_marker_check(
+    database, function_name, name, work_start, race_error,
+):
+    engine, local = database
+    _prepare_once_notices(local)
+    run = getattr(db, function_name)
+    connections = []
+    errors = []
+
+    def finish_on_other_connection(conn, cursor, statement, parameters, context, executemany):
+        if not statement.startswith(work_start):
+            return
+        connections.append(conn)
+        if len(connections) == 1:
+            # 외부 호출이 완료 기록 부재를 읽은 직후·작업 SQL 실행 전에 경쟁자를 완료시킨다.
+            run()
+            if race_error == "operational":
+                raise OperationalError(statement, parameters, Exception("경쟁 잠금 오류 주입"))
+
+    def record_error(context):
+        errors.append(context.sqlalchemy_exception)
+
+    event.listen(engine, "before_cursor_execute", finish_on_other_connection)
+    event.listen(engine, "handle_error", record_error)
+    try:
+        run()
+    finally:
+        event.remove(engine, "before_cursor_execute", finish_on_other_connection)
+        event.remove(engine, "handle_error", record_error)
+    assert len(connections) == 2 and connections[0] is not connections[1]
+    if race_error == "integrity":
+        assert len(errors) == 1 and isinstance(errors[0], IntegrityError)
+    _assert_once_result(local, name)
+
+
+@pytest.mark.parametrize("function_name,name,work_start", ONCE_JOBS)
+@pytest.mark.parametrize("failure_point", ["work", "marker_insert"])
+def test_once_operational_error_without_marker_retries_once(
+    database, function_name, name, work_start, failure_point,
+):
+    engine, local = database
+    _prepare_once_notices(local)
+    statements = []
+    failures = []
+    target = ("INSERT INTO schema_migration " if failure_point == "marker_insert" else
+              "INSERT INTO list_rule " if name == SEED_NAME else work_start)
+
+    def fail_first_attempt(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+        if statement.startswith(target) and not failures:
+            failures.append(True)
+            # SQL 실행 뒤 실패시켜 작업·완료 기록의 실제 롤백까지 검증한다.
+            raise OperationalError(statement, parameters, Exception("첫 시도 실패 주입"))
+
+    event.listen(engine, "after_cursor_execute", fail_first_attempt)
+    try:
+        getattr(db, function_name)()
+    finally:
+        event.remove(engine, "after_cursor_execute", fail_first_attempt)
+    assert failures == [True]
+    assert sum(statement.startswith(work_start) for statement in statements) == 2
+    # 최초 확인 → 롤백 뒤 새 트랜잭션 확인 → 재시도 확인.
+    assert sum("FROM schema_migration" in statement for statement in statements) == 3
+    _assert_once_result(local, name)
+
+
+@pytest.mark.parametrize("function_name,name,work_start", ONCE_JOBS)
+@pytest.mark.parametrize("error_type", [IntegrityError, OperationalError])
+def test_once_two_database_failures_without_marker_raise_last_error(
+    database, function_name, name, work_start, error_type,
+):
+    engine, local = database
+    _prepare_once_notices(local)
+    failures = []
+    checks = []
+
+    def fail_each_marker_insert(conn, cursor, statement, parameters, context, executemany):
+        if "FROM schema_migration" in statement:
+            checks.append(conn)
+        if statement.startswith("INSERT INTO schema_migration "):
+            error = error_type(statement, parameters, Exception("연속 실패 주입"))
+            failures.append(error)
+            raise error
+
+    event.listen(engine, "after_cursor_execute", fail_each_marker_insert)
+    try:
+        with pytest.raises(error_type) as raised:
+            getattr(db, function_name)()
+    finally:
+        event.remove(engine, "after_cursor_execute", fail_each_marker_insert)
+    assert len(failures) == 2 and raised.value is failures[-1]
+    assert len(checks) == 4  # 두 시도 모두 롤백 후 완료 여부를 다시 확인한다.
+    assert checks[0] is not checks[1] and checks[2] is not checks[3]
+    _assert_once_result(local, name, completed=False)
