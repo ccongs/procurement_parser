@@ -8,10 +8,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from sqlalchemy import select
-
 from app import classifier, repository
-from app.models import BidNotice
 
 
 MAX_RULES_PER_KIND = 300
@@ -124,11 +121,6 @@ def date_bounds(data: dict[str, str]) -> tuple[datetime | None, datetime | None]
 def preview(session, plan: list[dict], match_codes, data: dict[str, str]) -> dict:
     """기간 내 전체를 집계하되 화면용 행은 상한까지만 보관한다."""
     start, end = date_bounds(data)
-    query = select(BidNotice.bid_ntce_no)
-    if start:
-        query = query.where(BidNotice.bid_ntce_dt >= start)
-    if end:
-        query = query.where(BidNotice.bid_ntce_dt < end)
     stats = {"total": 0, "current": 0, "draft": 0, "added": 0, "removed": 0,
              "current_basis": dict.fromkeys(("업종", "분류", "키워드"), 0),
              "draft_basis": dict.fromkeys(("업종", "분류", "키워드"), 0),
@@ -137,7 +129,7 @@ def preview(session, plan: list[dict], match_codes, data: dict[str, str]) -> dic
     with session.no_autoflush:
         for notice, result in classifier.iter_classifications(
             session, rules=classifier.rule_set_from_rows(plan), match_codes=match_codes,
-            bid_ntce_nos=session.scalars(query),
+            bid_ntce_dt_from=start, bid_ntce_dt_to=end,
         ):
             stats["total"] += 1
             for label, visible, basis in (("current", notice.list_visible, notice.match_basis),

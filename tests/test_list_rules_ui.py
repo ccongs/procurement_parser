@@ -943,6 +943,12 @@ def _apply(client, data):
     return client.post("/config/rules/test/apply", data=data, follow_redirects=False)
 
 
+def _assert_rule_test_error_at_top(page):
+    assert 'id="preview"' not in page
+    assert 'window.location.hash' not in page
+    assert page.index("초안 편집") < page.index('<div class="msg err">') < page.index('<textarea')
+
+
 def test_rule_test_link_defaults_enabled_only_and_escaping(client):
     with main.SessionLocal() as session:
         repository.add_list_rule(session, "clsfc", '<분류&"명>')
@@ -1015,13 +1021,35 @@ def test_rule_test_preview_date_boundaries_and_search_does_not_filter_summary(cl
     assert _database_state() == before
 
 
+@pytest.mark.parametrize("dt_from,dt_to", [
+    ("", ""), ("2026-10-07", ""), ("", "2026-10-07"), ("2026-10-07", "2026-10-07"),
+])
+def test_rule_test_preview_passes_date_bounds_without_number_targets(client, monkeypatch, dt_from, dt_to):
+    data = _test_form(client, keyword="새플랫폼", dt_from=dt_from, dt_to=dt_to)
+    original = classifier.iter_classifications
+    calls = []
+
+    def classify(*args, **kwargs):
+        assert "bid_ntce_nos" not in kwargs
+        calls.append((kwargs["bid_ntce_dt_from"], kwargs["bid_ntce_dt_to"]))
+        yield from original(*args, **kwargs)
+
+    monkeypatch.setattr(classifier, "iter_classifications", classify)
+    before = _database_state()
+    response = _preview(client, data)
+    assert response.status_code == 200 and "대상 공고 4건" in response.text
+    assert calls == [(datetime(2026, 10, 7) if dt_from else None,
+                      datetime(2026, 10, 8) if dt_to else None)]
+    assert _database_state() == before
+
+
 @pytest.mark.parametrize("removed", [False, True])
 def test_rule_test_preview_row_caps_and_search_cap(client, removed):
     with main.SessionLocal() as session:
         now = datetime(2026, 10, 7)
         session.add_all([BidNotice(bid_ntce_no=f"CAP-{i:03}", bid_ntce_nm="경계키워드 <공고>",
                                   bid_ntce_dt=now, collected_at=now, updated_at=now)
-                         for i in range(203)])
+                         for i in range(503)])
         if removed:
             repository.add_list_rule(session, "keyword", "경계키워드", commit=False)
         classifier.reclassify_notices(session)
@@ -1029,10 +1057,10 @@ def test_rule_test_preview_row_caps_and_search_cap(client, removed):
     before = _database_state()
     page = _preview(client, data).text
     section = page.split('<h2>새로 숨김' if removed else '<h2>새로 표시', 1)[1].split('</section>', 1)[0]
-    assert '(203건)' in section and section.count('<tr><td>') == 200
-    assert '외 3건' in section and 'CAP-200' not in section
+    assert '(503건)' in section and section.count('<tr><td>') == 200
+    assert '외 303건' in section and 'CAP-200' not in section
     section = page.split('<h2>공고명 검색 결과', 1)[1]
-    assert section.count('<tr><td>') == 100 and '외 103건' in section
+    assert section.count('<tr><td>') == 100 and '외 403건' in section
     assert '&lt;공고&gt;' in section and '<공고>' not in section
     assert _database_state() == before
 
@@ -1053,7 +1081,7 @@ def test_rule_test_invalid_draft_never_classifies_or_writes(client, monkeypatch,
         assert response.status_code == 400
         assert "100자" in response.text or "중복된 규칙" in response.text
         assert "미리보기 결과" not in response.text
-        assert 'id="preview"' in response.text
+        _assert_rule_test_error_at_top(response.text)
         assert _database_state() == before
 
 
@@ -1064,6 +1092,7 @@ def test_rule_test_invalid_date_never_writes(client, start, end):
     for response in (_preview(client, data), _apply(client, data)):
         assert response.status_code == 400
         assert "날짜를 확인" in response.text
+        _assert_rule_test_error_at_top(response.text)
         assert _database_state() == before
 
 
@@ -1317,6 +1346,7 @@ def test_rule_test_draft_limits_reject_before_classification_and_writes(client, 
         assert response.status_code == 400
         assert ("20,000자" if kind == "chars" else "종류별 300개") in response.text
         assert "미리보기 결과" not in response.text
+        _assert_rule_test_error_at_top(response.text)
         assert _database_state() == before
 
 
@@ -1373,7 +1403,7 @@ def test_rule_test_validation_error_preserves_input_and_fingerprint_for_retry(cl
         assert f'<textarea name="keyword" rows="10">{data["keyword"]}</textarea>' in response.text
         assert f'name="dt_from" value="{data["dt_from"]}"' in response.text
         assert '&lt;검색&amp;&quot;값&gt;' in response.text
-        assert 'window.location.hash = "preview"' in response.text
+        _assert_rule_test_error_at_top(response.text)
         assert _database_state() == before
     data.update(keyword="새 플랫폼", dt_from="2026-10-01")
     assert _apply(client, data).status_code == 303
@@ -1419,5 +1449,6 @@ def test_rule_test_stale_invalid_preview_warns_without_claiming_a_result(client,
     assert "현재 규칙 다시 불러오기(초안 버림)" in response.text
     assert "현재 상태로 계산한 미리보기" not in response.text
     assert "미리보기 결과" not in response.text
+    _assert_rule_test_error_at_top(response.text)
     assert f'name="fingerprint" value="{data["fingerprint"]}"' in response.text
     assert _database_state() == before

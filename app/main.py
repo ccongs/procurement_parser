@@ -5358,6 +5358,7 @@ def _render_rule_test_page(view: RuleTestView) -> str:
     if result is not None or view.focus_preview:
         results = f'<div id="preview">{message}{warning}{results}</div>'
         message = ""
+        warning = ""
         focus_script = '<script>window.location.hash = "preview";</script>'
     return f'''<!doctype html><html lang="ko"><head><meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -5367,7 +5368,7 @@ def _render_rule_test_page(view: RuleTestView) -> str:
       textarea {{ width:100%; padding:8px; border:1px solid #cbd2dc; border-radius:6px; font:inherit; }}
       .help {{ margin-top:6px; color:#6b7280; font-size:12px; }}
       </style></head><body><header><h1>규칙 테스트</h1><a class="hdr-btn" href="/config#rules">설정</a></header>
-      <main><section class="card"><h2>초안 편집</h2>{message}
+      <main><section class="card"><h2>초안 편집</h2>{message}{warning}
       <p>현재 매칭 업종코드: <code>{_e(", ".join(sorted(match_codes)) or "없음")}</code>
       <span class="muted">(읽기 전용 · 변경은 설정에서)</span></p>
       <form method="post" action="/config/rules/test#preview">
@@ -5407,6 +5408,7 @@ def _rule_test_view(data: Mapping[str, Any] | None = None, *, preview: bool = Fa
                 plan = rule_test.rule_plan(rows, rule_test.draft_values(data))
                 result = rule_test.preview(session, plan, codes, data)
             except rule_test.FormStructureError:
+                # 라우트에서 먼저 걸러지며, 여기서는 일반 실패로 삼키지 않는다.
                 raise
             except rule_test.DraftValidationError as exc:
                 err = str(exc)
@@ -5414,7 +5416,7 @@ def _rule_test_view(data: Mapping[str, Any] | None = None, *, preview: bool = Fa
                 logger.exception("규칙 테스트 미리보기 실패")
                 err = "미리보기에 실패했습니다. 다시 시도해 주세요."
         return RuleTestView(data=dict(data), match_codes=codes, result=result, err=err,
-                            msg=msg, stale=stale, focus_preview=preview or err is not None)
+                            msg=msg, stale=stale, focus_preview=result is not None)
 
 
 @app.get("/config/rules/test", response_class=HTMLResponse)

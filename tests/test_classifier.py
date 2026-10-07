@@ -511,6 +511,61 @@ def test_target_batches_bound_parameters_and_only_process_existing_notices(datab
         assert not session.dirty and _snapshot(session) == before
 
 
+@pytest.mark.parametrize("start,end,expected", [
+    (None, None, "ABCDEFGH"),
+    (datetime(2026, 10, 7), None, "CDFGH"),
+    (None, datetime(2026, 10, 10), "BCDFH"),
+    (datetime(2026, 10, 7), datetime(2026, 10, 10), "CDFH"),
+    (datetime(2026, 10, 7), datetime(2026, 10, 7), ""),
+    (datetime(2026, 10, 11), None, ""),
+])
+def test_keyset_date_bounds_match_number_targets_across_batches(database, start, end, expected):
+    engine, local = database
+    dates = [None, datetime(2026, 10, 6, 23, 59, 59), datetime(2026, 10, 7),
+             datetime(2026, 10, 8, 12), None, datetime(2026, 10, 9, 23, 59, 59),
+             datetime(2026, 10, 10), datetime(2026, 10, 8, 12)]
+    with local() as session:
+        for no, dt in zip("ABCDEFGH", dates):
+            session.add_all([_notice(no, bid_ntce_dt=dt, bid_ntce_nm="홈페이지"),
+                             _license(no, "1468" if no in "BDH" else "9999")])
+        session.commit()
+        before = _snapshot(session)
+        query = select(BidNotice.bid_ntce_no)
+        if start is not None:
+            query = query.where(BidNotice.bid_ntce_dt >= start)
+        if end is not None:
+            query = query.where(BidNotice.bid_ntce_dt < end)
+        old_results = [(row.bid_ntce_no, result) for row, result in iter_classifications(
+            session, rules=DEFAULT_RULES, match_codes=("1468",),
+            bid_ntce_nos=session.scalars(query), batch_size=2,
+        )]
+        queries = []
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            queries.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            results = [(row.bid_ntce_no, result) for row, result in iter_classifications(
+                session, rules=DEFAULT_RULES, match_codes=("1468",),
+                bid_ntce_dt_from=start, bid_ntce_dt_to=end, batch_size=2,
+            )]
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
+        assert [no for no, _ in results] == list(expected)
+        assert results == old_results
+        notice_queries = [query for query in queries if "FROM bid_notice" in query]
+        assert len(notice_queries) == (len(expected) + 1) // 2 + 1
+        assert all("LIMIT" in query for query in notice_queries)
+        assert all(("bid_notice.bid_ntce_dt >=" in query) == (start is not None)
+                   for query in notice_queries)
+        assert all(("bid_notice.bid_ntce_dt <" in query) == (end is not None)
+                   for query in notice_queries)
+        assert all("bid_notice.bid_ntce_no >" in query for query in notice_queries[1:])
+        assert all(query.startswith("SELECT") for query in queries)
+        assert not session.dirty and _snapshot(session) == before
+
+
 @pytest.mark.parametrize("targets", [[], ["", " ", "\t\n"]])
 def test_empty_normalized_targets_do_not_query(database, targets):
     engine, local = database
