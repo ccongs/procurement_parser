@@ -76,6 +76,16 @@ def test_dedup_notices_skips_blank_pk():
     assert [i["bidNtceNo"] for i in items] == ["X"]
 
 
+@pytest.mark.parametrize("orders", [
+    ("0001", "1", "001"), ("0001", "001", "1"),
+    ("1", "0001", "001"), ("1", "001", "0001"),
+    ("001", "0001", "1"), ("001", "1", "0001"),
+])
+def test_dedup_notices_recognizes_equivalent_order_notation(orders):
+    notices = [{"bidNtceNo": "SAME", "bidNtceOrd": order} for order in orders]
+    assert dedup_notices(notices) == [notices[0]]
+
+
 # --- 4. fmt_dt ---------------------------------------------------------
 def test_fmt_dt():
     assert fmt_dt(datetime(2025, 7, 1, 9, 0)) == "202507010900"
@@ -544,10 +554,14 @@ def test_license_endpoint_params_and_base_url():
 
 
 @pytest.mark.parametrize("source", ["bulk", "db"])
-def test_missing_license_targets_recognizes_padded_current_order(session, source):
+@pytest.mark.parametrize("notice_order", ["0001", "1", "001"])
+@pytest.mark.parametrize("license_order", ["0001", "1", "001"])
+def test_missing_license_targets_recognizes_padded_current_order(
+    session, source, notice_order, license_order,
+):
     from app.models import BidLicenseLimit
-    notices = [{"bidNtceNo": "SAME", "bidNtceOrd": "1", "indstrytyLmtYn": "Y"}]
-    row = collector.license_values({"bidNtceNo": "SAME", "bidNtceOrd": "001"})
+    notices = [{"bidNtceNo": "SAME", "bidNtceOrd": notice_order, "indstrytyLmtYn": "Y"}]
+    row = collector.license_values({"bidNtceNo": "SAME", "bidNtceOrd": license_order})
     licenses = {}
     if source == "bulk":
         licenses[collector._license_key(row)] = row

@@ -393,7 +393,7 @@ def test_missing_license_only_current_limited_notices_are_called(monkeypatch, db
     assert run.status == "success"
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": 2, "called": 2, "found": 1,
-                   "skipped": 0, "failed": [], "retry_count": 0}
+                   "failed": [], "retry_count": 0}
     with Local() as session:
         assert session.get(BidNotice, "MISS").list_visible is False
         assert session.get(BidNotice, "FIX").match_basis == "업종"
@@ -422,27 +422,67 @@ def test_legacy_industry_preserved_when_fix_finds_no_rows(monkeypatch, db_engine
 
 
 @pytest.mark.parametrize("count", [199, 200, 205])
-def test_missing_license_fix_cap(monkeypatch, db_engine, count):
+def test_missing_license_fix_queries_all_targets(monkeypatch, db_engine, count):
     _, Local = db_engine
     with Local() as session:
         session.get(AppConfig, 1).num_of_rows = 300
         session.get(AppConfig, 1).last_success_dt = WIN_BGN
         session.commit()
     notices = [_notice(f"A-{i}") for i in range(count)]
-    calls = _fake_api(monkeypatch, lambda op, params: _ok_result(notices, str(count))
-                      if op == collector.OPERATION else _ok_result())
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result(notices, str(count))
+        if params["inqryDiv"] == "2" and int(params["bidNtceNo"].split("-")[1]) % 2 == 0:
+            return _ok_result([_license(params["bidNtceNo"])], "1")
+        return _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
-    assert collector._MAX_LICENSE_FIX_TARGETS == 200
-    skipped = max(0, count - 200)
-    assert fix["targets"] == count and fix["called"] == min(count, 200) and fix["skipped"] == skipped
-    assert len(calls) == min(count, 200) + 2
-    assert run.status == ("partial" if skipped else "success")
-    assert fix["outcome"] == ("failed" if skipped else "ok")
-    if skipped:
-        assert "license_fix" in run.error_msg and "상한" in run.error_msg and "5건" in run.error_msg
+    assert fix == {"outcome": "ok", "targets": count, "called": count,
+                   "found": (count + 1) // 2, "failed": [], "retry_count": 0}
+    fixes = [params for op, params in calls
+             if op == collector.LICENSE_OPERATION and params["inqryDiv"] == "2"]
+    assert [params["bidNtceNo"] for params in fixes] == [item["bidNtceNo"] for item in notices]
+    assert len(calls) == count + 2
+    assert run.status == "success" and run.error_msg is None
     with Local() as session:
-        assert session.get(AppConfig, 1).last_success_dt == (WIN_BGN if skipped else WIN_END)
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+
+@pytest.mark.parametrize("code", ["03", "00"])
+def test_missing_license_fix_no_rows_advances_successive_windows(monkeypatch, db_engine, code):
+    _, Local = db_engine
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 300
+        session.get(AppConfig, 1).last_success_dt = WIN_BGN
+        session.commit()
+    notices = [_notice(f"MISSING-{i}") for i in range(205)]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result(notices, str(len(notices)))
+        result = _ok_result()
+        if params["inqryDiv"] == "2":
+            result.result_code = code
+        return result
+
+    calls = _fake_api(monkeypatch, responder)
+    for window_bgn, window_end in [(WIN_BGN, WIN_END), (WIN_END, datetime(2026, 7, 1))]:
+        calls.clear()
+        run = collector.collect_window(window_bgn, window_end)
+        assert run.status == "success" and run.error_msg is None
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert fix == {"outcome": "ok", "targets": 205, "called": 205,
+                       "found": 0, "failed": [], "retry_count": 0}
+        assert len(calls) == 207
+        with Local() as session:
+            assert session.get(AppConfig, 1).last_success_dt == window_end
+            assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 0
+            assert session.scalar(select(func.count()).select_from(BidNotice).where(
+                BidNotice.list_visible.is_(True)
+            )) == 0
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -572,21 +612,28 @@ def test_empty_match_codes_still_collects(monkeypatch, db_engine, caplog):
         assert session.get(BidNotice, "NEW").list_visible is False
 
 
-def test_client_error_is_partial_and_halt_gate_still_skips(monkeypatch, db_engine):
+@pytest.mark.parametrize("stage", ["license", "license_fix"])
+def test_client_error_is_partial_and_halt_gate_still_skips(monkeypatch, db_engine, stage):
     _, Local = db_engine
 
     def responder(op, params):
-        if op == collector.LICENSE_OPERATION:
+        if op == collector.OPERATION:
+            return _ok_result([_notice("NEW")], "1")
+        if params["inqryDiv"] == ("1" if stage == "license" else "2"):
             raise api_client.ApiClientError("가짜 클라이언트 오류")
-        return _ok_result([_notice("NEW")], "1")
+        return _ok_result()
 
     calls = _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
-    assert run.status == "partial" and "license" in run.error_msg
+    assert run.status == "partial" and stage in run.error_msg
+    if stage == "license_fix":
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert fix["outcome"] == "failed" and fix["failed"] == ["NEW"]
     with Local() as session:
         session.get(AppConfig, 1).auto_halted = True
         session.commit()
-    assert collector.collect_window(WIN_BGN, WIN_END) is None and len(calls) == 2
+    assert collector.collect_window(WIN_BGN, WIN_END) is None
+    assert len(calls) == (2 if stage == "license" else 3)
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])

@@ -31,7 +31,6 @@ _RETRY_CODES: frozenset[str] = frozenset({"01", "02", "04", "05"})
 _RETRY_BACKOFF_SECONDS = 2.0
 _MAX_PAGES_SAFETY = 1000
 _LICENSE_BULK_PAGE_SIZE = 1000
-_MAX_LICENSE_FIX_TARGETS = 200
 
 
 def classify_result_code(code: str | None) -> str:
@@ -73,12 +72,12 @@ def dedup_notices(items: list[dict]) -> list[dict]:
             continue
         previous = deduped.get(no)
         if previous is not None:
-            new_ord = _text(item.get("bidNtceOrd"))
-            old_ord = _text(previous.get("bidNtceOrd"))
+            new_ord = classifier.normalize_order(_text(item.get("bidNtceOrd")))
+            old_ord = classifier.normalize_order(_text(previous.get("bidNtceOrd")))
             try:
-                higher = int(new_ord) > int(old_ord)
-            except ValueError:
-                higher = new_ord.zfill(3) > old_ord.zfill(3)
+                higher = new_ord > old_ord
+            except TypeError:
+                higher = str(new_ord).zfill(3) > str(old_ord).zfill(3)
             if not higher:
                 continue
         deduped[no] = item
@@ -129,16 +128,18 @@ def _missing_license_targets(session, notices: list[dict], licenses: dict[tuple,
     """업종 제한 Y 공고의 현재 차수 면허가 일괄 응답·DB 모두에 없으면 보정한다."""
     candidates = [item for item in notices if _text(item.get("indstrytyLmtYn")) == "Y"
                   and _text(item.get("bidNtceOrd"))]
-    pairs = {(row["bid_ntce_no"], row["bid_ntce_ord"].zfill(3)) for row in licenses.values()}
+    pairs = {(row["bid_ntce_no"], classifier.normalize_order(row["bid_ntce_ord"]))
+             for row in licenses.values()}
     nos = [_text(item["bidNtceNo"]) for item in candidates]
     for start in range(0, len(nos), 500):
-        pairs.update((no, ord_.zfill(3)) for no, ord_ in session.execute(
+        pairs.update((no, classifier.normalize_order(ord_)) for no, ord_ in session.execute(
             select(BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord).where(
                 BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500])
             ).distinct()
         ))
     return [item for item in candidates
-            if (_text(item["bidNtceNo"]), _text(item["bidNtceOrd"]).zfill(3)) not in pairs]
+            if (_text(item["bidNtceNo"]),
+                classifier.normalize_order(_text(item["bidNtceOrd"]))) not in pairs]
 
 
 def fmt_dt(dt: datetime) -> str:
@@ -327,8 +328,8 @@ def collect_window(
         )
         meta_ts = datetime.now()
         run = repository.create_run(session, trigger, window_bgn, window_end)
-        logger.info("수집 시작: trigger=%s window=%s~%s 보정상한=%d",
-                    trigger, fmt_dt(window_bgn), fmt_dt(window_end), _MAX_LICENSE_FIX_TARGETS)
+        logger.info("수집 시작: trigger=%s window=%s~%s",
+                    trigger, fmt_dt(window_bgn), fmt_dt(window_end))
         by_call = {
             "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
                       "items": 0, "notices": 0, "retry_count": 0},
@@ -336,7 +337,7 @@ def collect_window(
                         "items": 0, "kept": 0, "retry_count": 0,
                         "page_size": _LICENSE_BULK_PAGE_SIZE},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
-                            "found": 0, "skipped": 0, "failed": [], "retry_count": 0},
+                            "found": 0, "failed": [], "retry_count": 0},
         }
         failed: list[tuple[str, dict]] = []
 
@@ -380,15 +381,8 @@ def collect_window(
         fix = by_call["license_fix"]
         if servc["outcome"] == license_result["outcome"] == "ok":
             targets = _missing_license_targets(session, notices, licenses)
-            fix.update(outcome="ok", targets=len(targets),
-                       skipped=max(0, len(targets) - _MAX_LICENSE_FIX_TARGETS))
-            if fix["skipped"]:
-                fix["outcome"] = "failed"
-                failed.append(("license_fix", {
-                    "last_code": None,
-                    "error_msg": f"보정 상한({_MAX_LICENSE_FIX_TARGETS}건) 초과 — {fix['skipped']}건 건너뜀",
-                }))
-            for item in targets[:_MAX_LICENSE_FIX_TARGETS]:
+            fix.update(outcome="ok", targets=len(targets))
+            for item in targets:
                 no = _text(item["bidNtceNo"])
                 result = _fetch_pages(LICENSE_OPERATION, {
                     "inqryDiv": "2", "bidNtceNo": no, "bidNtceOrd": _text(item["bidNtceOrd"]),

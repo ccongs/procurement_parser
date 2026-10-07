@@ -347,7 +347,8 @@ def test_missing_notice_order_uses_latest_license_order(database, order):
 
 
 @pytest.mark.parametrize("notice_order,license_order", [
-    ("1", "001"), ("001", "1"), ("+1", "001"), ("A", "00A"),
+    ("1", "001"), ("001", "1"), ("0001", "1"), ("1", "0001"),
+    ("0001", "001"), ("001", "0001"), ("+1", "001"), ("A", "00A"),
 ])
 def test_current_license_order_normalizes_notation(database, notice_order, license_order):
     _, local = database
