@@ -19,11 +19,13 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    true,
 )
 
 from app.db import Base
@@ -38,6 +40,12 @@ class BidNotice(Base):
     """입찰공고 — 단일 테이블. PK = bid_ntce_no(최신 차수만 유지)."""
 
     __tablename__ = "bid_notice"
+
+    __table_args__ = (
+        Index("ix_bid_notice_visible_ntce_dt", "list_visible", "bid_ntce_dt"),
+        Index("ix_bid_notice_visible_openg_dt", "list_visible", "openg_dt"),
+        Index("ix_bid_notice_indstryty_lmt_yn", "indstryty_lmt_yn"),
+    )
 
     # --- 식별 (PK = 공고번호 단일) ---
     bid_ntce_no = Column(String(40), primary_key=True)  # bidNtceNo
@@ -87,6 +95,8 @@ class BidNotice(Base):
     pub_prcrmnt_lrgclsfc_nm = Column(String(100))       # pubPrcrmntLrgclsfcNm
     pub_prcrmnt_midclsfc_nm = Column(String(100))       # pubPrcrmntMidclsfcNm
     pub_prcrmnt_clsfc_no = Column(String(10))           # pubPrcrmntClsfcNo
+    pub_prcrmnt_clsfc_nm = Column(String(100))          # pubPrcrmntClsfcNm
+    bef_bid_bbanc_no = Column(String(40))               # befBidBbancNo (이전 공고번호)
     bid_ntce_url = Column(String(500))                  # bidNtceUrl
     bid_ntce_dtl_url = Column(String(512))              # bidNtceDtlUrl
     std_ntce_doc_url = Column(String(800))              # stdNtceDocUrl
@@ -118,12 +128,66 @@ class BidNotice(Base):
 
     # --- 수집 메타데이터 ---
     matched_indstryty_cds = Column(String(50))          # 이 공고를 잡아낸 업종코드(예: "1468,1470")
-    raw_json = Column(Text)                             # 응답 item 원문 전체(재파싱 대비)
+    list_visible = Column(Boolean, nullable=False, default=True, server_default=true())
+    match_basis = Column(String(10))                    # 표시 근거: 업종/분류/키워드
+    match_detail = Column(String(200))                  # 분류명 또는 일치 키워드
+    raw_json = Column(Text)                             # 호환용(원문은 bid_notice_raw 에 저장)
     collected_at = Column(DateTime, nullable=False)     # 최초 수집 시각
     updated_at = Column(DateTime, nullable=False)       # 최종 갱신 시각
 
     def __repr__(self) -> str:  # pragma: no cover - 디버그용
         return f"<BidNotice {self.bid_ntce_no!r} ord={self.bid_ntce_ord!r}>"
+
+
+class BidNoticeRaw(Base):
+    """입찰공고 원문 — 공고당 1행, 저장 순서에 의존하지 않도록 FK 없음."""
+
+    __tablename__ = "bid_notice_raw"
+
+    bid_ntce_no = Column(String(40), primary_key=True)
+    raw_json = Column(Text)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class BidLicenseLimit(Base):
+    """면허제한 — op15 응답 1행당 1행(수집 로직은 Phase 13.3)."""
+
+    __tablename__ = "bid_license_limit"
+
+    bid_ntce_no = Column(String(40), primary_key=True)
+    bid_ntce_ord = Column(String(3), primary_key=True)
+    lmt_grp_no = Column(String(10), primary_key=True)
+    lmt_sno = Column(String(10), primary_key=True)
+    lcns_cd = Column(String(10), index=True)             # 면허제한명 명/코드 중 코드
+    lcns_nm = Column(String(200))
+    permsn_cds = Column(Text)                           # 허용업종 코드 CSV
+    rgst_dt = Column(DateTime)
+    collected_at = Column(DateTime, nullable=False)
+
+
+class ListRule(Base):
+    """목록 표시 규칙 — 기본값 시드·편집은 Phase 13.2·13.4."""
+
+    __tablename__ = "list_rule"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_type = Column(String(20), nullable=False)       # clsfc/keyword/negative
+    value = Column(String(100), nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True, server_default=true())
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("rule_type", "value", name="uq_list_rule_type_value"),
+    )
+
+
+class SchemaMigration(Base):
+    """데이터 보정 완료 기록 — 중단 후 재시도·완료 후 재실행 방지용."""
+
+    __tablename__ = "schema_migration"
+
+    name = Column(String(100), primary_key=True)
+    applied_at = Column(DateTime, nullable=False, default=_utcnow)
 
 
 class CollectionRun(Base):

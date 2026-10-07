@@ -20,7 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from app import collector, repository
 from app.collector import _RETRY_BACKOFF_SECONDS
 from app.db import Base
-from app.models import AppConfig, CollectionRun
+from app.models import AppConfig, BidNotice, BidNoticeRaw, CollectionRun
 
 WIN_BGN = datetime(2026, 5, 1, 0, 0)
 WIN_END = datetime(2026, 6, 1, 0, 0)
@@ -168,6 +168,33 @@ def test_success_updates_last_success_dt(monkeypatch, db_engine):
     with TestSession() as s:
         cfg = s.get(AppConfig, 1)
         assert cfg.last_success_dt == WIN_END
+
+
+def test_collection_stores_industry_classification_and_separate_raw(monkeypatch, db_engine):
+    """13.1 동안 업종 검색·표시 분류를 유지하고 원문은 별도 테이블에 저장."""
+    _engine, TestSession = db_engine
+    item = {"bidNtceNo": "COLLECT-13", "bidNtceNm": "수집 분류 검증"}
+    calls = []
+
+    def fake_call_with_retry(params, max_retries):
+        calls.append(params.copy())
+        return _ok_result(items=[item], total_count="1"), 0, "ok"
+
+    monkeypatch.setattr(collector, "_call_with_retry", fake_call_with_retry)
+    run = collector.collect_window(WIN_BGN, WIN_END, trigger="test")
+    assert run.status == "success"
+    assert run.total_new == 1
+    assert len(calls) == 1 and calls[0]["indstrytyCd"] == "1468"
+    with TestSession() as session:
+        row = session.get(BidNotice, "COLLECT-13")
+        assert row.list_visible is True
+        assert row.match_basis == "업종"
+        assert row.match_detail is None
+        assert row.matched_indstryty_cds == "1468"
+        assert row.raw_json is None
+        raw = session.get(BidNoticeRaw, "COLLECT-13")
+        assert json.loads(raw.raw_json) == item
+        assert raw.updated_at == row.updated_at
 
 
 # --- 4. detail_json 구조 확인 — by_cd / ord_changes / ord_changed_count --

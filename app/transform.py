@@ -13,7 +13,7 @@
     그 외(String·Text) → clean_str.
   - 리스트성 Text(원문 보존: purchsObjPrdctList·prdctDtlList·bidNtceNoList)는
     `_preserve_list_or_str` 로 별도 처리.
-- 수집 메타데이터(matched_indstryty_cds·collected_at·updated_at)는 호출자가 부여한다.
+- 수집 메타데이터(matched_indstryty_cds·collected_at·updated_at·list_visible·match_basis·match_detail)는 호출자가 부여한다.
 """
 
 from __future__ import annotations
@@ -29,7 +29,10 @@ from app.models import BidNotice, PreSpec
 
 # 호출자(3.3 collector/repository)가 채우는 수집 메타데이터 — 여기서는 채우지 않는다.
 META_COLUMNS: frozenset[str] = frozenset(
-    {"matched_indstryty_cds", "collected_at", "updated_at"}
+    {
+        "matched_indstryty_cds", "collected_at", "updated_at",
+        "list_visible", "match_basis", "match_detail",
+    }
 )
 
 # 사전규격(pre_spec) 수집 메타데이터 — 호출자(5.3 collector)가 부여(여기서 스킵).
@@ -98,6 +101,8 @@ COLUMN_TO_API: dict[str, str] = {
     "pub_prcrmnt_lrgclsfc_nm": "pubPrcrmntLrgclsfcNm",
     "pub_prcrmnt_midclsfc_nm": "pubPrcrmntMidclsfcNm",
     "pub_prcrmnt_clsfc_no": "pubPrcrmntClsfcNo",
+    "pub_prcrmnt_clsfc_nm": "pubPrcrmntClsfcNm",
+    "bef_bid_bbanc_no": "befBidBbancNo",
     "bid_ntce_url": "bidNtceUrl",
     "bid_ntce_dtl_url": "bidNtceDtlUrl",
     "std_ntce_doc_url": "stdNtceDocUrl",
@@ -232,7 +237,7 @@ def item_to_bid_notice_values(item: dict) -> dict:
     """API 응답 item 1건 → {bid_notice 컬럼명: 변환된 값} dict 반환.
 
     - API에서 유래한 컬럼만 채운다. 수집 메타데이터는 호출자가 부여한다.
-    - raw_json 은 원본 item 전체를 json.dumps(ensure_ascii=False)로 직렬화해 저장.
+    - raw_json 은 원본 item 전체를 json.dumps(ensure_ascii=False)로 직렬화하며, 저장처는 bid_notice_raw.
     - bid_ntce_no(PK)가 비어 있으면 ValueError(상위에서 스킵/로깅).
     """
     if not isinstance(item, dict):

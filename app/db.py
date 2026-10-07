@@ -11,12 +11,13 @@ app_config 단일 행(id=1)을 기본값으로 시드한다(pre_spec 시드는 �
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # .env 로드 (프로젝트 루트의 .env)
@@ -88,12 +89,11 @@ _register_sqlite_pragmas(engine)
 
 
 def init_db() -> None:
-    """테이블 4종(bid_notice·collection_run·app_config·pre_spec) 생성 + 자동 마이그레이션 + app_config 기본행 시드.
+    """모델 테이블 생성 + 자동 마이그레이션 + app_config 기본행 시드.
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
       create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
-    - 이미 있는 테이블/행은 건드리지 않는다(create_all 은 멱등, 시드는 존재 검사).
-    - 순서: create_all → _migrate_add_columns(기존 DB 누락 컬럼 ALTER) → _seed_app_config.
+    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관 → 기존 시드.
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
@@ -101,19 +101,22 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _migrate_add_columns()
+    _migrate_match_basis_backfill()
+    _migrate_bid_notice_indexes()
+    _migrate_bid_notice_raw()
     _seed_app_config()
 
 
 def _migrate_add_columns() -> None:
-    """기존(구 스키마) DB 에 Phase 5.4 신규 컬럼이 없으면 ALTER TABLE ADD COLUMN.
+    """기존(구 스키마) DB 에 신규 컬럼이 없으면 ALTER TABLE ADD COLUMN.
 
     멱등·inspector 가드: 신규 DB 는 create_all 이 이미 컬럼을 만들었으므로 inspector 가
-    present 로 보고 ALTER 를 스킵(no-op)한다. 기존 DB 만 ADD COLUMN 하며 **기존 행은 무손상**
-    (`collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다). init_db() 를 여러 번 호출해도
-    안전하다.
+    present 로 보고 ALTER 를 스킵(no-op)한다. 기존 DB 만 ADD COLUMN 하며
+    `collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다. 기존 표시 공고의 NULL 분류값은
+    별도 보정 함수에서 완료 기록을 기준으로 1회 보정한다. init_db() 반복 호출은 안전하다.
 
-    ⚠️ PostgreSQL 이전 시: boolean 기본값 리터럴 `1`(SQLite 표기)을 `true` 로 바꿔야 한다
-    (SQLite 우선·표준 ALTER 사용). 컬럼 추가만 하므로 그 외 표준 SQL 로 이식 가능하다.
+    list_visible 기본값 TRUE 는 SQLite·PostgreSQL 공통 표기다.
+    기존 pre_spec_enabled 의 DEFAULT 1 은 PostgreSQL 이전 시 true 로 조정해야 한다.
     """
     insp = inspect(engine)
     tables = set(insp.get_table_names())
@@ -122,6 +125,18 @@ def _migrate_add_columns() -> None:
         return {c["name"] for c in insp.get_columns(t)}
 
     stmts: list[str] = []
+    if "bid_notice" in tables:
+        bn = colset("bid_notice")
+        additions = {
+            "list_visible": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "match_basis": "VARCHAR(10)",
+            "match_detail": "VARCHAR(200)",
+            "pub_prcrmnt_clsfc_nm": "VARCHAR(100)",
+            "bef_bid_bbanc_no": "VARCHAR(40)",
+        }
+        for name, definition in additions.items():
+            if name not in bn:
+                stmts.append(f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}")
     if "collection_run" in tables and "source" not in colset("collection_run"):
         stmts.append(
             "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
@@ -151,6 +166,89 @@ def _migrate_add_columns() -> None:
         with engine.begin() as conn:
             for s in stmts:
                 conn.execute(text(s))
+
+
+def _migrate_match_basis_backfill() -> None:
+    """완료 기록이 없으면 기존 표시 공고의 NULL 분류값만 1회 보정·완료 기록."""
+    from app.models import SchemaMigration
+
+    migration = SchemaMigration.__table__
+    name = "phase13_match_basis_backfill"
+    # ALTER 와 분리된 DML 트랜잭션: 보정·완료 기록이 함께 커밋되거나 함께 롤백된다.
+    with engine.begin() as conn:
+        if conn.execute(select(migration.c.name).where(migration.c.name == name)).first():
+            return
+        conn.execute(text(
+            "UPDATE bid_notice SET match_basis='업종' "
+            "WHERE list_visible = true AND match_basis IS NULL"
+        ))
+        conn.execute(migration.insert().values(name=name))
+
+
+def _migrate_bid_notice_indexes() -> None:
+    """기존 DB 에 누락된 Phase 13.1 인덱스만 표준 CREATE INDEX 로 생성."""
+    from app.models import BidNotice
+
+    names = {idx["name"] for idx in inspect(engine).get_indexes("bid_notice")}
+    required = {
+        "ix_bid_notice_visible_ntce_dt",
+        "ix_bid_notice_visible_openg_dt",
+        "ix_bid_notice_indstryty_lmt_yn",
+    }
+    with engine.begin() as conn:
+        for index in BidNotice.__table__.indexes:
+            if index.name in required and index.name not in names:
+                index.create(bind=conn)
+
+
+def _migrate_bid_notice_raw() -> None:
+    """원문을 500행씩 이관·추출 후 비움. 배치별 트랜잭션으로 재실행 안전."""
+    from app.models import BidNotice, BidNoticeRaw
+    from app.transform import clean_str
+
+    notice = BidNotice.__table__
+    raw = BidNoticeRaw.__table__
+    while True:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    notice.c.bid_ntce_no, notice.c.raw_json, notice.c.updated_at,
+                    notice.c.bef_bid_bbanc_no, notice.c.pub_prcrmnt_clsfc_nm,
+                )
+                .where(notice.c.raw_json.is_not(None))
+                .order_by(notice.c.bid_ntce_no)
+                .limit(500)
+            ).mappings().all()
+            if not rows:
+                break
+            existing = set(conn.execute(
+                select(raw.c.bid_ntce_no).where(
+                    raw.c.bid_ntce_no.in_([row["bid_ntce_no"] for row in rows])
+                )
+            ).scalars())
+            inserts = [
+                {key: row[key] for key in ("bid_ntce_no", "raw_json", "updated_at")}
+                for row in rows if row["bid_ntce_no"] not in existing
+            ]
+            if inserts:
+                conn.execute(raw.insert(), inserts)
+            for row in rows:
+                values = {"raw_json": None}
+                try:
+                    item = json.loads(row["raw_json"])
+                except (TypeError, ValueError):
+                    item = None  # 깨진 원문도 저장하고 추출만 건너뛴다.
+                if isinstance(item, dict):
+                    for column, field in (
+                        ("bef_bid_bbanc_no", "befBidBbancNo"),
+                        ("pub_prcrmnt_clsfc_nm", "pubPrcrmntClsfcNm"),
+                    ):
+                        if clean_str(row[column]) is None:
+                            values[column] = clean_str(item.get(field))
+                conn.execute(
+                    notice.update().where(notice.c.bid_ntce_no == row["bid_ntce_no"])
+                    .values(**values)
+                )
 
 
 def _seed_app_config() -> None:

@@ -21,15 +21,16 @@ from app.models import (
     AnalysisResult,
     AppConfig,
     BidNotice,
+    BidNoticeRaw,
     CollectionRun,
     ExcludeKeyword,
     ExportCartItem,
     PreSpec,
 )
 
-# bid_notice 에 실제 존재하는 컬럼명 집합 — values dict 중 컬럼이 아닌 키는 무시한다.
+# bid_notice 저장 컬럼 — 원문은 별도 테이블로 보내고 컬럼이 아닌 키는 무시한다.
 _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
-    c.name for c in BidNotice.__table__.columns
+    c.name for c in BidNotice.__table__.columns if c.name != "raw_json"
 )
 
 # pre_spec 에 실제 존재하는 컬럼명 집합(upsert_pre_specs 화이트리스트).
@@ -146,7 +147,8 @@ def upsert_bid_notices(
 
     - 각 원소는 transform 결과 + 메타(matched_indstryty_cds/collected_at/updated_at)가 합쳐진
       컬럼값 dict.
-    - 기존 PK 는 `IN` 으로 한 번에 조회해 N+1 을 피한다.
+    - 공고·원문 각각 기존 PK 를 `IN` 한 번으로 조회해 N+1 을 피한다.
+      raw_json 은 같은 세션의 bid_notice_raw 에만 저장한다.
     - **collected_at(최초 수집 시각)은 insert 시에만 설정하고 update 시 보존**한다.
       updated_at 등 나머지 컬럼은 항상 갱신.
     - ord_changes: update 경로에서 bid_ntce_ord 가 바뀐 공고 목록. 각 원소
@@ -159,6 +161,7 @@ def upsert_bid_notices(
 
     pks = [v["bid_ntce_no"] for v in values_list if v.get("bid_ntce_no")]
     existing: dict[str, BidNotice] = {}
+    existing_raw: dict[str, BidNoticeRaw] = {}
     if pks:
         rows = (
             session.execute(select(BidNotice).where(BidNotice.bid_ntce_no.in_(pks)))
@@ -166,6 +169,10 @@ def upsert_bid_notices(
             .all()
         )
         existing = {r.bid_ntce_no: r for r in rows}
+        raw_rows = session.execute(
+            select(BidNoticeRaw).where(BidNoticeRaw.bid_ntce_no.in_(pks))
+        ).scalars().all()
+        existing_raw = {r.bid_ntce_no: r for r in raw_rows}
 
     new_count = 0
     updated_count = 0
@@ -206,7 +213,18 @@ def upsert_bid_notices(
                 if key == "collected_at":
                     continue  # 최초 수집 시각 보존
                 setattr(row, key, value)
+            if "raw_json" in values:
+                row.raw_json = None  # 원문을 분리 저장하는 경우에만 호환 컬럼을 비운다.
             updated_count += 1
+
+        if "raw_json" in values:
+            raw = existing_raw.get(pk)
+            if raw is None:
+                raw = BidNoticeRaw(bid_ntce_no=pk)
+                session.add(raw)
+                existing_raw[pk] = raw  # 같은 배치 중복 PK 는 갱신으로 흡수.
+            raw.raw_json = values["raw_json"]
+            raw.updated_at = values["updated_at"]
 
     session.flush()
     return (new_count, updated_count, ord_changes)
