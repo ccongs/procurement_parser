@@ -136,7 +136,7 @@ def _capture_base_params(monkeypatch, snapshot):
     assert "indstrytyCd" not in captured
     assert captured["inqryDiv"] == snapshot.inqry_div
     assert captured["intrntnlDivCd"] == snapshot.intrntnl_div_cd
-    assert captured["numOfRows"] == "1000"
+    assert captured["numOfRows"] == "999"
     assert captured["inqryBgnDt"] == "202605010000"
     assert captured["inqryEndDt"] == "202606010000"
     return captured

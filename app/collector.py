@@ -30,7 +30,7 @@ _OK_CODES: frozenset[str] = frozenset({"00", "03"})
 _RETRY_CODES: frozenset[str] = frozenset({"01", "02", "04", "05"})
 _RETRY_BACKOFF_SECONDS = 2.0
 _MAX_PAGES_SAFETY = 1000
-_BULK_PAGE_SIZE = 1000
+_BULK_PAGE_SIZE = 999  # API 상한 999 — 1000 이상은 오류 없이 기본 10행 응답(2026-10-07 실측)
 
 
 def classify_result_code(code: str | None) -> str:
@@ -200,6 +200,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
     retry_count = 0
     pages_fetched = 0
     last_code: str | None = None
+    total_count: int | None = None
     max_page: int | None = None
     page = 1
 
@@ -217,6 +218,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "pages": pages_fetched,
                     "last_code": last_code,
                     "retry_count": retry_count,
+                    "total_count": total_count,
                     "outcome": "halt",
                     "halt_code": halt_code,
                     "error_msg": f"resultCode={halt_code} "
@@ -228,6 +230,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "pages": pages_fetched,
                     "last_code": last_code,
                     "retry_count": retry_count,
+                    "total_count": total_count,
                     "outcome": "failed",
                     "halt_code": None,
                     "error_msg": result.error
@@ -237,11 +240,25 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             # outcome == "ok"
             pages_fetched += 1
             if result.result_code == "03":  # No Data → 종료
+                if total_count is None:
+                    total_count = 0
                 break
             items.extend(result.items)
 
+            try:
+                response_total_count = int(_text(result.total_count))
+                if response_total_count < 0:
+                    raise ValueError
+            except ValueError:
+                return {
+                    "items": items, "pages": pages_fetched, "last_code": last_code,
+                    "retry_count": retry_count, "total_count": total_count,
+                    "outcome": "failed", "halt_code": None,
+                    "error_msg": "totalCount 누락/오류",
+                }
             if max_page is None:
-                max_page = total_pages(result.total_count, page_size)
+                total_count = response_total_count
+                max_page = total_pages(total_count, page_size)
 
             if page >= max_page:
                 break
@@ -255,6 +272,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                 return {
                     "items": items, "pages": pages_fetched, "last_code": last_code,
                     "retry_count": retry_count, "outcome": "failed", "halt_code": None,
+                    "total_count": total_count,
                     "truncated": True,
                     "error_msg": f"안전 상한({_MAX_PAGES_SAFETY}페이지) 도달 — 잘린 수집",
                 }
@@ -266,19 +284,22 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             "pages": pages_fetched,
             "last_code": last_code,
             "retry_count": retry_count,
+            "total_count": total_count,
             "outcome": "failed",
             "halt_code": None,
             "error_msg": f"ApiClientError: {exc}",
         }
 
+    shortfall = len(items) < total_count
     return {
         "items": items,
         "pages": pages_fetched,
         "last_code": last_code,
         "retry_count": retry_count,
-        "outcome": "ok",
+        "total_count": total_count,
+        "outcome": "failed" if shortfall else "ok",
         "halt_code": None,
-        "error_msg": None,
+        "error_msg": f"건수 미달: 받은 {len(items)} / 전체 {total_count}" if shortfall else None,
     }
 
 
@@ -305,6 +326,7 @@ def _build_detail_json(by_call: dict, ord_changes: list[dict], classify: dict | 
 def _call_detail(result: dict, **counts) -> dict:
     return {"outcome": result["outcome"], "pages": result["pages"],
             "last_result_code": result["last_code"], "items": len(result["items"]),
+            "total_count": result["total_count"], "error_msg": result["error_msg"],
             **({"truncated": True} if result.get("truncated") else {}),
             **counts, "retry_count": result["retry_count"]}
 
@@ -334,12 +356,12 @@ def collect_window(
         by_call = {
             "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
                       "items": 0, "notices": 0, "retry_count": 0,
-                      "page_size": _BULK_PAGE_SIZE},
+                      "page_size": _BULK_PAGE_SIZE, "total_count": None},
             "license": {"outcome": "skipped", "pages": 0, "last_result_code": None,
                         "items": 0, "kept": 0, "retry_count": 0,
-                        "page_size": _BULK_PAGE_SIZE},
+                        "page_size": _BULK_PAGE_SIZE, "total_count": None},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
-                            "found": 0, "failed": [], "retry_count": 0},
+                            "found": 0, "failed": [], "retry_count": 0, "total_count": None},
         }
         failed: list[tuple[str, dict]] = []
 
@@ -386,7 +408,7 @@ def collect_window(
             if len(targets) >= 50:
                 logger.warning("면허 누락 보정 대상 %d건 — 이번 창 공고 %d건",
                                len(targets), len(notices))
-            fix.update(outcome="ok", targets=len(targets))
+            fix.update(outcome="ok", targets=len(targets), total_count=0)
             for item in targets:
                 no = _text(item["bidNtceNo"])
                 result = _fetch_pages(LICENSE_OPERATION, {
@@ -394,16 +416,22 @@ def collect_window(
                 }, snapshot)
                 fix["called"] += 1
                 fix["retry_count"] += result["retry_count"]
+                # 보정 단계의 전체 건수는 공고별 첫 정상 응답 건수의 합(불명이 있으면 None).
+                fix["total_count"] = (fix["total_count"] + result["total_count"]
+                                      if fix["total_count"] is not None
+                                      and result["total_count"] is not None else None)
                 rows = [row for raw in result["items"] if (row := license_values(raw)) is not None]
                 licenses.update({_license_key(row): row for row in rows})
                 if rows:
                     fix["found"] += 1
                 if result["outcome"] == "halt":
                     fix["outcome"] = "failed"
+                    fix["error_msg"] = result["error_msg"]
                     fix["failed"].append(no)
                     return halt("license_fix", result)
                 if result["outcome"] == "failed":
                     fix["outcome"] = "failed"
+                    fix["error_msg"] = "; ".join(filter(None, [fix.get("error_msg"), result["error_msg"]]))
                     if result.get("truncated"):
                         fix["truncated"] = True
                     fix["failed"].append(no)
