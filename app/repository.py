@@ -953,15 +953,29 @@ def normalize_rule_value(raw: str) -> str:
     return " ".join(raw.split())
 
 
+def list_rule_value_key(rule_type: str, raw: str) -> str:
+    """분류는 정확 일치, 키워드·제외어는 대소문자·공백을 무시한다."""
+    normalized = normalize_rule_value(raw)
+    return normalized if rule_type == "clsfc" else "".join(normalized.split()).lower()
+
+
+def validate_list_rule_value(rule_type: str, raw: str) -> str:
+    """카드 추가와 초안 편집에서 같은 값 검증을 사용한다."""
+    if rule_type not in {"clsfc", "keyword", "negative"}:
+        raise ValueError("알 수 없는 규칙 종류입니다.")
+    value = normalize_rule_value(raw)
+    if not value:
+        raise ValueError("추가할 규칙 값을 입력하세요.")
+    if len(value) > 100:
+        raise ValueError("규칙 값은 100자 이하여야 합니다.")
+    return value
+
+
 def find_list_rule_duplicate(session: Session, rule_type: str, value: str) -> str | None:
     """같은 종류에서 중복인 기존 값을 반환한다(키워드·제외어는 대소문자·공백 무시)."""
-    def key(raw: str) -> str:
-        normalized = normalize_rule_value(raw)
-        return normalized if rule_type == "clsfc" else "".join(normalized.split()).lower()
-
-    wanted = key(value)
+    wanted = list_rule_value_key(rule_type, value)
     for existing in session.scalars(select(ListRule.value).where(ListRule.rule_type == rule_type)):
-        if key(existing) == wanted:
+        if list_rule_value_key(rule_type, existing) == wanted:
             return existing
     return None
 
@@ -970,13 +984,7 @@ def add_list_rule(
     session: Session, rule_type: str, value: str, *, commit: bool = True,
 ) -> bool:
     """공백을 정규화해 규칙을 추가한다. 같은 종류의 중복이면 False."""
-    if rule_type not in {"clsfc", "keyword", "negative"}:
-        raise ValueError("알 수 없는 규칙 종류입니다.")
-    value = normalize_rule_value(value)
-    if not value:
-        raise ValueError("추가할 규칙 값을 입력하세요.")
-    if len(value) > 100:
-        raise ValueError("규칙 값은 100자 이하여야 합니다.")
+    value = validate_list_rule_value(rule_type, value)
     if find_list_rule_duplicate(session, rule_type, value) is not None:
         return False
     session.add(ListRule(rule_type=rule_type, value=value, enabled=True))
