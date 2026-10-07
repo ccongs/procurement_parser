@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections import defaultdict
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import BidLicenseLimit, BidNotice, ListRule
 from app.repository import get_config
+
+
+# 설정·규칙 변경과 수집 저장을 재분류 커밋까지 직렬화한다(프로세스 내 공용).
+CLASSIFY_WRITE_LOCK = threading.RLock()
 
 
 DEFAULT_LIST_RULES: tuple[tuple[str, str], ...] = (
@@ -136,15 +142,22 @@ def normalize_order(value: str) -> int | str:
         return value.zfill(3)
 
 
-def load_rule_set(session: Session) -> RuleSet:
-    """켜진 규칙만 id 순으로 읽고 알 수 없는 종류는 무시한다."""
+def rule_set_from_rows(rows: Iterable[Mapping[str, Any] | ListRule]) -> RuleSet:
+    """켜진 규칙을 id 순·종류별로 묶고 id 없는 새 규칙은 뒤에 붙인다."""
+    def field(row, name):
+        return row.get(name) if isinstance(row, Mapping) else getattr(row, name)
+
     values: dict[str, list[str]] = {"clsfc": [], "keyword": [], "negative": []}
-    for row in session.scalars(
-        select(ListRule).where(ListRule.enabled.is_(True)).order_by(ListRule.id)
-    ):
-        if row.rule_type in values:
-            values[row.rule_type].append(row.value)
+    for row in sorted(rows, key=lambda row: (field(row, "id") is None, field(row, "id") or 0)):
+        kind = field(row, "rule_type")
+        if field(row, "enabled") and kind in values:
+            values[kind].append(field(row, "value"))
     return RuleSet(tuple(values["clsfc"]), tuple(values["keyword"]), tuple(values["negative"]))
+
+
+def load_rule_set(session: Session) -> RuleSet:
+    """DB 규칙을 공용 구성 함수로 읽는다."""
+    return rule_set_from_rows(session.scalars(select(ListRule)))
 
 
 def load_match_codes(session: Session) -> frozenset[str]:
@@ -239,17 +252,22 @@ def iter_classifications(
 
 def reclassify_notices(
     session: Session, *, bid_ntce_nos: Iterable[str] | None = None,
+    rules: RuleSet | None = None, match_codes: Collection[str] | None = None,
     commit: bool = True,
 ) -> dict:
-    """변경된 분류 컬럼만 갱신하고 판정 통계를 반환한다(기본 1회 커밋)."""
-    session.flush()
-    rules = load_rule_set(session)
-    codes = load_match_codes(session)
+    """초안이 있으면 쓰기를 커밋까지 미루고, 없으면 flush 후 저장된 기준으로 판정한다."""
+    if rules is None and match_codes is None:
+        session.flush()
+    with session.no_autoflush:
+        if rules is None:
+            rules = load_rule_set(session)
+        if match_codes is None:
+            match_codes = load_match_codes(session)
     stats = {"total": 0, "changed": 0, "visible": 0, "hidden": 0,
              "by_basis": {"업종": 0, "분류": 0, "키워드": 0}}
     columns = ("list_visible", "match_basis", "match_detail", "matched_indstryty_cds")
     for notice, result in iter_classifications(
-        session, rules=rules, match_codes=codes, bid_ntce_nos=bid_ntce_nos,
+        session, rules=rules, match_codes=match_codes, bid_ntce_nos=bid_ntce_nos,
     ):
         stats["total"] += 1
         if result.list_visible:

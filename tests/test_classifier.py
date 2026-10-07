@@ -13,7 +13,7 @@ from app import db
 from app.classifier import (
     DEFAULT_LIST_RULES, Classification, RuleSet, _compile_terms,
     classify_notice, iter_classifications, load_match_codes, load_rule_set, match_terms,
-    reclassify_notices,
+    reclassify_notices, rule_set_from_rows,
 )
 from app.models import AppConfig, BidLicenseLimit, BidNotice, ListRule, SchemaMigration
 
@@ -188,6 +188,29 @@ def test_load_rule_set_filters_and_orders_by_id(database):
         ])
         session.commit()
         assert load_rule_set(session) == RuleSet(("분류",), ("선순위", "후순위"), ("제외",))
+
+
+@pytest.mark.parametrize("as_models", [False, True])
+def test_rule_set_from_rows_orders_filters_and_appends_new_rules(as_models):
+    rows = [
+        {"rule_type": "keyword", "value": "새 규칙 1", "enabled": True},
+        {"id": 9, "rule_type": "keyword", "value": "후순위", "enabled": True},
+        {"id": 2, "rule_type": "keyword", "value": "선순위", "enabled": True},
+        {"id": 3, "rule_type": "keyword", "value": "꺼짐", "enabled": False},
+        {"id": 4, "rule_type": "unknown", "value": "무시", "enabled": True},
+        {"id": 5, "rule_type": "clsfc", "value": "분류", "enabled": True},
+        {"id": 6, "rule_type": "negative", "value": "제외", "enabled": True},
+        {"id": None, "rule_type": "keyword", "value": "새 규칙 2", "enabled": True},
+        {"rule_type": "clsfc", "value": "새 분류", "enabled": True},
+        {"rule_type": "negative", "value": "새 제외", "enabled": True},
+    ]
+    source = [ListRule(**row) for row in rows] if as_models else rows
+    assert rule_set_from_rows(iter(source)) == RuleSet(
+        ("분류", "새 분류"), ("선순위", "후순위", "새 규칙 1", "새 규칙 2"), ("제외", "새 제외"),
+    )
+    assert (source[0].id if as_models else source[0].get("id")) is None
+    assert (source[1].id if as_models else source[1]["id"]) == 9
+    assert rule_set_from_rows([]) == RuleSet((), (), ())
 
 
 @pytest.mark.parametrize("codes,expected", [
@@ -767,3 +790,51 @@ def test_once_two_database_failures_without_marker_raise_last_error(
     assert len(checks) == 4  # 두 시도 모두 롤백 후 완료 여부를 다시 확인한다.
     assert checks[0] is not checks[1] and checks[2] is not checks[3]
     _assert_once_result(local, name, completed=False)
+
+
+@pytest.mark.parametrize("supplied", ["both", "rules", "match_codes"])
+def test_reclassification_with_draft_defers_all_writes_across_batches(database, monkeypatch, supplied):
+    engine, local = database
+    with local() as session:
+        session.add(AppConfig(id=1, indstryty_cds="1468"))
+        session.add(ListRule(rule_type="keyword", value="개발", enabled=True))
+        session.add_all(_notice(f"K-{i:04}", bid_ntce_nm="새플랫폼 개발") for i in range(501))
+        session.add(_notice("I", indstryty_lmt_yn="Y", matched_indstryty_cds="1468"))
+        session.commit()
+    with sessionmaker(bind=engine, autoflush=True)() as session:
+        session.get(AppConfig, 1).interval_minutes = 99
+        session.add(ListRule(rule_type="negative", value="개발", enabled=True))
+        queries, flushes = [], []
+
+        def unexpected(session):
+            pytest.fail("명시적으로 전달한 판정 기준을 DB에서 다시 읽으면 안 됩니다")
+
+        arguments = {}
+        if supplied in {"both", "rules"}:
+            arguments["rules"] = RuleSet((), ("새 플랫폼",), ())
+            monkeypatch.setattr("app.classifier.load_rule_set", unexpected)
+        if supplied in {"both", "match_codes"}:
+            arguments["match_codes"] = {"9999"}
+            monkeypatch.setattr("app.classifier.load_match_codes", unexpected)
+
+        def record_query(conn, cursor, statement, parameters, context, executemany):
+            queries.append(statement)
+
+        event.listen(session, "before_flush", lambda *args: flushes.append(True))
+        event.listen(engine, "before_cursor_execute", record_query)
+        try:
+            stats = reclassify_notices(session, commit=False, **arguments)
+            assert stats["total"] == 502
+            assert stats["visible"] == (502 if supplied == "rules" else 501)
+            assert session.get(BidNotice, "K-0500").match_detail == (
+                "개발" if supplied == "match_codes" else "새 플랫폼"
+            )
+            assert flushes == []
+            assert all(query.startswith("SELECT") for query in queries)
+            assert sum("FROM bid_notice \n" in query for query in queries) >= 2
+            session.commit()
+            assert flushes == [True]
+            assert any(query.startswith("INSERT") for query in queries)
+            assert any(query.startswith("UPDATE") for query in queries)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_query)
