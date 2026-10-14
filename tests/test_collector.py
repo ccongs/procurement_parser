@@ -544,6 +544,80 @@ def test_upsert_license_limits_batched_last_wins_and_preserves_timestamp(session
     assert repository.upsert_license_limits(session, [], t2) == (0, 0)
 
 
+@pytest.mark.parametrize("order,expected", [
+    ("1", "001"), (" 0001 ", "001"), ("001", "001"), ("1234", "1234"),
+    (" A ", "A"), (" 00A ", "00A"),
+])
+def test_license_values_normalizes_stored_order(order, expected):
+    from app import classifier
+    from app.ordering import normalize_order
+    row = collector.license_values({"bidNtceNo": "ORDER", "bidNtceOrd": order})
+    assert row["bid_ntce_ord"] == expected
+    assert classifier.normalize_order is normalize_order
+
+
+@pytest.mark.parametrize("stored_ord", ["001", "1"])
+def test_license_upsert_preserves_superseded_state_even_if_input_overrides_it(session, stored_ord):
+    from app.models import BidLicenseLimit
+    t1, t2 = datetime(2026, 5, 1), datetime(2026, 5, 2)
+    values = collector.license_values({
+        "bidNtceNo": "RESTORE", "bidNtceOrd": "001", "lmtGrpNo": "1", "lmtSno": "1",
+        "lcnsLmtNm": "이름/1468",
+    })
+    row = BidLicenseLimit(**{**values, "bid_ntce_ord": stored_ord}, collected_at=t1, superseded_at=t1)
+    session.add(row)
+    session.flush()
+    assert repository.upsert_license_limits(session, [
+        {**values, "bid_ntce_ord": "1", "superseded_at": None, "lcns_nm": "변경"},
+    ], t2) == (0, 1)
+    assert row.superseded_at == t1 and row.collected_at == t1 and row.lcns_nm == "변경"
+    assert repository.upsert_license_limits(session, [
+        {**values, "lmt_sno": "2", "superseded_at": t1},
+    ], t2) == (1, 0)
+    assert session.get(BidLicenseLimit, ("RESTORE", "001", "1", "2")).superseded_at is None
+
+
+def test_reconcile_batches_notices_and_counts_only_final_state_changes(session):
+    from app.models import BidLicenseLimit
+    t1, t2 = datetime(2026, 5, 1), datetime(2026, 5, 2)
+    snapshots = []
+    for i in range(501):
+        no = f"RECONCILE-{i}"
+        # 기존 비정규 숫자 차수도 보존 PK 비교에서는 정규화한다.
+        session.add_all([
+            BidLicenseLimit(bid_ntce_no=no, bid_ntce_ord="1", lmt_grp_no="1", lmt_sno="1",
+                            collected_at=t1, superseded_at=t1),
+            BidLicenseLimit(bid_ntce_no=no, bid_ntce_ord="001", lmt_grp_no="1", lmt_sno="2",
+                            collected_at=t1),
+            BidLicenseLimit(bid_ntce_no=no, bid_ntce_ord="002", lmt_grp_no="1", lmt_sno="1",
+                            collected_at=t1),
+        ])
+        snapshots.append((no, "001", {(no, "001", "1", "1")}))
+    session.flush()
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(session.bind, "before_cursor_execute", capture)
+    try:
+        changes = repository.reconcile_license_limits(session, snapshots, t2)
+    finally:
+        event.remove(session.bind, "before_cursor_execute", capture)
+    assert len(queries) == 2 and all(" IN " in sql and len(params) <= 500 for sql, params in queries)
+    assert changes == {"superseded": 501, "restored": 501, "superseded_notices_count": 501}
+    assert session.get(BidLicenseLimit, ("RECONCILE-0", "1", "1", "1")).superseded_at is None
+    assert session.get(BidLicenseLimit, ("RECONCILE-0", "001", "1", "2")).superseded_at == t2
+    assert session.get(BidLicenseLimit, ("RECONCILE-0", "002", "1", "1")).superseded_at is None
+    assert repository.reconcile_license_limits(session, snapshots, t2) == {
+        "superseded": 0, "restored": 0, "superseded_notices": [], "superseded_notices_count": 0,
+    }
+    assert repository.reconcile_license_limits(session, [("RECONCILE-0", "001", set())], t2) == {
+        "superseded": 0, "restored": 0, "superseded_notices": [], "superseded_notices_count": 0,
+    }
+
+
 def test_keep_licenses_queries_candidates_in_batches(session):
     now = datetime(2026, 5, 1)
     session.add(BidNotice(bid_ntce_no="OLD", collected_at=now, updated_at=now))

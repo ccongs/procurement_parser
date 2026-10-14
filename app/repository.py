@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, func, or_, select, tuple_
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -32,6 +32,7 @@ from app.models import (
     ListRule,
     PreSpec,
 )
+from app.ordering import normalize_order, stored_order
 
 # bid_notice 저장 컬럼 — 원문은 별도 테이블로 보내고 컬럼이 아닌 키는 무시한다.
 _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
@@ -239,66 +240,81 @@ def upsert_bid_notices(
 # --- 면허제한 upsert ----------------------------------------------------
 def upsert_license_limits(
     session: Session, rows: list[dict[str, Any]], collected_at: datetime,
-    *, stats: dict | None = None,
 ) -> tuple[int, int]:
-    """면허 복합 PK 를 묶음 IN 조회해 upsert 하고 flush 만 한다(삭제 없음).
+    """공고번호를 묶음 IN 조회해 면허 복합 PK 로 upsert 하고 flush 만 한다(삭제 없음).
 
     같은 배치의 중복 PK 는 마지막 값으로 흡수하며 최초 collected_at 은 보존한다.
-    다시 수신한 행은 유효 상태로 복원하고, stats 가 있으면 복원 건수를 누적한다.
+    기존 대체 상태는 유지한다. 대체·복원은 검증된 전체 조회 대조에서만 수행한다.
     """
     pk_names = ("bid_ntce_no", "bid_ntce_ord", "lmt_grp_no", "lmt_sno")
-    deduped = {tuple(row[name] for name in pk_names): row for row in rows}
-    pks = list(deduped)
+    normalized_rows = [{**row, "bid_ntce_ord": stored_order(row["bid_ntce_ord"])} for row in rows]
+    deduped = {tuple(row[name] for name in pk_names): row for row in normalized_rows}
+    nos = sorted({pk[0] for pk in deduped})
     existing = {}
-    pk_columns = tuple_(*(getattr(BidLicenseLimit, name) for name in pk_names))
-    # 복합 PK 4개 × 200행으로 SQLite 바인드 수에도 여유를 둔다.
-    for start in range(0, len(pks), 200):
+    # 기존 비정규 차수도 같은 PK 로 찾아 상태·물리 PK 를 보존한다(바인드 수 여유).
+    for start in range(0, len(nos), 200):
         for row in session.scalars(select(BidLicenseLimit).where(
-            pk_columns.in_(pks[start:start + 200])
+            BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 200])
         )):
-            existing[tuple(getattr(row, name) for name in pk_names)] = row
+            pk = (row.bid_ntce_no, stored_order(row.bid_ntce_ord), row.lmt_grp_no, row.lmt_sno)
+            existing.setdefault(pk, []).append(row)
     inserted = updated = 0
     columns = {column.name for column in BidLicenseLimit.__table__.columns}
     for pk, values in deduped.items():
         data = {key: value for key, value in values.items()
-                if key in columns and key != "collected_at"}
-        data["superseded_at"] = None
-        row = existing.get(pk)
-        if row is None:
-            session.add(BidLicenseLimit(**data, collected_at=collected_at))
+                if key in columns and key not in {"collected_at", "superseded_at"}}
+        matched_rows = existing.get(pk)
+        if matched_rows is None:
+            session.add(BidLicenseLimit(**data, collected_at=collected_at, superseded_at=None))
             inserted += 1
         else:
-            if row.superseded_at is not None and stats is not None:
-                stats["restored"] = stats.get("restored", 0) + 1
-            for key, value in data.items():
-                setattr(row, key, value)
+            for row in matched_rows:
+                for key, value in data.items():
+                    if key not in pk_names:
+                        setattr(row, key, value)
             updated += 1
     session.flush()
     return inserted, updated
 
 
-def mark_superseded_licenses(
-    session: Session, no: str, ord_: str, keep_pks: set[tuple], at: datetime,
-) -> int:
-    """전체 조회에 없는 같은 공고·차수의 유효 행을 대체 표시하고 flush 만 한다."""
-    if not keep_pks:
-        return 0  # 0행 응답은 지연·이상 가능성이 있어 기존 행을 보존한다.
-    # 분류기처럼 숫자 차수·비숫자 0채움 표기 차이를 흡수한다.
-    def order(value: str):
-        normalized, _ = _normalize_ord(value)
-        return normalized.zfill(3) if isinstance(normalized, str) else normalized
-
-    selected_order = order(ord_)
-    count = 0
-    for row in session.scalars(select(BidLicenseLimit).where(
-        BidLicenseLimit.bid_ntce_no == no, BidLicenseLimit.superseded_at.is_(None),
-    )):
-        pk = (row.bid_ntce_no, row.bid_ntce_ord, row.lmt_grp_no, row.lmt_sno)
-        if order(row.bid_ntce_ord) == selected_order and pk not in keep_pks:
-            row.superseded_at = at
-            count += 1
+def reconcile_license_limits(
+    session: Session, snapshots: list[tuple[str, str, set[tuple]]], at: datetime,
+) -> dict:
+    """검증된 전체 조회별로 대체·복원하고 flush 만 한다(공고번호 500개 이하 IN 조회)."""
+    by_pair = {
+        (no, normalize_order(ord_)): {
+            (pk[0], stored_order(pk[1]), *pk[2:]) for pk in keep_pks
+        }
+        for no, ord_, keep_pks in snapshots if keep_pks
+    }  # 0행 응답은 지연·이상 가능성이 있어 기존 행을 보존한다.
+    superseded = restored = 0
+    changed_pairs = set()
+    nos = sorted({no for no, _ in by_pair})
+    for start in range(0, len(nos), 500):
+        for row in session.scalars(select(BidLicenseLimit).where(
+            BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500]),
+        )):
+            pair = (row.bid_ntce_no, normalize_order(row.bid_ntce_ord))
+            keep_pks = by_pair.get(pair)
+            if keep_pks is None:
+                continue
+            pk = (row.bid_ntce_no, stored_order(row.bid_ntce_ord), row.lmt_grp_no, row.lmt_sno)
+            if pk in keep_pks:
+                if row.superseded_at is not None:
+                    row.superseded_at = None
+                    restored += 1
+                    changed_pairs.add(pair)
+            elif row.superseded_at is None:
+                row.superseded_at = at
+                superseded += 1
+                changed_pairs.add(pair)
     session.flush()
-    return count
+    labels = {(no, normalize_order(ord_)): f"{no}-{stored_order(ord_)}"
+              for no, ord_, keep_pks in snapshots if keep_pks}
+    notices = sorted(labels[pair] for pair in changed_pairs)
+    return {"superseded": superseded, "restored": restored,
+            "superseded_notices_count": len(notices),
+            **({"superseded_notices": notices} if len(notices) <= 50 else {})}
 
 
 # --- pre_spec upsert (Phase 5.3) ----------------------------------------

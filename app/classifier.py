@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import BidLicenseLimit, BidNotice, ListRule
+from app.ordering import normalize_order
 from app.repository import get_config
 
 
@@ -132,15 +133,6 @@ def classify_notice(
 
 def _split_codes(value: str | None) -> set[str]:
     return {code.strip() for code in (value or "").split(",") if code.strip()}
-
-
-def normalize_order(value: str) -> int | str:
-    """차수 표기 차이를 흡수한다(정수 우선, 아니면 3자리 0채움)."""
-    value = value.strip()
-    try:
-        return int(value)
-    except ValueError:
-        return value.zfill(3)
 
 
 def rule_set_from_rows(rows: Iterable[Mapping[str, Any] | ListRule]) -> RuleSet:
