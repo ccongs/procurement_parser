@@ -12,7 +12,9 @@ app_config 단일 행(id=1)을 기본값으로 시드한다(pre_spec 시드는 �
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +22,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+logger = logging.getLogger(__name__)
 
 # .env 로드 (프로젝트 루트의 .env)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -99,17 +103,29 @@ def init_db() -> None:
     - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관
       → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회).
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
+    - 동시 실행의 DB 오류는 전체 단계를 처음부터 최대 3회 실행해 흡수한다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
     from app import models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
-    _migrate_add_columns()
-    _migrate_match_basis_backfill()
-    _migrate_bid_notice_indexes()
-    _migrate_bid_notice_raw()
-    _seed_app_config()
-    _seed_list_rules()
+    for attempt in range(3):
+        try:
+            Base.metadata.create_all(bind=engine)
+            _migrate_add_columns()
+            _migrate_match_basis_backfill()
+            _migrate_bid_notice_indexes()
+            _migrate_bid_notice_raw()
+            _seed_app_config()
+            _seed_list_rules()
+            return
+        except (OperationalError, IntegrityError, ProgrammingError) as exc:
+            if attempt == 2:
+                raise
+            logger.warning(
+                "DB 초기화 재시도 %d/3: %s: %s",
+                attempt + 2, type(exc).__name__, " ".join(str(exc.orig).splitlines())[:200],
+            )
+            time.sleep((0.2, 0.5)[attempt])
 
 
 def _migrate_add_columns() -> None:
@@ -278,35 +294,45 @@ def _seed_app_config() -> None:
     """app_config 에 행이 없으면 기본값으로 id=1 단일 행을 생성한다."""
     from app.models import AppConfig
 
-    with SessionLocal() as session:
-        existing = session.get(AppConfig, 1)
-        if existing is not None:
+    for attempt in range(2):
+        try:
+            with SessionLocal() as session:
+                existing = session.get(AppConfig, 1)
+                if existing is not None:
+                    return
+                session.add(
+                    AppConfig(
+                        id=1,
+                        enabled=True,
+                        auto_halted=False,
+                        halt_code=None,
+                        halt_reason=None,
+                        interval_minutes=60,
+                        window_overlap_minutes=90,
+                        backfill_days=30,
+                        num_of_rows=20,
+                        max_retries=2,
+                        inqry_div="1",
+                        intrntnl_div_cd="1",
+                        indstryty_cds="1426,1468,1469,1470",
+                        prtcpt_lmt_rgn_cd="00",  # 신규 설치 기본 = 전국(지역제한 없는 공고만)
+                        presmpt_prce_bgn=None,
+                        presmpt_prce_end="100000000",
+                        last_success_dt=None,
+                        updated_at=datetime.now(),
+                        pre_spec_enabled=True,  # 사전규격 잡 기본 on (Phase 5.4)
+                        pre_spec_last_success_dt=None,
+                    )
+                )
+                session.commit()
             return
-        session.add(
-            AppConfig(
-                id=1,
-                enabled=True,
-                auto_halted=False,
-                halt_code=None,
-                halt_reason=None,
-                interval_minutes=60,
-                window_overlap_minutes=90,
-                backfill_days=30,
-                num_of_rows=20,
-                max_retries=2,
-                inqry_div="1",
-                intrntnl_div_cd="1",
-                indstryty_cds="1426,1468,1469,1470",
-                prtcpt_lmt_rgn_cd="00",  # 신규 설치 기본 = 전국(지역제한 없는 공고만)
-                presmpt_prce_bgn=None,
-                presmpt_prce_end="100000000",
-                last_success_dt=None,
-                updated_at=datetime.now(),
-                pre_spec_enabled=True,  # 사전규격 잡 기본 on (Phase 5.4)
-                pre_spec_last_success_dt=None,
-            )
-        )
-        session.commit()
+        except IntegrityError:
+            # 실패한 세션은 이미 롤백·종료됨. 새 세션에서 경쟁자의 생성을 확인한다.
+            with SessionLocal() as session:
+                if session.get(AppConfig, 1) is not None:
+                    return
+            if attempt == 1:
+                raise
 
 
 def _seed_list_rules() -> None:
