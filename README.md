@@ -93,7 +93,7 @@ uvicorn app.main:app --reload    # http://127.0.0.1:8000
 
 - DB 는 **SQLite 파일**(`procurement.db`). SQLite 동시성: WAL + `busy_timeout` 적용(첫 기동에서 `*.db-wal`/`*.db-shm` 생성).
 - **기동 = 수집 시작**: 앱이 뜨면 스케줄러 게이트 충족 시 수집이 시작된다(입찰·사전규격 기본 둘 다 ON). 원치 않으면 `/config` 에서 토글.
-- PK: 입찰=`bid_ntce_no`, 사전규격=`bf_spec_rgst_no`(자연키). 응답 원문은 입찰=`bid_notice_raw` 테이블, 사전규격=`raw_json` 컬럼으로 보존. 면허제한=`bid_license_limit`, 표시 규칙=`list_rule`.
+- PK: 입찰=`bid_ntce_no`, 사전규격=`bf_spec_rgst_no`(자연키). 응답 원문은 입찰=`bid_notice_raw` 테이블, 사전규격=`raw_json` 컬럼으로 보존. 면허제한=`bid_license_limit`(내용이 바뀐 이전 면허는 삭제하지 않고 `superseded_at` 으로 대체 표시), 면허 확인 대기=`license_verification`, 표시 규칙=`list_rule`.
 - 나라장터 API 의 `numOfRows` 상한은 **999**(1000 이상은 오류 없이 10행만 응답). 입찰공고·면허 일괄 조회는 999행 고정이며, 받은 건수가 전체 건수보다 적으면 해당 수집을 partial 로 기록하고 다음 회차에 다시 받는다.
 
 ## 디렉터리 구조 (요약)
