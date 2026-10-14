@@ -546,13 +546,14 @@ def test_upsert_license_limits_batched_last_wins_and_preserves_timestamp(session
 
 @pytest.mark.parametrize("order,expected", [
     ("1", "001"), (" 0001 ", "001"), ("001", "001"), ("1234", "1234"),
-    (" A ", "A"), (" 00A ", "00A"),
+    (" A ", "00A"), (" 00A ", "00A"),
 ])
 def test_license_values_normalizes_stored_order(order, expected):
     from app import classifier
     from app.ordering import normalize_order
     row = collector.license_values({"bidNtceNo": "ORDER", "bidNtceOrd": order})
     assert row["bid_ntce_ord"] == expected
+    assert normalize_order(row["bid_ntce_ord"]) == normalize_order(order)
     assert classifier.normalize_order is normalize_order
 
 

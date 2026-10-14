@@ -880,10 +880,10 @@ def test_safety_limit_is_partial_and_preserves_received_data(monkeypatch, db_eng
         assert session.get(AppConfig, 1).last_success_dt == WIN_BGN
         assert session.get(AppConfig, 1).auto_halted is False
         notice = session.get(BidNotice, "NEW")
-        assert notice.list_visible is (stage != "license")
+        assert notice.list_visible is (stage == "servc")
         assert session.get(BidNoticeRaw, "NEW") is not None
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
-            1 if stage == "servc" else 2
+            1 if stage == "servc" else 2 if stage == "license" else 0
         )
 
 
@@ -961,10 +961,10 @@ def test_short_api_pages_are_partial_and_keep_received_data(
         assert session.scalar(select(func.count()).select_from(BidNotice)) == (
             received if stage == "servc" else 1)
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
-            0 if stage == "servc" else received)
+            received if stage == "license" else 0)
         notice = session.get(BidNotice, "NEW-0" if stage == "servc" else "NEW")
-        assert notice.list_visible is True
-        assert detail["classify"]["visible"] == (received if stage == "servc" else 1)
+        assert notice.list_visible is (stage != "license_fix")
+        assert detail["classify"]["visible"] == (received if stage == "servc" else 1 if stage == "license" else 0)
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -1045,7 +1045,7 @@ def test_bulk_999_pages_receive_full_seven_day_counts(monkeypatch, operation, to
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
-@pytest.mark.parametrize("second_code", ["00", "03"])
+@pytest.mark.parametrize("second_code", ["00", "03", "03_total"])
 def test_first_total_count_is_preserved_when_later_page_changes(monkeypatch, stage, second_code):
     operation = collector.OPERATION if stage == "servc" else collector.LICENSE_OPERATION
     page_size = 20 if stage == "license_fix" else 999
@@ -1063,8 +1063,9 @@ def test_first_total_count_is_preserved_when_later_page_changes(monkeypatch, sta
     result = collector._fetch_pages(operation, {"inqryDiv": "2" if stage == "license_fix" else "1"},
                                     collector._ConfigSnapshot("1", "1", None, 20, 0))
     assert result["total_count"] == total and len(calls) == 2
+    assert result.get("total_count_changed", False) is (second_code != "03")
     assert result["outcome"] == ("ok" if second_code == "00" else "failed")
-    if second_code == "03":
+    if second_code != "00":
         assert result["error_msg"] == f"건수 미달: 고유 {page_size} / 전체 {total}"
 
 
@@ -1190,7 +1191,7 @@ def test_repeated_page_key_cannot_hide_missing_row(monkeypatch, db_engine, stage
         assert session.scalar(select(func.count()).select_from(BidNotice)) == (
             999 if stage == "servc" else 1)
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
-            0 if stage == "servc" else 999)
+            999 if stage == "license" else 0)
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -1768,17 +1769,22 @@ def test_full_snapshot_rejects_any_unconvertible_or_wrong_pair_row(
         assert session.get(AppConfig, 1).last_success_dt is None
 
 
-def test_full_snapshot_same_pk_with_unpadded_order_neither_supersedes_nor_duplicates(monkeypatch, db_engine):
+@pytest.mark.parametrize("stored_ord,response_ord", [("001", "1"), ("A", "00A"), ("00A", "A")])
+def test_full_snapshot_same_pk_with_unpadded_order_neither_supersedes_nor_duplicates(
+    monkeypatch, db_engine, stored_ord, response_ord,
+):
     _, Local = db_engine
-    old = _license("SAME-PK", "001", lmtGrpNo="1", lmtSno="1")
-    new = _license("SAME-PK", "001", code="9999", lmtGrpNo="1", lmtSno="2")
+    old = _license("SAME-PK", stored_ord, lmtGrpNo="1", lmtSno="1")
+    new = _license("SAME-PK", stored_ord, code="9999", lmtGrpNo="1", lmtSno="2")
     notice = _existing_notice("SAME-PK", indstryty_lmt_yn="Y")
-    notice.bid_ntce_ord = "001"
-    _seed(Local, notice, _stored_license(old))
+    notice.bid_ntce_ord = stored_ord
+    old_row = _stored_license(old)
+    old_row.bid_ntce_ord = stored_ord  # 기존 비정규 표기의 물리 PK 도 보존한다.
+    _seed(Local, notice, old_row)
 
     def responder(op, params):
-        rows = [_notice("SAME-PK", "001")] if op == collector.OPERATION else (
-            [new] if params["inqryDiv"] == "1" else [{**old, "bidNtceOrd": "1"}, new])
+        rows = [_notice("SAME-PK", stored_ord)] if op == collector.OPERATION else (
+            [new] if params["inqryDiv"] == "1" else [{**old, "bidNtceOrd": response_ord}, new])
         return _ok_result(rows, len(rows))
 
     _fake_api(monkeypatch, responder)
@@ -1788,7 +1794,8 @@ def test_full_snapshot_same_pk_with_unpadded_order_neither_supersedes_nor_duplic
     assert fix["superseded"] == fix["restored"] == 0
     with Local() as session:
         rows = session.scalars(select(BidLicenseLimit)).all()
-        assert len(rows) == 2 and all(row.bid_ntce_ord == "001" and row.superseded_at is None for row in rows)
+        assert len(rows) == 2 and all(row.superseded_at is None for row in rows)
+        assert {row.bid_ntce_ord for row in rows} == {stored_ord, new["bidNtceOrd"].zfill(3)}
         assert session.get(BidNotice, "SAME-PK").match_basis == "업종"
 
 
@@ -1826,3 +1833,162 @@ def test_full_snapshot_hash_duplicates_cannot_hide_missing_rows(monkeypatch, db_
         row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(active)))
         assert (row.superseded_at is None) is duplicate_hash
         assert session.get(BidNotice, "HASH-COUNT").list_visible is duplicate_hash
+
+
+@pytest.mark.parametrize("second_total", [2, 3, 1])
+def test_full_snapshot_count_change_neither_supersedes_restores_nor_saves(
+    monkeypatch, db_engine, second_total,
+):
+    _, Local = db_engine
+    active = _license("COUNT-CHANGE", lmtGrpNo="1", lmtSno="1")
+    restored = _license("COUNT-CHANGE", code="1470", lmtGrpNo="1", lmtSno="2")
+    new = _license("COUNT-CHANGE", code="9999", lmtGrpNo="1", lmtSno="3")
+    _seed(Local, _existing_notice("COUNT-CHANGE", indstryty_lmt_yn="Y",
+                                 list_visible=True, match_basis="업종", matched_indstryty_cds="1468"),
+          _stored_license(active), _stored_license(restored, superseded_at=WIN_BGN))
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 1
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        if params["inqryDiv"] == "1":
+            return _ok_result([new], 1)
+        if params["pageNo"] == "1":
+            return _ok_result([{**restored, "lcnsLmtNm": "변경/1470"}], 2)
+        return _ok_result([{**new, "lcnsLmtNm": "전체 조회만/9999"}], second_total)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    changed = second_total != 2
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert len(calls) == 4 and fix["total_count"] == fix["unique_items"] == 2
+    assert run.status == ("partial" if changed else "success")
+    assert fix.get("total_count_changed", False) is changed
+    assert fix["superseded"] == fix["restored"] == int(not changed)
+    assert fix["found"] == int(not changed)
+    if changed:
+        assert "totalCount 변화" in run.error_msg and "totalCount 변화" in fix["error_msg"]
+    with Local() as session:
+        active_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(active)))
+        restored_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(restored)))
+        new_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(new)))
+        assert (active_row.superseded_at is None) is changed
+        assert restored_row.superseded_at == (WIN_BGN if changed else None)
+        assert restored_row.lcns_nm == (collector.license_values(restored)["lcns_nm"] if changed else "변경")
+        assert new_row.lcns_nm == (collector.license_values(new)["lcns_nm"] if changed else "전체 조회만")
+        notice = session.get(BidNotice, "COUNT-CHANGE")
+        assert notice.list_visible is changed
+        assert notice.match_basis == ("업종" if changed else None)
+        assert session.get(AppConfig, 1).last_success_dt == (None if changed else WIN_END)
+
+
+@pytest.mark.parametrize("bad_row,reason", [
+    (_license("OTHER", lmtSno="3"), "다른 공고·차수"),
+    (_license("REJECT", "001", lmtSno="3"), "다른 공고·차수"),
+    ({"bidNtceOrd": "000"}, "변환 불가"),
+])
+def test_rejected_full_response_saves_no_rows_and_keeps_classification(
+    monkeypatch, db_engine, bad_row, reason,
+):
+    _, Local = db_engine
+    old = _license("REJECT", code="9999", lmtSno="1")
+    new = _license("REJECT", lmtSno="2")
+    _seed(Local, _existing_notice("REJECT", indstryty_lmt_yn="Y", list_visible=False),
+          _existing_notice("OTHER", indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(old, superseded_at=WIN_BGN))
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("REJECT")], 1)
+        if params["inqryDiv"] == "1":
+            return _ok_result()
+        return _ok_result([{**old, "lcnsLmtNm": "거절된 변경/1468"}, new, bad_row], 3)
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "partial" and reason in run.error_msg
+    assert fix["found"] == fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        row = session.scalars(select(BidLicenseLimit)).one()
+        assert row.superseded_at == WIN_BGN and row.lcns_cd == "9999"
+        assert row.lcns_nm == collector.license_values(old)["lcns_nm"]
+        for no in ("REJECT", "OTHER"):
+            notice = session.get(BidNotice, no)
+            assert notice.list_visible is False and notice.match_basis is None
+            assert notice.matched_indstryty_cds is None
+        assert session.get(AppConfig, 1).last_success_dt is None
+
+
+@pytest.mark.parametrize("existing", ["none", "other_order", "active", "superseded"])
+@pytest.mark.parametrize("invalid", [None, "count_change", "wrong_pair", "unconvertible"])
+def test_duplicate_hash_snapshot_skips_comparison_only_without_existing_pair(
+    monkeypatch, db_engine, existing, invalid,
+):
+    _, Local = db_engine
+    hashed = _license("DUPLICATE")
+    old = _license("DUPLICATE", "001" if existing == "other_order" else "000",
+                   code="9999", lmtSno="1")
+    _seed(Local, _existing_notice("DUPLICATE", indstryty_lmt_yn="Y"))
+    if existing != "none":
+        _seed(Local, _stored_license(old, superseded_at=WIN_BGN if existing == "superseded" else None))
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 1
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("DUPLICATE")], 1)
+        if params["inqryDiv"] == "1":
+            # 유효 행이 있으면 새 PK 로 확인 조회를 유도한다.
+            return _ok_result([_license("DUPLICATE", code="9999", lmtSno="2")], 1) if existing == "active" else _ok_result()
+        row = hashed
+        total = 2
+        if params["pageNo"] == "2":
+            if invalid == "count_change":
+                total = 3
+            elif invalid == "wrong_pair":
+                row = {**hashed, "bidNtceNo": "OTHER"}
+            elif invalid == "unconvertible":
+                row = {"bidNtceOrd": "000"}
+        return _ok_result([row], total)
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    accepted = invalid is None and existing in {"none", "other_order"}
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("success" if accepted else "partial")
+    assert fix["called"] == 1 and fix["superseded"] == fix["restored"] == 0
+    assert fix["found"] == int(accepted)
+    if invalid is None and not accepted:
+        assert "고유 PK 미달" in run.error_msg
+    with Local() as session:
+        row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(hashed)))
+        assert (row is not None) is accepted
+        if row is not None:
+            assert row.superseded_at is None
+        if existing != "none":
+            row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+            assert row.superseded_at == (WIN_BGN if existing == "superseded" else None)
+        assert session.get(AppConfig, 1).last_success_dt == (WIN_END if accepted else None)
+
+
+@pytest.mark.parametrize("stage", ["servc", "license"])
+def test_bulk_count_change_only_records_history_without_changing_outcome(monkeypatch, db_engine, stage):
+    def responder(op, params):
+        current = "servc" if op == collector.OPERATION else "license"
+        if current != stage:
+            return _ok_result()
+        if params["pageNo"] == "1":
+            return _ok_result([{"page": 1}] * 999, 1000)
+        return _ok_result([{"page": 2}], 1001)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    detail = json.loads(run.detail_json)["by_call"][stage]
+    assert run.status == "success" and detail["outcome"] == "ok"
+    assert len(calls) == 3 and detail["pages"] == 2
+    assert detail["total_count"] == detail["unique_items"] == 1000
+    assert detail["total_count_changed"] is True and detail["error_msg"] is None

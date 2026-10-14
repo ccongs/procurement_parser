@@ -263,6 +263,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
     pages_fetched = 0
     last_code: str | None = None
     total_count: int | None = None
+    paging_flags: dict[str, bool] = {}
     max_page: int | None = None
     page = 1
 
@@ -282,6 +283,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "last_code": last_code,
                     "retry_count": retry_count,
                     "total_count": total_count,
+                    **paging_flags,
                     "outcome": "halt",
                     "halt_code": halt_code,
                     "error_msg": f"resultCode={halt_code} "
@@ -295,6 +297,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "last_code": last_code,
                     "retry_count": retry_count,
                     "total_count": total_count,
+                    **paging_flags,
                     "outcome": "failed",
                     "halt_code": None,
                     "error_msg": result.error
@@ -304,6 +307,13 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             # outcome == "ok"
             pages_fetched += 1
             if result.result_code == "03":  # No Data → 종료
+                try:
+                    response_total_count = int(_text(result.total_count))
+                    if (total_count is not None and response_total_count >= 0
+                            and response_total_count != total_count):
+                        paging_flags["total_count_changed"] = True
+                except ValueError:
+                    pass  # 03은 totalCount 없이도 정상 종료하는 기존 규칙을 유지한다.
                 if total_count is None:
                     total_count = 0
                 break
@@ -318,12 +328,15 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "items": items, "pages": pages_fetched, "last_code": last_code,
                     "unique_items": _count_unique_items(operation, items),
                     "retry_count": retry_count, "total_count": total_count,
+                    **paging_flags,
                     "outcome": "failed", "halt_code": None,
                     "error_msg": "totalCount 누락/오류",
                 }
             if max_page is None:
                 total_count = response_total_count
                 max_page = total_pages(total_count, page_size)
+            elif response_total_count != total_count:
+                paging_flags["total_count_changed"] = True
 
             if page >= max_page:
                 break
@@ -339,6 +352,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "unique_items": _count_unique_items(operation, items),
                     "retry_count": retry_count, "outcome": "failed", "halt_code": None,
                     "total_count": total_count,
+                    **paging_flags,
                     "truncated": True,
                     "error_msg": f"안전 상한({_MAX_PAGES_SAFETY}페이지) 도달 — 잘린 수집",
                 }
@@ -352,6 +366,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
             "last_code": last_code,
             "retry_count": retry_count,
             "total_count": total_count,
+            **paging_flags,
             "outcome": "failed",
             "halt_code": None,
             "error_msg": f"ApiClientError: {exc}",
@@ -370,6 +385,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
         "last_code": last_code,
         "retry_count": retry_count,
         "total_count": total_count,
+        **paging_flags,
         "outcome": "failed" if shortfall else "ok",
         "halt_code": None,
         "error_msg": error_msg,
@@ -402,6 +418,7 @@ def _call_detail(result: dict, **counts) -> dict:
             "unique_items": result["unique_items"],
             "total_count": result["total_count"], "error_msg": result["error_msg"],
             **({"truncated": True} if result.get("truncated") else {}),
+            **({"total_count_changed": True} if result.get("total_count_changed") else {}),
             **counts, "retry_count": result["retry_count"]}
 
 
@@ -490,6 +507,16 @@ def collect_window(
                 for item in _missing_license_targets(session, notices, licenses) + verify_targets
             }
             targets = list(targets_by_pair.values())
+            existing_license_pairs = set()
+            target_nos = sorted({no for no, _ in targets_by_pair})
+            for start in range(0, len(target_nos), 500):
+                existing_license_pairs.update(
+                    (no, classifier.normalize_order(ord_)) for no, ord_ in session.execute(
+                        select(BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord).where(
+                            BidLicenseLimit.bid_ntce_no.in_(target_nos[start:start + 500])
+                        ).distinct()
+                    )
+                )
             if len(targets) >= 50:
                 logger.warning("면허 보정·확인 대상 %d건(확인 %d건) — 이번 창 공고 %d건",
                                len(targets), len(verify_targets), len(notices))
@@ -508,33 +535,41 @@ def collect_window(
                                       if fix["total_count"] is not None
                                       and result["total_count"] is not None else None)
                 rows = [row for raw in result["items"] if (row := license_values(raw)) is not None]
-                licenses.update({_license_key(row): row for row in rows})
-                if rows:
-                    fix["found"] += 1
+                if result.get("total_count_changed"):
+                    fix["total_count_changed"] = True
                 if result["outcome"] == "halt":
                     fix["outcome"] = "failed"
                     fix["error_msg"] = result["error_msg"]
                     fix["failed"].append(no)
                     return halt("license_fix", result)
-                if result["outcome"] == "ok" and result["items"]:
+                if result["outcome"] == "ok":
                     ord_ = _text(item["bidNtceOrd"])
                     # 모든 행이 변환·대상 검증을 통과해야 하며, 해시 PK 중복도 제거해 검증한다.
                     validation_error = None
-                    if len(rows) != len(result["items"]):
+                    if result.get("total_count_changed"):
+                        validation_error = "전체 조회 페이지 사이 totalCount 변화"
+                    elif len(rows) != len(result["items"]):
                         validation_error = "전체 조회 변환 불가 행 포함"
                     elif any(row["bid_ntce_no"] != no or
                              classifier.normalize_order(row["bid_ntce_ord"])
                              != classifier.normalize_order(ord_) for row in rows):
                         validation_error = "전체 조회 다른 공고·차수 행 포함"
                     keep_pks = {_license_key(row) for row in rows}
-                    if validation_error is None and len(keep_pks) < result["total_count"]:
+                    pk_shortfall = len(keep_pks) < result["total_count"]
+                    # 기존 유효·대체 행이 모두 없으면 해시 중복은 저장만 하고 대조는 생략한다.
+                    if (validation_error is None and pk_shortfall
+                            and (no, classifier.normalize_order(ord_)) in existing_license_pairs):
                         validation_error = (f"전체 조회 변환 후 고유 PK 미달: "
                                             f"고유 {len(keep_pks)} / 전체 {result['total_count']}")
                     if validation_error:
                         result = {**result, "outcome": "failed",
                                   "error_msg": f"{no}-{ord_}: {validation_error}"}
                     else:
-                        full_license_keys.append((no, ord_, keep_pks))
+                        licenses.update({_license_key(row): row for row in rows})
+                        if rows:
+                            fix["found"] += 1
+                        if keep_pks and not pk_shortfall:
+                            full_license_keys.append((no, ord_, keep_pks))
                 if result["outcome"] == "failed":
                     fix["outcome"] = "failed"
                     fix["error_msg"] = "; ".join(filter(None, [fix.get("error_msg"), result["error_msg"]]))

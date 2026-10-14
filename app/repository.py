@@ -280,7 +280,10 @@ def upsert_license_limits(
 def reconcile_license_limits(
     session: Session, snapshots: list[tuple[str, str, set[tuple]]], at: datetime,
 ) -> dict:
-    """검증된 전체 조회별로 대체·복원하고 flush 만 한다(공고번호 500개 이하 IN 조회)."""
+    """검증된 전체 조회별로 대체·복원하고 flush 만 한다(공고번호 500개 이하 IN 조회).
+
+    superseded_notices 와 그 개수에는 복원만 일어난 공고·차수도 포함한다.
+    """
     by_pair = {
         (no, normalize_order(ord_)): {
             (pk[0], stored_order(pk[1]), *pk[2:]) for pk in keep_pks

@@ -11,9 +11,5 @@ def normalize_order(value: str) -> int | str:
 
 
 def stored_order(value: str) -> str:
-    """숫자 차수는 API 표기인 3자리로 저장하고 비숫자는 공백만 제거한다."""
-    value = value.strip()
-    try:
-        return str(int(value)).zfill(3)
-    except ValueError:
-        return value
+    """비교와 같은 규칙으로 정규화한 차수를 3자리 0채움해 저장한다."""
+    return str(normalize_order(value)).zfill(3)
