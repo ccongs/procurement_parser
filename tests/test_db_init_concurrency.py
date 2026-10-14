@@ -3,6 +3,7 @@
 import logging
 import multiprocessing
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import Column, MetaData, Table, create_engine, event, inspect, select
@@ -59,6 +60,10 @@ def _assert_initialized(engine, *, legacy=False):
     indexes = {i["name"]: i["column_names"] for i in inspector.get_indexes("bid_notice")}
     for name, columns in INDEXES.items():
         assert indexes[name] == columns
+    for table in db.Base.metadata.sorted_tables:
+        actual = {i["name"]: i["column_names"] for i in inspector.get_indexes(table.name)}
+        for index in table.indexes:
+            assert actual[index.name] == [c.name for c in index.columns]
     with sessionmaker(bind=engine)() as session:
         config = session.scalars(select(AppConfig)).one()
         assert config.id == 1 and config.enabled and config.pre_spec_enabled
@@ -84,42 +89,47 @@ def _assert_initialized(engine, *, legacy=False):
             assert notice.pub_prcrmnt_clsfc_nm == "정보시스템개발"
 
 
-@pytest.mark.parametrize("stage", ["create_all", "alter", "index", "raw", "config"])
+@pytest.mark.parametrize("stage", ["create_all", "alter", "index", "raw", "config", "sequence"])
 def test_other_connection_wins_after_check_before_creation(database, monkeypatch, stage):
     engine = database
     if stage != "create_all":
         _old_notice_table(engine)
     attempts, sleeps, connections, errors = [], [], [], []
     create_all = db.Base.metadata.create_all
+    create_tables = db._create_model_tables
+    competed = []
 
-    def count_attempt(**kwargs):
+    def count_attempt():
         attempts.append(True)
-        return create_all(**kwargs)
+        return create_tables()
 
-    monkeypatch.setattr(db.Base.metadata, "create_all", count_attempt)
-    monkeypatch.setattr(db.time, "sleep", sleeps.append)
+    monkeypatch.setattr(db, "_create_model_tables", count_attempt)
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
 
     def compete(conn, cursor, statement, parameters, context, executemany):
         sql = statement.lstrip()
-        target = {
+        targets = {
             "create_all": sql.startswith("CREATE TABLE"),
             "alter": sql.startswith("ALTER TABLE bid_notice ADD COLUMN"),
             "index": any(sql.startswith(f"CREATE INDEX {name} ") for name in INDEXES),
             "raw": sql.startswith("INSERT INTO bid_notice_raw "),
             "config": sql.startswith("INSERT INTO app_config "),
-        }[stage]
-        if not target or connections:
+        }
+        candidates = ("create_all", "alter", "index") if stage == "sequence" else (stage,)
+        target = next((name for name in candidates if targets[name] and name not in competed), None)
+        if target is None:
             return
         # 존재 확인 직후·생성 직전에 별도 연결이 같은 객체를 먼저 만든다.
+        competed.append(target)
         connections.append(conn)
         with engine.begin() as other:
             assert other is not conn
             connections.append(other)
-            if stage == "create_all":
+            if target == "create_all":
                 create_all(bind=other)
-            elif stage in {"alter", "index"}:
+            elif target in {"alter", "index"}:
                 other.exec_driver_sql(statement, parameters)
-            elif stage == "raw":
+            elif target == "raw":
                 other.execute(BidNoticeRaw.__table__.insert(), {
                     "bid_ntce_no": "LEGACY", "raw_json": RAW_JSON, "updated_at": NOW,
                 })
@@ -137,11 +147,13 @@ def test_other_connection_wins_after_check_before_creation(database, monkeypatch
     finally:
         event.remove(engine, "before_cursor_execute", compete)
         event.remove(engine, "handle_error", record_error)
-    assert len(connections) == 2
-    assert len(errors) == 1
-    assert isinstance(errors[0], IntegrityError if stage in {"raw", "config"} else OperationalError)
-    assert len(attempts) == (1 if stage == "config" else 2)
-    assert sleeps == ([] if stage == "config" else [0.2])
+    assert competed == (["create_all", "alter", "index"] if stage == "sequence" else [stage])
+    assert len(connections) == (6 if stage == "sequence" else 2)
+    assert len(errors) == (3 if stage == "sequence" else 1)
+    assert all(isinstance(error, IntegrityError if stage in {"raw", "config"}
+                          else OperationalError) for error in errors)
+    assert len(attempts) == 1
+    assert sleeps == []
     _assert_initialized(engine, legacy=stage != "create_all")
     db.init_db()
     _assert_initialized(engine, legacy=stage != "create_all")
@@ -151,7 +163,7 @@ def test_other_connection_wins_after_check_before_creation(database, monkeypatch
 @pytest.mark.parametrize("stage", [
     "create_all", "_migrate_add_columns", "_migrate_match_basis_backfill",
     "_migrate_bid_notice_indexes", "_migrate_bid_notice_raw", "_seed_app_config",
-    "_seed_list_rules",
+    "_seed_list_rules", "_validate_model_indexes",
 ])
 def test_init_retries_entire_sequence_three_times_then_raises(
     database, monkeypatch, caplog, stage, error_type,
@@ -159,7 +171,7 @@ def test_init_retries_entire_sequence_three_times_then_raises(
     stages = [
         "create_all", "_migrate_add_columns", "_migrate_match_basis_backfill",
         "_migrate_bid_notice_indexes", "_migrate_bid_notice_raw", "_seed_app_config",
-        "_seed_list_rules",
+        "_seed_list_rules", "_validate_model_indexes",
     ]
     calls, errors, sleeps = [], [], []
 
@@ -172,10 +184,10 @@ def test_init_retries_entire_sequence_three_times_then_raises(
                 raise error
         return run
 
-    monkeypatch.setattr(db.Base.metadata, "create_all", step("create_all"))
+    monkeypatch.setattr(db, "_create_model_tables", step("create_all"))
     for name in stages[1:]:
         monkeypatch.setattr(db, name, step(name))
-    monkeypatch.setattr(db.time, "sleep", sleeps.append)
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
     with caplog.at_level(logging.WARNING, logger="app.db"):
         with pytest.raises(error_type) as raised:
             db.init_db()
@@ -185,8 +197,11 @@ def test_init_retries_entire_sequence_three_times_then_raises(
     warnings = [r.getMessage() for r in caplog.records if r.name == "app.db"]
     assert len(warnings) == 2
     assert "2/3" in warnings[0] and "3/3" in warnings[1]
+    assert all(f"단계={stage}" in warning for warning in warnings)
+    assert "대기=0.2초" in warnings[0] and "대기=0.5초" in warnings[1]
     assert all(error_type.__name__ in w and "반복 실패 주입" in w and "\n" not in w
                for w in warnings)
+    assert all("SQL" not in w and "{}" not in w for w in warnings)
 
 
 def test_init_does_not_retry_unrelated_error(database, monkeypatch):
@@ -201,6 +216,102 @@ def test_init_does_not_retry_unrelated_error(database, monkeypatch):
     with pytest.raises(RuntimeError) as raised:
         db.init_db()
     assert raised.value is error and calls == [True]
+
+
+@pytest.mark.parametrize("index_name", ["ix_bid_notice_bid_ntce_dt", "ix_pre_spec_rcpt_dt"])
+def test_create_all_partial_index_failure_recovers_all_model_indexes(
+    database, monkeypatch, index_name,
+):
+    failures, sleeps = [], []
+
+    def fail_index_once(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith(f"CREATE INDEX {index_name} ") and not failures:
+            failures.append(True)
+            raise OperationalError(statement, parameters, Exception("인덱스 생성 실패 주입"))
+
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
+    event.listen(database, "before_cursor_execute", fail_index_once)
+    try:
+        db.init_db()
+    finally:
+        event.remove(database, "before_cursor_execute", fail_index_once)
+    assert failures == [True]
+    assert sleeps == []
+    _assert_initialized(database)
+
+
+@pytest.mark.parametrize("index_name", ["ix_bid_notice_dminstt_cd", "ix_pre_spec_rcpt_dt"])
+def test_validate_model_indexes_rejects_missing_index(database, index_name):
+    db.init_db()
+    index = next(index for table in db.Base.metadata.sorted_tables
+                 for index in table.indexes if index.name == index_name)
+    index.drop(bind=database)
+    with pytest.raises(OperationalError, match=index_name):
+        db._validate_model_indexes()
+    db.init_db()
+    _assert_initialized(database)
+
+
+def test_init_retries_when_final_index_validation_finds_missing_index(
+    database, monkeypatch, caplog,
+):
+    seed_rules = db._seed_list_rules
+    calls, sleeps = [], []
+    index = next(i for i in BidNotice.__table__.indexes if i.name == "ix_bid_notice_openg_dt")
+
+    def drop_after_index_migration():
+        seed_rules()
+        calls.append(True)
+        if len(calls) == 1:
+            index.drop(bind=database)
+
+    monkeypatch.setattr(db, "_seed_list_rules", drop_after_index_migration)
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
+    with caplog.at_level(logging.WARNING, logger="app.db"):
+        db.init_db()
+    assert calls == [True, True] and sleeps == [0.2]
+    assert "단계=_validate_model_indexes" in caplog.text
+    _assert_initialized(database)
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_raw_integrity_error_retries_batch_once_in_new_transaction(
+    database, failures,
+):
+    db.init_db()
+    with database.begin() as conn:
+        conn.execute(BidNotice.__table__.insert(), {
+            "bid_ntce_no": "LEGACY", "raw_json": RAW_JSON,
+            "collected_at": NOW, "updated_at": NOW,
+        })
+    transactions, errors = [], []
+
+    def fail_after_update(conn, cursor, statement, parameters, context, executemany):
+        if not statement.startswith("UPDATE bid_notice SET"):
+            return
+        transactions.append(conn.get_transaction())
+        if len(errors) < failures:
+            error = IntegrityError(statement, parameters, Exception("배치 충돌 주입"))
+            errors.append(error)
+            raise error
+
+    event.listen(database, "after_cursor_execute", fail_after_update)
+    try:
+        if failures == 1:
+            db._migrate_bid_notice_raw()
+        else:
+            with pytest.raises(IntegrityError) as raised:
+                db._migrate_bid_notice_raw()
+            assert raised.value is errors[-1]
+    finally:
+        event.remove(database, "after_cursor_execute", fail_after_update)
+    assert len(transactions) == 2 and transactions[0] is not transactions[1]
+    assert all(not transaction.is_active for transaction in transactions)
+    with db.SessionLocal() as session:
+        notice = session.get(BidNotice, "LEGACY")
+        raw = session.get(BidNoticeRaw, "LEGACY")
+        assert notice.raw_json == (None if failures == 1 else RAW_JSON)
+        assert (raw.raw_json if raw else None) == (RAW_JSON if failures == 1 else None)
 
 
 @pytest.mark.parametrize("failures", [1, 2])
@@ -244,7 +355,19 @@ def test_config_missing_after_integrity_error_retries_once(database, monkeypatch
         assert len(session.scalars(select(AppConfig)).all()) == (1 if failures == 1 else 0)
 
 
-def _init_worker(database_url, barrier):
+def _init_worker(database_url, barrier, stderr_path):
+    from contextlib import redirect_stderr
+    import traceback
+
+    with open(stderr_path, "w") as stderr, redirect_stderr(stderr):
+        try:
+            _run_init_worker(database_url, barrier)
+        except BaseException:
+            traceback.print_exc(file=stderr)
+            raise
+
+
+def _run_init_worker(database_url, barrier):
     """spawn 자식 프로세스마다 임시 DB 전용 engine 을 사용."""
     import os
 
@@ -264,7 +387,7 @@ def _init_worker(database_url, barrier):
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["new", "old-schema"])
-def test_four_processes_init_together(database, monkeypatch, legacy):
+def test_four_processes_init_together(database, monkeypatch, tmp_path, legacy):
     engine = database
     if legacy:
         _old_notice_table(engine)
@@ -272,14 +395,20 @@ def test_four_processes_init_together(database, monkeypatch, legacy):
     monkeypatch.setenv("DATABASE_URL", database_url)
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(4)
-    processes = [context.Process(target=_init_worker, args=(database_url, barrier))
-                 for _ in range(4)]
+    stderr_paths = [tmp_path / f"worker-{i}.stderr" for i in range(4)]
+    processes = [context.Process(target=_init_worker, args=(database_url, barrier, stderr_path))
+                 for stderr_path in stderr_paths]
     try:
         for process in processes:
             process.start()
         for process in processes:
-            process.join(timeout=30)
-        assert [p.exitcode for p in processes] == [0] * 4
+            process.join(timeout=90)
+        diagnostics = "\n".join(
+            f"pid={process.pid}, exitcode={process.exitcode}, stderr="
+            f"{stderr_path.read_text() if stderr_path.exists() else '<미생성>'}"
+            for process, stderr_path in zip(processes, stderr_paths)
+        )
+        assert [p.exitcode for p in processes] == [0] * 4, diagnostics
     finally:
         for process in processes:
             if process.is_alive():

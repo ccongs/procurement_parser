@@ -65,8 +65,8 @@ def _apply_sqlite_pragmas(dbapi_connection, connection_record) -> None:  # noqa:
     (예: `:memory:` 의 WAL 미지원) 다른 PRAGMA 적용을 막지 않도록 개별 try 로 감싼다.
     """
     pragmas = (
-        "PRAGMA journal_mode=WAL",      # 읽기/쓰기 동시성↑ (웹 GET 이 수집 쓰기를 막지 않음)
         "PRAGMA busy_timeout=30000",    # 잠금 대기 30초 (짧은 쓰기 경쟁 흡수)
+        "PRAGMA journal_mode=WAL",      # 읽기/쓰기 동시성↑ (웹 GET 이 수집 쓰기를 막지 않음)
         "PRAGMA synchronous=NORMAL",    # WAL 과 함께 안전·고속
     )
     for stmt in pragmas:
@@ -104,28 +104,62 @@ def init_db() -> None:
       → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회).
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     - 동시 실행의 DB 오류는 전체 단계를 처음부터 최대 3회 실행해 흡수한다.
+    - 잠금 대기 오류(database is locked)는 시도마다 busy_timeout 만큼 대기(최대 3회).
+    - 하위 단계(_run_once·_seed_app_config)의 자체 재시도와 겹칠 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
     from app import models  # noqa: F401
 
+    stages = (
+        ("create_all", _create_model_tables),
+        ("_migrate_add_columns", _migrate_add_columns),
+        ("_migrate_match_basis_backfill", _migrate_match_basis_backfill),
+        ("_migrate_bid_notice_indexes", _migrate_bid_notice_indexes),
+        ("_migrate_bid_notice_raw", _migrate_bid_notice_raw),
+        ("_seed_app_config", _seed_app_config),
+        ("_seed_list_rules", _seed_list_rules),
+        ("_validate_model_indexes", _validate_model_indexes),
+    )
     for attempt in range(3):
         try:
-            Base.metadata.create_all(bind=engine)
-            _migrate_add_columns()
-            _migrate_match_basis_backfill()
-            _migrate_bid_notice_indexes()
-            _migrate_bid_notice_raw()
-            _seed_app_config()
-            _seed_list_rules()
+            for stage_name, stage in stages:
+                stage()
             return
         except (OperationalError, IntegrityError, ProgrammingError) as exc:
             if attempt == 2:
                 raise
+            delay = (0.2, 0.5)[attempt]
             logger.warning(
-                "DB 초기화 재시도 %d/3: %s: %s",
-                attempt + 2, type(exc).__name__, " ".join(str(exc.orig).splitlines())[:200],
+                "DB 초기화 재시도 %d/3: 단계=%s, 대기=%.1f초: %s: %s",
+                attempt + 2, stage_name, delay, type(exc).__name__,
+                " ".join(str(exc.orig).splitlines())[:200],
             )
-            time.sleep((0.2, 0.5)[attempt])
+            time.sleep(delay)
+
+
+def _create_if_missing(create: Callable[[], None], exists: Callable[[], bool]) -> None:
+    """존재 확인 후 DDL 실행. 실패한 트랜잭션 종료 뒤 경쟁자의 생성을 재확인."""
+    if exists():
+        return
+    try:
+        create()
+    except (OperationalError, IntegrityError, ProgrammingError):
+        if not exists():
+            raise
+
+
+def _create_model_tables() -> None:
+    """테이블별 생성 경합은 해당 테이블의 존재를 재확인해 처리한다."""
+    for table in Base.metadata.sorted_tables:
+        _create_if_missing(
+            lambda: Base.metadata.create_all(bind=engine, tables=[table]),
+            lambda: inspect(engine).has_table(table.name, schema=table.schema),
+        )
+
+
+def _execute_ddl(statement: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(statement))
 
 
 def _migrate_add_columns() -> None:
@@ -145,7 +179,7 @@ def _migrate_add_columns() -> None:
     def colset(t: str) -> set[str]:
         return {c["name"] for c in insp.get_columns(t)}
 
-    stmts: list[str] = []
+    stmts: list[tuple[str, str, str]] = []
     if "bid_notice" in tables:
         bn = colset("bid_notice")
         additions = {
@@ -157,36 +191,38 @@ def _migrate_add_columns() -> None:
         }
         for name, definition in additions.items():
             if name not in bn:
-                stmts.append(f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}")
+                stmts.append(("bid_notice", name,
+                              f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}"))
     if "collection_run" in tables and "source" not in colset("collection_run"):
-        stmts.append(
+        stmts.append(("collection_run", "source",
             "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
-        )
+        ))
     if "app_config" in tables:
         ac = colset("app_config")
         if "pre_spec_enabled" not in ac:
             # PG 이전 시 DEFAULT 1 → DEFAULT true 로 조정.
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_enabled",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_enabled BOOLEAN NOT NULL DEFAULT 1"
-            )
+            ))
         if "pre_spec_last_success_dt" not in ac:
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_last_success_dt",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_last_success_dt DATETIME"
-            )
+            ))
         # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위(신규 컬럼 2개).
         if "pre_spec_amt_bgn" not in ac:
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_amt_bgn",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_amt_bgn VARCHAR(25)"
-            )
+            ))
         if "pre_spec_amt_end" not in ac:
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_amt_end",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_amt_end VARCHAR(25)"
-            )
+            ))
 
-    if stmts:
-        with engine.begin() as conn:
-            for s in stmts:
-                conn.execute(text(s))
+    for table_name, column_name, statement in stmts:
+        _create_if_missing(
+            lambda: _execute_ddl(statement),
+            lambda: column_name in {c["name"] for c in inspect(engine).get_columns(table_name)},
+        )
 
 
 def _run_once(name: str, work: Callable[[Connection], None]) -> None:
@@ -225,19 +261,27 @@ def _migrate_match_basis_backfill() -> None:
 
 
 def _migrate_bid_notice_indexes() -> None:
-    """기존 DB 에 누락된 Phase 13.1 인덱스만 표준 CREATE INDEX 로 생성."""
-    from app.models import BidNotice
+    """모든 모델 테이블의 누락 인덱스를 복구한다(이름 고정 3종 포함)."""
+    for table in Base.metadata.sorted_tables:
+        for index in sorted(table.indexes, key=lambda index: index.name):
+            _create_if_missing(
+                lambda: index.create(bind=engine),
+                lambda: index.name in _index_names(table),
+            )
 
-    names = {idx["name"] for idx in inspect(engine).get_indexes("bid_notice")}
-    required = {
-        "ix_bid_notice_visible_ntce_dt",
-        "ix_bid_notice_visible_openg_dt",
-        "ix_bid_notice_indstryty_lmt_yn",
-    }
-    with engine.begin() as conn:
-        for index in BidNotice.__table__.indexes:
-            if index.name in required and index.name not in names:
-                index.create(bind=conn)
+
+def _index_names(table) -> set[str]:  # noqa: ANN001
+    return {idx["name"] for idx in inspect(engine).get_indexes(table.name, schema=table.schema)}
+
+
+def _validate_model_indexes() -> None:
+    """반환 전에 모델 정의 인덱스 전체를 확인하며 누락은 전체 재시도 대상으로 올린다."""
+    for table in Base.metadata.sorted_tables:
+        missing = {index.name for index in table.indexes} - _index_names(table)
+        if missing:
+            raise OperationalError(None, None, Exception(
+                f"모델 인덱스 누락: {table.name}: {', '.join(sorted(missing))}"
+            ))
 
 
 def _migrate_bid_notice_raw() -> None:
@@ -247,7 +291,7 @@ def _migrate_bid_notice_raw() -> None:
 
     notice = BidNotice.__table__
     raw = BidNoticeRaw.__table__
-    while True:
+    def migrate_batch() -> bool:
         with engine.begin() as conn:
             rows = conn.execute(
                 select(
@@ -259,7 +303,7 @@ def _migrate_bid_notice_raw() -> None:
                 .limit(500)
             ).mappings().all()
             if not rows:
-                break
+                return False
             existing = set(conn.execute(
                 select(raw.c.bid_ntce_no).where(
                     raw.c.bid_ntce_no.in_([row["bid_ntce_no"] for row in rows])
@@ -288,6 +332,18 @@ def _migrate_bid_notice_raw() -> None:
                     notice.update().where(notice.c.bid_ntce_no == row["bid_ntce_no"])
                     .values(**values)
                 )
+        return True
+
+    while True:
+        for attempt in range(2):
+            try:
+                if not migrate_batch():
+                    return
+                break
+            except IntegrityError:
+                # 해당 배치만 롤백한 뒤 새 트랜잭션에서 경쟁자의 원문을 다시 조회한다.
+                if attempt == 1:
+                    raise
 
 
 def _seed_app_config() -> None:
