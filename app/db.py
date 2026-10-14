@@ -95,15 +95,20 @@ def _register_sqlite_pragmas(eng) -> None:  # noqa: ANN001
 _register_sqlite_pragmas(engine)
 
 
+class IndexDefinitionMismatchError(RuntimeError):
+    """동명 인덱스의 정의가 모델과 달라 초기화를 중단해야 하는 스키마 오류."""
+
+
 def init_db() -> None:
     """모델 테이블 생성 + 자동 마이그레이션 + 설정·표시 규칙 기본값 시드.
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
-      create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
-    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관
-      → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회).
+      테이블 생성 단계가 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
+    - 순서: 모델 테이블 생성 → 컬럼 ALTER·기존 분류값 보정 → 인덱스 확인·생성 → 원문 이관
+      → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회) → 모델 인덱스 최종 검증.
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
-    - 동시 실행의 DB 오류는 전체 단계를 처음부터 최대 3회 실행해 흡수한다.
+    - 동시 실행 경합은 단계 내 재확인·원문 배치 1회 재처리로 우선 흡수한다.
+      남은 DB 오류는 마지막 안전장치로 전체 단계를 처음부터 최대 3회 실행한다.
     - 잠금 대기 오류(database is locked)는 시도마다 busy_timeout 만큼 대기(최대 3회).
     - 하위 단계(_run_once·_seed_app_config)의 자체 재시도와 겹칠 수 있다.
     """
@@ -111,14 +116,14 @@ def init_db() -> None:
     from app import models  # noqa: F401
 
     stages = (
-        ("create_all", _create_model_tables),
-        ("_migrate_add_columns", _migrate_add_columns),
-        ("_migrate_match_basis_backfill", _migrate_match_basis_backfill),
-        ("_migrate_bid_notice_indexes", _migrate_bid_notice_indexes),
-        ("_migrate_bid_notice_raw", _migrate_bid_notice_raw),
-        ("_seed_app_config", _seed_app_config),
-        ("_seed_list_rules", _seed_list_rules),
-        ("_validate_model_indexes", _validate_model_indexes),
+        ("모델 테이블 생성", _create_model_tables),
+        ("컬럼 추가", _migrate_add_columns),
+        ("기존 분류값 보정", _migrate_match_basis_backfill),
+        ("모델 인덱스 확인", _migrate_bid_notice_indexes),
+        ("원문 이관", _migrate_bid_notice_raw),
+        ("설정 기본값 시드", _seed_app_config),
+        ("표시 규칙 시드", _seed_list_rules),
+        ("모델 인덱스 최종 검증", _validate_model_indexes),
     )
     for attempt in range(3):
         try:
@@ -152,8 +157,8 @@ def _create_model_tables() -> None:
     """테이블별 생성 경합은 해당 테이블의 존재를 재확인해 처리한다."""
     for table in Base.metadata.sorted_tables:
         _create_if_missing(
-            lambda: Base.metadata.create_all(bind=engine, tables=[table]),
-            lambda: inspect(engine).has_table(table.name, schema=table.schema),
+            lambda t=table: Base.metadata.create_all(bind=engine, tables=[t]),
+            lambda t=table: inspect(engine).has_table(t.name, schema=t.schema),
         )
 
 
@@ -220,8 +225,10 @@ def _migrate_add_columns() -> None:
 
     for table_name, column_name, statement in stmts:
         _create_if_missing(
-            lambda: _execute_ddl(statement),
-            lambda: column_name in {c["name"] for c in inspect(engine).get_columns(table_name)},
+            lambda s=statement: _execute_ddl(s),
+            lambda t=table_name, c=column_name: c in {
+                col["name"] for col in inspect(engine).get_columns(t)
+            },
         )
 
 
@@ -263,22 +270,57 @@ def _migrate_match_basis_backfill() -> None:
 def _migrate_bid_notice_indexes() -> None:
     """모든 모델 테이블의 누락 인덱스를 복구한다(이름 고정 3종 포함)."""
     for table in Base.metadata.sorted_tables:
+        if not table.indexes:
+            continue
+        indexes = _index_definitions(table)
         for index in sorted(table.indexes, key=lambda index: index.name):
             _create_if_missing(
-                lambda: index.create(bind=engine),
-                lambda: index.name in _index_names(table),
+                lambda i=index, actual=indexes: _create_model_index(i, actual),
+                lambda i=index, actual=indexes: _model_index_exists(i, actual),
             )
 
 
-def _index_names(table) -> set[str]:  # noqa: ANN001
-    return {idx["name"] for idx in inspect(engine).get_indexes(table.name, schema=table.schema)}
+def _index_definitions(table) -> dict[str, dict]:  # noqa: ANN001
+    return {
+        idx["name"]: {
+            "column_names": list(idx["column_names"]), "unique": bool(idx["unique"]),
+        }
+        for idx in inspect(engine).get_indexes(table.name, schema=table.schema)
+    }
+
+
+def _model_index_exists(index, indexes: dict[str, dict]) -> bool:  # noqa: ANN001
+    actual = indexes.get(index.name)
+    if actual is None:
+        return False
+    expected = {"column_names": [c.name for c in index.columns], "unique": bool(index.unique)}
+    if actual != expected:
+        raise IndexDefinitionMismatchError(
+            f"모델 인덱스 정의 불일치: {index.table.fullname}: {index.name}: "
+            f"기대 정의={expected!r}, 실제 정의={actual!r}"
+        )
+    return True
+
+
+def _create_model_index(index, indexes: dict[str, dict]) -> None:  # noqa: ANN001
+    try:
+        index.create(bind=engine)
+    except (OperationalError, IntegrityError, ProgrammingError):
+        # DDL 실패 뒤에만 새 조회로 경쟁자가 만든 인덱스의 정의를 재확인한다.
+        indexes.clear()
+        indexes.update(_index_definitions(index.table))
+        raise
 
 
 def _validate_model_indexes() -> None:
     """반환 전에 모델 정의 인덱스 전체를 확인하며 누락은 전체 재시도 대상으로 올린다."""
     for table in Base.metadata.sorted_tables:
-        missing = {index.name for index in table.indexes} - _index_names(table)
+        if not table.indexes:
+            continue
+        indexes = _index_definitions(table)
+        missing = {index.name for index in table.indexes if not _model_index_exists(index, indexes)}
         if missing:
+            # 정의 불일치와 달리 누락은 생성 경합으로 복구 가능하므로 전체 재시도 대상으로 올린다.
             raise OperationalError(None, None, Exception(
                 f"모델 인덱스 누락: {table.name}: {', '.join(sorted(missing))}"
             ))

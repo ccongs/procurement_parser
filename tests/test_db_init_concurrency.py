@@ -2,11 +2,12 @@
 
 import logging
 import multiprocessing
+from collections import Counter
 from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import Column, MetaData, Table, create_engine, event, inspect, select
+from sqlalchemy import Column, Index, MetaData, Table, create_engine, event, inspect, select
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import sessionmaker
 
@@ -24,6 +25,16 @@ INDEXES = {
     "ix_bid_notice_visible_ntce_dt": ["list_visible", "bid_ntce_dt"],
     "ix_bid_notice_visible_openg_dt": ["list_visible", "openg_dt"],
     "ix_bid_notice_indstryty_lmt_yn": ["indstryty_lmt_yn"],
+}
+STAGE_LABELS = {
+    "create_all": "모델 테이블 생성",
+    "_migrate_add_columns": "컬럼 추가",
+    "_migrate_match_basis_backfill": "기존 분류값 보정",
+    "_migrate_bid_notice_indexes": "모델 인덱스 확인",
+    "_migrate_bid_notice_raw": "원문 이관",
+    "_seed_app_config": "설정 기본값 시드",
+    "_seed_list_rules": "표시 규칙 시드",
+    "_validate_model_indexes": "모델 인덱스 최종 검증",
 }
 RAW_JSON = '{"befBidBbancNo":"OLD", "pubPrcrmntClsfcNm":"정보시스템개발"}'
 
@@ -61,9 +72,10 @@ def _assert_initialized(engine, *, legacy=False):
     for name, columns in INDEXES.items():
         assert indexes[name] == columns
     for table in db.Base.metadata.sorted_tables:
-        actual = {i["name"]: i["column_names"] for i in inspector.get_indexes(table.name)}
+        actual = {i["name"]: i for i in inspector.get_indexes(table.name)}
         for index in table.indexes:
-            assert actual[index.name] == [c.name for c in index.columns]
+            assert actual[index.name]["column_names"] == [c.name for c in index.columns]
+            assert bool(actual[index.name]["unique"]) == bool(index.unique)
     with sessionmaker(bind=engine)() as session:
         config = session.scalars(select(AppConfig)).one()
         assert config.id == 1 and config.enabled and config.pre_spec_enabled
@@ -197,7 +209,7 @@ def test_init_retries_entire_sequence_three_times_then_raises(
     warnings = [r.getMessage() for r in caplog.records if r.name == "app.db"]
     assert len(warnings) == 2
     assert "2/3" in warnings[0] and "3/3" in warnings[1]
-    assert all(f"단계={stage}" in warning for warning in warnings)
+    assert all(f"단계={STAGE_LABELS[stage]}" in warning for warning in warnings)
     assert "대기=0.2초" in warnings[0] and "대기=0.5초" in warnings[1]
     assert all(error_type.__name__ in w and "반복 실패 주입" in w and "\n" not in w
                for w in warnings)
@@ -270,8 +282,108 @@ def test_init_retries_when_final_index_validation_finds_missing_index(
     with caplog.at_level(logging.WARNING, logger="app.db"):
         db.init_db()
     assert calls == [True, True] and sleeps == [0.2]
-    assert "단계=_validate_model_indexes" in caplog.text
+    assert "단계=모델 인덱스 최종 검증" in caplog.text
     _assert_initialized(database)
+
+
+@pytest.mark.parametrize("mismatch", ["columns", "column-order", "unique"])
+@pytest.mark.parametrize("phase", ["existing", "race", "final-validation"])
+def test_index_definition_mismatch_stops_init_without_retry(
+    database, monkeypatch, caplog, mismatch, phase,
+):
+    db.init_db()
+    index = next(i for i in BidNotice.__table__.indexes
+                 if i.name == "ix_bid_notice_visible_ntce_dt")
+    columns = [c.name for c in index.columns]
+    if mismatch == "columns":
+        columns = ["bid_ntce_no"]
+    elif mismatch == "column-order":
+        columns.reverse()
+
+    def create_wrong_index():
+        metadata = MetaData()
+        table = Table("bid_notice", metadata, *[
+            Column(c.name, c.type) for c in index.columns
+        ], Column("bid_ntce_no", BidNotice.__table__.c.bid_ntce_no.type))
+        Index(index.name, *(table.c[c] for c in columns),
+              unique=mismatch == "unique").create(bind=database)
+
+    attempts, sleeps, competed = [], [], []
+    create_tables = db._create_model_tables
+
+    def count_attempt():
+        attempts.append(True)
+        create_tables()
+
+    monkeypatch.setattr(db, "_create_model_tables", count_attempt)
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
+    if phase == "existing":
+        index.drop(bind=database)
+        create_wrong_index()
+    elif phase == "race":
+        index.drop(bind=database)
+    else:
+        seed_rules = db._seed_list_rules
+
+        def replace_before_validation():
+            seed_rules()
+            index.drop(bind=database)
+            create_wrong_index()
+
+        monkeypatch.setattr(db, "_seed_list_rules", replace_before_validation)
+
+    def compete(conn, cursor, statement, parameters, context, executemany):
+        if phase == "race" and statement.lstrip().startswith(
+            f"CREATE INDEX {index.name} "
+        ) and not competed:
+            competed.append(True)
+            create_wrong_index()
+
+    event.listen(database, "before_cursor_execute", compete)
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.db"):
+            with pytest.raises(db.IndexDefinitionMismatchError) as raised:
+                db.init_db()
+    finally:
+        event.remove(database, "before_cursor_execute", compete)
+    expected = {"column_names": [c.name for c in index.columns], "unique": False}
+    actual = {"column_names": columns, "unique": mismatch == "unique"}
+    message = str(raised.value)
+    assert "bid_notice" in message and index.name in message
+    assert f"기대 정의={expected!r}" in message and f"실제 정의={actual!r}" in message
+    assert attempts == [True] and sleeps == []
+    assert competed == ([True] if phase == "race" else [])
+    assert not [r for r in caplog.records if r.name == "app.db" and r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["new", "old-schema"])
+def test_valid_index_definitions_and_one_inspection_per_table_per_stage(
+    database, monkeypatch, legacy,
+):
+    if legacy:
+        _old_notice_table(database)
+    db.init_db()
+    _assert_initialized(database, legacy=legacy)
+    inspections = Counter()
+
+    def track_inspect(*args, **kwargs):
+        inspector = inspect(*args, **kwargs)
+        get_indexes = inspector.get_indexes
+
+        def track_get_indexes(table_name, **kwargs):
+            inspections[table_name] += 1
+            return get_indexes(table_name, **kwargs)
+
+        inspector.get_indexes = track_get_indexes
+        return inspector
+
+    monkeypatch.setattr(db, "inspect", track_inspect)
+    tables = {table.name for table in db.Base.metadata.sorted_tables if table.indexes}
+    for stage in (db._migrate_bid_notice_indexes, db._validate_model_indexes):
+        inspections.clear()
+        stage()
+        assert inspections == Counter({name: 1 for name in tables})
+    _assert_initialized(database, legacy=legacy)
 
 
 @pytest.mark.parametrize("failures", [1, 2])
