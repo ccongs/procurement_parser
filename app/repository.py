@@ -239,10 +239,12 @@ def upsert_bid_notices(
 # --- 면허제한 upsert ----------------------------------------------------
 def upsert_license_limits(
     session: Session, rows: list[dict[str, Any]], collected_at: datetime,
+    *, stats: dict | None = None,
 ) -> tuple[int, int]:
     """면허 복합 PK 를 묶음 IN 조회해 upsert 하고 flush 만 한다(삭제 없음).
 
     같은 배치의 중복 PK 는 마지막 값으로 흡수하며 최초 collected_at 은 보존한다.
+    다시 수신한 행은 유효 상태로 복원하고, stats 가 있으면 복원 건수를 누적한다.
     """
     pk_names = ("bid_ntce_no", "bid_ntce_ord", "lmt_grp_no", "lmt_sno")
     deduped = {tuple(row[name] for name in pk_names): row for row in rows}
@@ -260,16 +262,43 @@ def upsert_license_limits(
     for pk, values in deduped.items():
         data = {key: value for key, value in values.items()
                 if key in columns and key != "collected_at"}
+        data["superseded_at"] = None
         row = existing.get(pk)
         if row is None:
             session.add(BidLicenseLimit(**data, collected_at=collected_at))
             inserted += 1
         else:
+            if row.superseded_at is not None and stats is not None:
+                stats["restored"] = stats.get("restored", 0) + 1
             for key, value in data.items():
                 setattr(row, key, value)
             updated += 1
     session.flush()
     return inserted, updated
+
+
+def mark_superseded_licenses(
+    session: Session, no: str, ord_: str, keep_pks: set[tuple], at: datetime,
+) -> int:
+    """전체 조회에 없는 같은 공고·차수의 유효 행을 대체 표시하고 flush 만 한다."""
+    if not keep_pks:
+        return 0  # 0행 응답은 지연·이상 가능성이 있어 기존 행을 보존한다.
+    # 분류기처럼 숫자 차수·비숫자 0채움 표기 차이를 흡수한다.
+    def order(value: str):
+        normalized, _ = _normalize_ord(value)
+        return normalized.zfill(3) if isinstance(normalized, str) else normalized
+
+    selected_order = order(ord_)
+    count = 0
+    for row in session.scalars(select(BidLicenseLimit).where(
+        BidLicenseLimit.bid_ntce_no == no, BidLicenseLimit.superseded_at.is_(None),
+    )):
+        pk = (row.bid_ntce_no, row.bid_ntce_ord, row.lmt_grp_no, row.lmt_sno)
+        if order(row.bid_ntce_ord) == selected_order and pk not in keep_pks:
+            row.superseded_at = at
+            count += 1
+    session.flush()
+    return count
 
 
 # --- pre_spec upsert (Phase 5.3) ----------------------------------------

@@ -217,7 +217,8 @@ def iter_classifications(
                 continue
             licenses: dict[str, list[BidLicenseLimit]] = defaultdict(list)
             for row in session.scalars(select(BidLicenseLimit).where(
-                BidLicenseLimit.bid_ntce_no.in_([notice.bid_ntce_no for notice in notices])
+                BidLicenseLimit.bid_ntce_no.in_([notice.bid_ntce_no for notice in notices]),
+                BidLicenseLimit.superseded_at.is_(None),
             )):
                 licenses[row.bid_ntce_no].append(row)
             for notice in notices:

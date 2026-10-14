@@ -158,12 +158,39 @@ def _missing_license_targets(session, notices: list[dict], licenses: dict[tuple,
     for start in range(0, len(nos), 500):
         pairs.update((no, classifier.normalize_order(ord_)) for no, ord_ in session.execute(
             select(BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord).where(
-                BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500])
+                BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500]),
+                BidLicenseLimit.superseded_at.is_(None),
             ).distinct()
         ))
     return [item for item in candidates
             if (_text(item["bidNtceNo"]),
                 classifier.normalize_order(_text(item["bidNtceOrd"]))) not in pairs]
+
+
+def _verify_license_targets(session, licenses: dict[tuple, dict]) -> list[dict]:
+    """새 PK 와 미수신 기존 유효 행이 같은 공고·차수에 있으면 전체 조회로 확인한다."""
+    by_pair: dict[tuple, dict[tuple, dict]] = {}
+    for pk, row in licenses.items():
+        pair = (row["bid_ntce_no"], classifier.normalize_order(row["bid_ntce_ord"]))
+        by_pair.setdefault(pair, {})[pk] = row
+    existing: set[tuple] = set()
+    active: dict[tuple, set[tuple]] = {}
+    nos = sorted({no for no, _ in by_pair})
+    for start in range(0, len(nos), 500):
+        for no, ord_, group, sequence, superseded_at in session.execute(select(
+            BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord,
+            BidLicenseLimit.lmt_grp_no, BidLicenseLimit.lmt_sno, BidLicenseLimit.superseded_at,
+        ).where(BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500]))):
+            pk = (no, ord_, group, sequence)
+            existing.add(pk)
+            if superseded_at is None:
+                active.setdefault((no, classifier.normalize_order(ord_)), set()).add(pk)
+    targets = []
+    for pair, rows in by_pair.items():
+        if rows.keys() - existing and active.get(pair, set()) - rows.keys():
+            row = next(iter(rows.values()))
+            targets.append({"bidNtceNo": row["bid_ntce_no"], "bidNtceOrd": row["bid_ntce_ord"]})
+    return targets
 
 
 def fmt_dt(dt: datetime) -> str:
@@ -398,7 +425,8 @@ def collect_window(
                         "page_size": _BULK_PAGE_SIZE, "total_count": None},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
                             "found": 0, "failed": [], "retry_count": 0, "total_count": None,
-                            "unique_items": 0},
+                            "unique_items": 0, "verify_targets": 0,
+                            "superseded": 0, "restored": 0},
         }
         failed: list[tuple[str, dict]] = []
 
@@ -440,12 +468,19 @@ def collect_window(
             failed.append(("license", license_result))
 
         fix = by_call["license_fix"]
+        full_license_keys: list[tuple[str, str, set[tuple]]] = []
         if servc["outcome"] == license_result["outcome"] == "ok":
-            targets = _missing_license_targets(session, notices, licenses)
+            verify_targets = _verify_license_targets(session, licenses)
+            targets_by_pair = {
+                (_text(item["bidNtceNo"]), classifier.normalize_order(_text(item["bidNtceOrd"]))): item
+                for item in _missing_license_targets(session, notices, licenses) + verify_targets
+            }
+            targets = list(targets_by_pair.values())
             if len(targets) >= 50:
                 logger.warning("면허 누락 보정 대상 %d건 — 이번 창 공고 %d건",
                                len(targets), len(notices))
-            fix.update(outcome="ok", targets=len(targets), total_count=0)
+            fix.update(outcome="ok", targets=len(targets), verify_targets=len(verify_targets),
+                       total_count=0)
             for item in targets:
                 no = _text(item["bidNtceNo"])
                 result = _fetch_pages(LICENSE_OPERATION, {
@@ -474,6 +509,15 @@ def collect_window(
                         fix["truncated"] = True
                     fix["failed"].append(no)
                     failed.append(("license_fix", result))
+                elif rows:
+                    # 성공한 비어 있지 않은 전체 조회만 사용하고, 다른 공고·차수는 제외한다.
+                    ord_ = _text(item["bidNtceOrd"])
+                    keep_pks = {_license_key(row) for row in rows
+                                if row["bid_ntce_no"] == no
+                                and classifier.normalize_order(row["bid_ntce_ord"])
+                                == classifier.normalize_order(ord_)}
+                    if keep_pks:
+                        full_license_keys.append((no, ord_, keep_pks))
 
         # 공고·면허·분류는 finish_run 의 실행 종료 이력과 함께 커밋한다.
         values_list = []
@@ -487,9 +531,14 @@ def collect_window(
             values_list.append(values)
         with classifier.CLASSIFY_WRITE_LOCK:
             new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)
-            repository.upsert_license_limits(session, list(licenses.values()), meta_ts)
+            repository.upsert_license_limits(session, list(licenses.values()), meta_ts, stats=fix)
+            for no, ord_, keep_pks in full_license_keys:
+                fix["superseded"] += repository.mark_superseded_licenses(
+                    session, no, ord_, keep_pks, meta_ts,
+                )
             classify = classifier.reclassify_notices(
-                session, bid_ntce_nos=notice_nos | {row["bid_ntce_no"] for row in licenses.values()},
+                session, bid_ntce_nos=notice_nos | {row["bid_ntce_no"] for row in licenses.values()}
+                | {no for no, _, _ in full_license_keys},
                 commit=False,
             )
             for change in ord_changes:

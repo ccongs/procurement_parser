@@ -104,6 +104,40 @@ def _old_notice_table(engine, retained_columns=()):
     return table
 
 
+def test_license_superseded_column_migration_twice_preserves_old_rows(database):
+    engine, local = database
+    metadata = MetaData()
+    table = Table("bid_license_limit", metadata, *[
+        Column(c.name, c.type, primary_key=c.primary_key, nullable=c.nullable)
+        for c in BidLicenseLimit.__table__.columns if c.name != "superseded_at"
+    ])
+    metadata.create_all(engine)
+    values = dict(bid_ntce_no="OLD-LICENSE", bid_ntce_ord="001", lmt_grp_no="1",
+                  lmt_sno="1", lcns_cd="1468", collected_at=NOW)
+    with engine.begin() as conn:
+        conn.execute(table.insert(), values)
+    alters = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("ALTER TABLE bid_license_limit"):
+            alters.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        for _ in range(2):
+            db.init_db()
+            column = next(c for c in inspect(engine).get_columns("bid_license_limit")
+                          if c["name"] == "superseded_at")
+            assert column["nullable"] is True
+            with local() as session:
+                row = session.scalars(select(BidLicenseLimit)).one()
+                assert row.superseded_at is None
+                assert all(getattr(row, name) == value for name, value in values.items())
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert len(alters) == 1
+
+
 def _snapshot(engine):
     with engine.connect() as conn:
         return (

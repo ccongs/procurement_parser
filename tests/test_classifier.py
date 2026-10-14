@@ -68,6 +68,32 @@ def _snapshot(session):
     ).order_by(BidNotice.bid_ntce_no)).all()
 
 
+@pytest.mark.parametrize("active,legacy,visible,matched", [
+    ("9999", "1468", False, None),
+    (None, "1468", True, "1468"),
+    (None, None, False, None),
+])
+def test_superseded_licenses_ignored_and_legacy_uses_active_rows(
+    database, active, legacy, visible, matched,
+):
+    _, local = database
+    with local() as session:
+        old = _license("SUPERSEDED", "1468", permsn="1470")
+        old.superseded_at = NOW
+        session.add_all([
+            _notice("SUPERSEDED", indstryty_lmt_yn="Y", matched_indstryty_cds=legacy), old,
+        ])
+        if active:
+            session.add(_license("SUPERSEDED", active, serial="2"))
+        session.commit()
+        _, result = next(iter_classifications(
+            session, rules=DEFAULT_RULES, match_codes=("1468", "1470"),
+        ))
+        assert result.list_visible is visible
+        assert result.matched_indstryty_cds == matched
+        assert result.match_basis == ("업종" if visible else None)
+
+
 def test_value_objects_are_frozen():
     with pytest.raises(FrozenInstanceError):
         DEFAULT_RULES.keywords = ()

@@ -163,6 +163,7 @@ class BidLicenseLimit(Base):
     permsn_cds = Column(Text)                           # 허용업종 코드 CSV
     rgst_dt = Column(DateTime)
     collected_at = Column(DateTime, nullable=False)
+    superseded_at = Column(DateTime, nullable=True)     # 대체된 면허는 보존하되 분류에서 제외
 
 
 class ListRule(Base):
