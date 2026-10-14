@@ -12,7 +12,9 @@ app_config 단일 행(id=1)을 기본값으로 시드한다(pre_spec 시드는 �
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +22,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+logger = logging.getLogger(__name__)
 
 # .env 로드 (프로젝트 루트의 .env)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -61,8 +65,8 @@ def _apply_sqlite_pragmas(dbapi_connection, connection_record) -> None:  # noqa:
     (예: `:memory:` 의 WAL 미지원) 다른 PRAGMA 적용을 막지 않도록 개별 try 로 감싼다.
     """
     pragmas = (
-        "PRAGMA journal_mode=WAL",      # 읽기/쓰기 동시성↑ (웹 GET 이 수집 쓰기를 막지 않음)
         "PRAGMA busy_timeout=30000",    # 잠금 대기 30초 (짧은 쓰기 경쟁 흡수)
+        "PRAGMA journal_mode=WAL",      # 읽기/쓰기 동시성↑ (웹 GET 이 수집 쓰기를 막지 않음)
         "PRAGMA synchronous=NORMAL",    # WAL 과 함께 안전·고속
     )
     for stmt in pragmas:
@@ -91,25 +95,81 @@ def _register_sqlite_pragmas(eng) -> None:  # noqa: ANN001
 _register_sqlite_pragmas(engine)
 
 
+class IndexDefinitionMismatchError(RuntimeError):
+    """동명 인덱스의 정의가 모델과 달라 초기화를 중단해야 하는 스키마 오류."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            f"{message}. 해당 인덱스를 DROP 한 뒤 재기동하면 모델 정의로 다시 생성됩니다"
+        )
+
+
 def init_db() -> None:
     """모델 테이블 생성 + 자동 마이그레이션 + 설정·표시 규칙 기본값 시드.
 
     - models 를 임포트하면 PreSpec 를 포함한 모든 모델이 Base.metadata 에 등록되어
-      create_all 이 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
-    - 순서: create_all → 컬럼 ALTER·기존 분류값 보정 → 인덱스 생성 → 원문 이관
-      → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회).
+      테이블 생성 단계가 pre_spec 테이블까지 자동 생성한다(별도 호출 불필요).
+    - 순서: 모델 테이블 생성 → 컬럼 ALTER·기존 분류값 보정 → 인덱스 확인·생성 → 원문 이관
+      → app_config 시드 → 표시 규칙 시드(완료 기록 기준 1회) → 모델 인덱스 최종 검증.
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
+    - 동시 실행 경합은 단계 내 재확인·원문 배치 1회 재처리로 우선 흡수한다.
+      남은 DB 오류는 마지막 안전장치로 전체 단계를 처음부터 최대 3회 실행한다.
+    - 잠금 대기 오류(database is locked)는 시도마다 busy_timeout 만큼 대기(최대 3회).
+    - 하위 단계(_run_once·_seed_app_config)의 자체 재시도와 겹칠 수 있다.
     """
     # models 를 임포트해야 Base.metadata 에 테이블이 등록된다(순환참조 회피용 지연 임포트).
     from app import models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
-    _migrate_add_columns()
-    _migrate_match_basis_backfill()
-    _migrate_bid_notice_indexes()
-    _migrate_bid_notice_raw()
-    _seed_app_config()
-    _seed_list_rules()
+    stages = (
+        ("모델 테이블 생성", _create_model_tables),
+        ("컬럼 추가", _migrate_add_columns),
+        ("기존 분류값 보정", _migrate_match_basis_backfill),
+        ("모델 인덱스 확인", _migrate_bid_notice_indexes),
+        ("원문 이관", _migrate_bid_notice_raw),
+        ("설정 기본값 시드", _seed_app_config),
+        ("표시 규칙 시드", _seed_list_rules),
+        ("모델 인덱스 최종 검증", _validate_model_indexes),
+    )
+    for attempt in range(3):
+        try:
+            for stage_name, stage in stages:
+                stage()
+            return
+        except (OperationalError, IntegrityError, ProgrammingError) as exc:
+            if attempt == 2:
+                raise
+            delay = (0.2, 0.5)[attempt]
+            logger.warning(
+                "DB 초기화 재시도 %d/3: 단계=%s, 대기=%.1f초: %s: %s",
+                attempt + 2, stage_name, delay, type(exc).__name__,
+                " ".join(str(exc.orig).splitlines())[:200],
+            )
+            time.sleep(delay)
+
+
+def _create_if_missing(create: Callable[[], None], exists: Callable[[], bool]) -> None:
+    """존재 확인 후 DDL 실행. 실패한 트랜잭션 종료 뒤 경쟁자의 생성을 재확인."""
+    if exists():
+        return
+    try:
+        create()
+    except (OperationalError, IntegrityError, ProgrammingError):
+        if not exists():
+            raise
+
+
+def _create_model_tables() -> None:
+    """테이블별 생성 경합은 해당 테이블의 존재를 재확인해 처리한다."""
+    for table in Base.metadata.sorted_tables:
+        _create_if_missing(
+            lambda t=table: Base.metadata.create_all(bind=engine, tables=[t]),
+            lambda t=table: inspect(engine).has_table(t.name, schema=t.schema),
+        )
+
+
+def _execute_ddl(statement: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(statement))
 
 
 def _migrate_add_columns() -> None:
@@ -129,7 +189,7 @@ def _migrate_add_columns() -> None:
     def colset(t: str) -> set[str]:
         return {c["name"] for c in insp.get_columns(t)}
 
-    stmts: list[str] = []
+    stmts: list[tuple[str, str, str]] = []
     if "bid_notice" in tables:
         bn = colset("bid_notice")
         additions = {
@@ -141,36 +201,40 @@ def _migrate_add_columns() -> None:
         }
         for name, definition in additions.items():
             if name not in bn:
-                stmts.append(f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}")
+                stmts.append(("bid_notice", name,
+                              f"ALTER TABLE bid_notice ADD COLUMN {name} {definition}"))
     if "collection_run" in tables and "source" not in colset("collection_run"):
-        stmts.append(
+        stmts.append(("collection_run", "source",
             "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
-        )
+        ))
     if "app_config" in tables:
         ac = colset("app_config")
         if "pre_spec_enabled" not in ac:
             # PG 이전 시 DEFAULT 1 → DEFAULT true 로 조정.
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_enabled",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_enabled BOOLEAN NOT NULL DEFAULT 1"
-            )
+            ))
         if "pre_spec_last_success_dt" not in ac:
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_last_success_dt",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_last_success_dt DATETIME"
-            )
+            ))
         # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위(신규 컬럼 2개).
         if "pre_spec_amt_bgn" not in ac:
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_amt_bgn",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_amt_bgn VARCHAR(25)"
-            )
+            ))
         if "pre_spec_amt_end" not in ac:
-            stmts.append(
+            stmts.append(("app_config", "pre_spec_amt_end",
                 "ALTER TABLE app_config ADD COLUMN pre_spec_amt_end VARCHAR(25)"
-            )
+            ))
 
-    if stmts:
-        with engine.begin() as conn:
-            for s in stmts:
-                conn.execute(text(s))
+    for table_name, column_name, statement in stmts:
+        _create_if_missing(
+            lambda s=statement: _execute_ddl(s),
+            lambda t=table_name, c=column_name: c in {
+                col["name"] for col in inspect(engine).get_columns(t)
+            },
+        )
 
 
 def _run_once(name: str, work: Callable[[Connection], None]) -> None:
@@ -209,19 +273,83 @@ def _migrate_match_basis_backfill() -> None:
 
 
 def _migrate_bid_notice_indexes() -> None:
-    """기존 DB 에 누락된 Phase 13.1 인덱스만 표준 CREATE INDEX 로 생성."""
-    from app.models import BidNotice
+    """모든 모델 테이블의 누락 인덱스를 복구한다(이름 고정 3종 포함).
 
-    names = {idx["name"] for idx in inspect(engine).get_indexes("bid_notice")}
-    required = {
-        "ix_bid_notice_visible_ntce_dt",
-        "ix_bid_notice_visible_openg_dt",
-        "ix_bid_notice_indstryty_lmt_yn",
-    }
-    with engine.begin() as conn:
-        for index in BidNotice.__table__.indexes:
-            if index.name in required and index.name not in names:
-                index.create(bind=conn)
+    정의 불일치 시 IndexDefinitionMismatchError 로 중단한다.
+    테이블별 inspector 조회 1회를 재사용하며 DDL 실패 뒤에만 재조회한다.
+    """
+    for table in Base.metadata.sorted_tables:
+        if not table.indexes:
+            continue
+        indexes = _index_definitions(table)
+        for index in sorted(table.indexes, key=lambda index: index.name):
+            _create_if_missing(
+                lambda i=index, actual=indexes: _create_model_index(i, actual),
+                lambda i=index, actual=indexes: _model_index_exists(i, actual),
+            )
+
+
+def _index_definitions(table) -> dict[str, dict]:  # noqa: ANN001
+    definitions = {}
+    for idx in inspect(engine).get_indexes(table.name, schema=table.schema):
+        actual = {
+            "column_names": list(idx["column_names"]), "unique": bool(idx["unique"]),
+        }
+        conditions = {
+            key: value for key, value in idx.get("dialect_options", {}).items()
+            if key.endswith("_where") and value is not None
+        }
+        if conditions:
+            actual["dialect_options"] = conditions
+        if idx.get("expressions"):
+            actual["expressions"] = idx["expressions"]
+        definitions[idx["name"].lower()] = actual
+    return definitions
+
+
+def _model_index_exists(index, indexes: dict[str, dict]) -> bool:  # noqa: ANN001
+    actual = indexes.get(index.name.lower())
+    if actual is None:
+        return False
+    expected = {"column_names": [c.name for c in index.columns], "unique": bool(index.unique)}
+    if actual != expected:
+        raise IndexDefinitionMismatchError(
+            f"모델 인덱스 정의 불일치: {index.table.fullname}: {index.name}: "
+            f"기대 정의={expected!r}, 실제 정의={actual!r}"
+        )
+    return True
+
+
+def _create_model_index(index, indexes: dict[str, dict]) -> None:  # noqa: ANN001
+    try:
+        index.create(bind=engine)
+    except (OperationalError, IntegrityError, ProgrammingError) as exc:
+        # DDL 실패 뒤에만 새 조회로 경쟁자가 만든 인덱스의 정의를 재확인한다.
+        indexes.clear()
+        indexes.update(_index_definitions(index.table))
+        # SQLite inspector 는 표현식 인덱스를 생략할 수 있어 중복 오류도 확인한다.
+        sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        duplicate = sqlstate in {"42P07", "42710"} or "already exists" in str(exc.orig).lower()
+        if duplicate and index.name.lower() not in indexes:
+            raise IndexDefinitionMismatchError(
+                f"모델 인덱스 정의 불일치: {index.table.fullname}: {index.name}: "
+                "같은 이름의 인덱스가 있으나 정의를 확인할 수 없음"
+            ) from exc
+        raise
+
+
+def _validate_model_indexes() -> None:
+    """반환 전에 모델 정의 인덱스 전체를 확인하며 누락은 전체 재시도 대상으로 올린다."""
+    for table in Base.metadata.sorted_tables:
+        if not table.indexes:
+            continue
+        indexes = _index_definitions(table)
+        missing = {index.name for index in table.indexes if not _model_index_exists(index, indexes)}
+        if missing:
+            # 정의 불일치와 달리 누락은 생성 경합으로 복구 가능하므로 전체 재시도 대상으로 올린다.
+            raise OperationalError(None, None, Exception(
+                f"모델 인덱스 누락: {table.name}: {', '.join(sorted(missing))}"
+            ))
 
 
 def _migrate_bid_notice_raw() -> None:
@@ -231,7 +359,7 @@ def _migrate_bid_notice_raw() -> None:
 
     notice = BidNotice.__table__
     raw = BidNoticeRaw.__table__
-    while True:
+    def migrate_batch() -> bool:
         with engine.begin() as conn:
             rows = conn.execute(
                 select(
@@ -243,7 +371,7 @@ def _migrate_bid_notice_raw() -> None:
                 .limit(500)
             ).mappings().all()
             if not rows:
-                break
+                return False
             existing = set(conn.execute(
                 select(raw.c.bid_ntce_no).where(
                     raw.c.bid_ntce_no.in_([row["bid_ntce_no"] for row in rows])
@@ -272,41 +400,63 @@ def _migrate_bid_notice_raw() -> None:
                     notice.update().where(notice.c.bid_ntce_no == row["bid_ntce_no"])
                     .values(**values)
                 )
+        return True
+
+    while True:
+        for attempt in range(2):
+            try:
+                if not migrate_batch():
+                    return
+                break
+            except IntegrityError:
+                # 해당 배치만 롤백한 뒤 새 트랜잭션에서 경쟁자의 원문을 다시 조회한다.
+                if attempt == 1:
+                    raise
 
 
 def _seed_app_config() -> None:
     """app_config 에 행이 없으면 기본값으로 id=1 단일 행을 생성한다."""
     from app.models import AppConfig
 
-    with SessionLocal() as session:
-        existing = session.get(AppConfig, 1)
-        if existing is not None:
+    for attempt in range(2):
+        try:
+            with SessionLocal() as session:
+                existing = session.get(AppConfig, 1)
+                if existing is not None:
+                    return
+                session.add(
+                    AppConfig(
+                        id=1,
+                        enabled=True,
+                        auto_halted=False,
+                        halt_code=None,
+                        halt_reason=None,
+                        interval_minutes=60,
+                        window_overlap_minutes=90,
+                        backfill_days=30,
+                        num_of_rows=20,
+                        max_retries=2,
+                        inqry_div="1",
+                        intrntnl_div_cd="1",
+                        indstryty_cds="1426,1468,1469,1470",
+                        prtcpt_lmt_rgn_cd="00",  # 신규 설치 기본 = 전국(지역제한 없는 공고만)
+                        presmpt_prce_bgn=None,
+                        presmpt_prce_end="100000000",
+                        last_success_dt=None,
+                        updated_at=datetime.now(),
+                        pre_spec_enabled=True,  # 사전규격 잡 기본 on (Phase 5.4)
+                        pre_spec_last_success_dt=None,
+                    )
+                )
+                session.commit()
             return
-        session.add(
-            AppConfig(
-                id=1,
-                enabled=True,
-                auto_halted=False,
-                halt_code=None,
-                halt_reason=None,
-                interval_minutes=60,
-                window_overlap_minutes=90,
-                backfill_days=30,
-                num_of_rows=20,
-                max_retries=2,
-                inqry_div="1",
-                intrntnl_div_cd="1",
-                indstryty_cds="1426,1468,1469,1470",
-                prtcpt_lmt_rgn_cd="00",  # 신규 설치 기본 = 전국(지역제한 없는 공고만)
-                presmpt_prce_bgn=None,
-                presmpt_prce_end="100000000",
-                last_success_dt=None,
-                updated_at=datetime.now(),
-                pre_spec_enabled=True,  # 사전규격 잡 기본 on (Phase 5.4)
-                pre_spec_last_success_dt=None,
-            )
-        )
-        session.commit()
+        except IntegrityError:
+            # 실패한 세션은 이미 롤백·종료됨. 새 세션에서 경쟁자의 생성을 확인한다.
+            with SessionLocal() as session:
+                if session.get(AppConfig, 1) is not None:
+                    return
+            if attempt == 1:
+                raise
 
 
 def _seed_list_rules() -> None:

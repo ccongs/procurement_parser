@@ -20,6 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -67,6 +68,14 @@ def _make_run_kwargs(source: str = "bid") -> dict:
 
 
 # --- 1. PRAGMA 적용 (WAL·busy_timeout) -----------------------------------
+def test_busy_timeout_is_set_before_wal_transition():
+    statements = []
+    cursor = SimpleNamespace(execute=statements.append, close=lambda: None)
+    connection = SimpleNamespace(cursor=lambda: cursor)
+    _apply_sqlite_pragmas(connection, None)
+    assert statements.index("PRAGMA busy_timeout=30000") < statements.index("PRAGMA journal_mode=WAL")
+
+
 def test_sqlite_pragmas_applied_on_connection(file_engine):
     """파일 SQLite 연결에 journal_mode=WAL·busy_timeout=30000 이 적용된다."""
     with file_engine.connect() as conn:
