@@ -502,6 +502,9 @@ def collect_window(
         full_license_keys: list[tuple[str, str, set[tuple]]] = []
         if servc["outcome"] == license_result["outcome"] == "ok":
             verify_targets = _verify_license_targets(session, licenses)
+            verify_pairs = {(_text(item["bidNtceNo"]),
+                             classifier.normalize_order(_text(item["bidNtceOrd"])))
+                            for item in verify_targets}
             targets_by_pair = {
                 (_text(item["bidNtceNo"]), classifier.normalize_order(_text(item["bidNtceOrd"]))): item
                 for item in _missing_license_targets(session, notices, licenses) + verify_targets
@@ -524,6 +527,8 @@ def collect_window(
                        total_count=0)
             for item in targets:
                 no = _text(item["bidNtceNo"])
+                ord_ = _text(item["bidNtceOrd"])
+                pair = (no, classifier.normalize_order(ord_))
                 result = _fetch_pages(LICENSE_OPERATION, {
                     "inqryDiv": "2", "bidNtceNo": no, "bidNtceOrd": _text(item["bidNtceOrd"]),
                 }, snapshot)
@@ -543,34 +548,51 @@ def collect_window(
                     fix["failed"].append(no)
                     return halt("license_fix", result)
                 if result["outcome"] == "ok":
-                    ord_ = _text(item["bidNtceOrd"])
-                    # 모든 행이 변환·대상 검증을 통과해야 하며, 해시 PK 중복도 제거해 검증한다.
+                    valid_rows = [row for row in rows if
+                                  (row["bid_ntce_no"], classifier.normalize_order(row["bid_ntce_ord"]))
+                                  == pair]
+                    anomaly_reasons = []
+                    if len(rows) != len(result["items"]):
+                        anomaly_reasons.append("전체 조회 변환 불가 행 포함")
+                    if len(valid_rows) != len(rows):
+                        anomaly_reasons.append("전체 조회 다른 공고·차수 행 포함")
+                    # 일시적 미완료는 재조회하고, 지속적 이상은 정상 소속 행만 저장한다.
                     validation_error = None
                     if result.get("total_count_changed"):
                         validation_error = "전체 조회 페이지 사이 totalCount 변화"
-                    elif len(rows) != len(result["items"]):
-                        validation_error = "전체 조회 변환 불가 행 포함"
-                    elif any(row["bid_ntce_no"] != no or
-                             classifier.normalize_order(row["bid_ntce_ord"])
-                             != classifier.normalize_order(ord_) for row in rows):
-                        validation_error = "전체 조회 다른 공고·차수 행 포함"
-                    keep_pks = {_license_key(row) for row in rows}
+                    keep_pks = {_license_key(row) for row in valid_rows}
                     pk_shortfall = len(keep_pks) < result["total_count"]
                     # 기존 유효·대체 행이 모두 없으면 해시 중복은 저장만 하고 대조는 생략한다.
-                    if (validation_error is None and pk_shortfall
-                            and (no, classifier.normalize_order(ord_)) in existing_license_pairs):
+                    if (validation_error is None and not anomaly_reasons and pk_shortfall
+                            and pair in existing_license_pairs):
                         validation_error = (f"전체 조회 변환 후 고유 PK 미달: "
                                             f"고유 {len(keep_pks)} / 전체 {result['total_count']}")
                     if validation_error:
                         result = {**result, "outcome": "failed",
                                   "error_msg": f"{no}-{ord_}: {validation_error}"}
                     else:
-                        licenses.update({_license_key(row): row for row in rows})
-                        if rows:
+                        licenses.update({_license_key(row): row for row in valid_rows})
+                        if valid_rows:
                             fix["found"] += 1
-                        if keep_pks and not pk_shortfall:
+                        if anomaly_reasons:
+                            reason = "; ".join(anomaly_reasons)
+                            anomalies = fix.setdefault("anomalies", [])
+                            if len(anomalies) < 50:
+                                anomalies.append({"notice": f"{no}-{stored_order(ord_)}", "reason": reason})
+                            logger.warning("면허 전체 조회 이상 %s-%s: %s — 정상 소속 행만 저장, 대체·복원 생략",
+                                           no, stored_order(ord_), reason)
+                        elif pk_shortfall:
+                            skipped = fix.setdefault("pk_shortfall_skipped", [])
+                            if len(skipped) < 50:
+                                skipped.append(f"{no}-{stored_order(ord_)}")
+                        elif keep_pks:
                             full_license_keys.append((no, ord_, keep_pks))
                 if result["outcome"] == "failed":
+                    # 확인 조건인 새 PK·대체 행 재등장을 저장하지 않아 다음 실행에도 확인한다.
+                    if pair in verify_pairs:
+                        licenses = {pk: row for pk, row in licenses.items() if
+                                    (row["bid_ntce_no"], classifier.normalize_order(row["bid_ntce_ord"]))
+                                    != pair}
                     fix["outcome"] = "failed"
                     fix["error_msg"] = "; ".join(filter(None, [fix.get("error_msg"), result["error_msg"]]))
                     if result.get("truncated"):
