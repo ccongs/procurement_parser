@@ -207,14 +207,50 @@ def _verify_license_targets(session, licenses: dict[tuple, dict]) -> list[dict]:
     return targets
 
 
-def _apply_license_verifications(session, registrations, responses, at, fix):
+def _give_up_license_verification(state, at, fix):
+    label = f"{state.bid_ntce_no}-{state.bid_ntce_ord}"
+    state.gave_up_at = at
+    state.pending_since = None
+    fix["verify_gave_up_count"] += 1
+    if len(fix["verify_gave_up"]) < 50:
+        fix["verify_gave_up"].append(label)
+    logger.warning("면허 확인 포기 %s: 시도 %d회, %s",
+                   label, state.attempts, state.last_error or "대기 7일 경과")
+
+
+def _pending_license_verifications(session, at, fix):
+    """선택 전에 모든 대기를 평가하고, 포기는 공용 쓰기 잠금 안에서 재확인한다."""
+    query = select(LicenseVerification).where(
+        LicenseVerification.pending_since.is_not(None), LicenseVerification.gave_up_at.is_(None),
+    ).execution_options(populate_existing=True)
+    states = session.scalars(query).all()
+    fix["verify_pending"] = len(states)
+
+    def expired(state):
+        return (state.attempts >= _VERIFY_MAX_ATTEMPTS
+                or at - state.pending_since >= _VERIFY_MAX_AGE)
+
+    if any(expired(state) for state in states):
+        with classifier.CLASSIFY_WRITE_LOCK:
+            states = session.scalars(query).all()
+            for state in states:
+                if expired(state):
+                    _give_up_license_verification(state, at, fix)
+            session.flush()
+    return {(state.bid_ntce_no, state.bid_ntce_ord): state.pending_since
+            for state in states if state.pending_since is not None}
+
+
+def _apply_license_verifications(session, registrations, responses, at, fix, *,
+                                 bulk_received_at=None, bulk_pairs=(), shortfall_pairs=(),
+                                 rejected_shortfalls=None):
     """공용 쓰기 잠금 안에서 상태를 재조회해 적용할 전체 조회와 오래된 공고·차수를 반환한다.
 
     SQLite 다중 프로세스에서 중간 커밋이 있으면 쓰기 시 잠금/스냅샷 오류로 실패할 수
     있다(기존 동작 유지). PostgreSQL 이전 시 확인 상태 행의 행 잠금이 필요하다.
     """
     nos = sorted({item["bidNtceNo"] for item in registrations}
-                 | {no for no, _, _, _, _ in responses})
+                 | {no for no, _, _, _, _ in responses} | {no for no, _ in bulk_pairs})
     states = {}
     for start in range(0, len(nos), 500):
         states.update({(row.bid_ntce_no, row.bid_ntce_ord): row for row in session.scalars(
@@ -242,7 +278,20 @@ def _apply_license_verifications(session, registrations, responses, at, fix):
             state.attempts = 0
 
     applicable = []
-    stale_pairs = set()
+    # 이번 실행의 대조를 적용하기 전 상태와 일괄 응답 수신 시각을 비교한다.
+    stale_pairs = {pair for pair in bulk_pairs if pair in states
+                   and states[pair].verified_at is not None
+                   and states[pair].verified_at > bulk_received_at}
+    active_pks = {}
+    shortfall_nos = sorted({no for no, _ in shortfall_pairs})
+    for start in range(0, len(shortfall_nos), 500):
+        for no, ord_, group, sequence in session.execute(select(
+            BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord,
+            BidLicenseLimit.lmt_grp_no, BidLicenseLimit.lmt_sno,
+        ).where(BidLicenseLimit.bid_ntce_no.in_(shortfall_nos[start:start + 500]),
+                BidLicenseLimit.superseded_at.is_(None))):
+            active_pks.setdefault((no, stored_order(ord_)), set()).add(
+                (no, stored_order(ord_), group, sequence))
     for no, ord_, received_at, keep_pks, error in responses:
         if not keep_pks and (no, stored_order(ord_)) not in states:
             continue  # 누락 보정만 실패한 경우 확인 대기로 새로 등록하지 않는다.
@@ -253,6 +302,12 @@ def _apply_license_verifications(session, registrations, responses, at, fix):
             if len(fix["stale_skipped"]) < 50:
                 fix["stale_skipped"].append(label)
             continue
+        if (keep_pks and (no, stored_order(ord_)) in shortfall_pairs
+                and active_pks.get((no, stored_order(ord_)), set()) - keep_pks):
+            keep_pks = None
+            error = "전체 조회 변환 후 고유 PK 미달: 기존 유효 행 누락"
+            if rejected_shortfalls is not None:
+                rejected_shortfalls[(no, stored_order(ord_))] = error
         if keep_pks:
             applicable.append((no, ord_, keep_pks))
             state.verified_at = received_at
@@ -272,13 +327,7 @@ def _apply_license_verifications(session, registrations, responses, at, fix):
                 fix["verify_failed"].append(label)
             if (state.attempts >= _VERIFY_MAX_ATTEMPTS
                     or received_at - state.pending_since >= _VERIFY_MAX_AGE):
-                state.gave_up_at = received_at
-                state.pending_since = None
-                fix["verify_gave_up_count"] += 1
-                if len(fix["verify_gave_up"]) < 50:
-                    fix["verify_gave_up"].append(label)
-                logger.warning("면허 확인 포기 %s: 시도 %d회, %s",
-                               label, state.attempts, state.last_error)
+                _give_up_license_verification(state, received_at, fix)
     session.flush()
     return applicable, stale_pairs
 
@@ -523,17 +572,6 @@ def collect_window(
         run = repository.create_run(session, trigger, window_bgn, window_end)
         logger.info("수집 시작: trigger=%s window=%s~%s",
                     trigger, fmt_dt(window_bgn), fmt_dt(window_end))
-        pending_attempts = {
-            (no, stored_order(ord_)): last_attempt_at
-            for no, ord_, last_attempt_at in session.execute(select(
-                LicenseVerification.bid_ntce_no, LicenseVerification.bid_ntce_ord,
-                LicenseVerification.last_attempt_at,
-            ).where(LicenseVerification.pending_since.is_not(None),
-                    LicenseVerification.gave_up_at.is_(None)))
-        }
-        pending_targets = [
-            {"bidNtceNo": no, "bidNtceOrd": ord_} for no, ord_ in pending_attempts
-        ]
         by_call = {
             "servc": {"outcome": "skipped", "pages": 0, "last_result_code": None,
                       "items": 0, "unique_items": 0, "notices": 0, "retry_count": 0,
@@ -544,7 +582,7 @@ def collect_window(
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
                             "found": 0, "failed": [], "retry_count": 0, "total_count": None,
                             "unique_items": 0, "verify_targets": 0,
-                            "verify_pending": len(pending_targets), "verified": [],
+                            "verify_pending": 0, "verified": [],
                             "verify_deferred": 0, "stale_bulk_skipped": 0,
                             "verify_failed": [], "verify_gave_up": [], "stale_skipped": [],
                             "verified_count": 0, "verify_failed_count": 0, "verify_gave_up_count": 0,
@@ -553,6 +591,11 @@ def collect_window(
                             "superseded_notices": [], "superseded_notices_count": 0},
         }
         failed: list[tuple[str, dict]] = []
+        fix = by_call["license_fix"]
+        pending_since = _pending_license_verifications(session, meta_ts, fix)
+        pending_targets = [
+            {"bidNtceNo": no, "bidNtceOrd": ord_} for no, ord_ in pending_since
+        ]
 
         def halt(stage: str, result: dict) -> CollectionRun:
             reason = f"{stage} 에서 비재시도 에러 {result['error_msg']} — 스케줄 자동 중단."
@@ -587,7 +630,10 @@ def collect_window(
         license_result = _fetch_pages(LICENSE_OPERATION, {
             "inqryDiv": "1", "inqryBgnDt": fmt_dt(window_bgn), "inqryEndDt": fmt_dt(window_end),
         }, snapshot)
+        bulk_received_at = datetime.now()
         licenses = _keep_licenses(session, license_result["items"], notice_nos)
+        bulk_keys = set(licenses)
+        bulk_pairs = {pk[:2] for pk in bulk_keys}
         by_call["license"] = _call_detail(
             license_result, kept=len(licenses), page_size=_BULK_PAGE_SIZE,
         )
@@ -596,10 +642,11 @@ def collect_window(
         if license_result["outcome"] == "failed":
             failed.append(("license", license_result))
 
-        fix = by_call["license_fix"]
         verification_responses = []
+        shortfall_pairs = set()
         full_rows = {}
         registrations = []
+        missing_pairs = set()
         bulk_ok = servc["outcome"] == license_result["outcome"] == "ok"
         if bulk_ok or pending_targets:
             if bulk_ok:
@@ -615,9 +662,9 @@ def collect_window(
                 (_text(item["bidNtceNo"]), classifier.normalize_order(_text(item["bidNtceOrd"])))
                 for item in missing_targets
             }
-            # 누락 보정은 상한 없이 조회하고, 확인만 필요한 대상은 미시도·오래된 시도 순이다.
+            # 누락 보정은 상한 없이 조회하고, 확인 전용은 대기 시작이 오래된 순이다.
             ordered_verify_pairs = sorted(verify_pairs - missing_pairs, key=lambda pair: (
-                pending_attempts.get((pair[0], stored_order(str(pair[1])))) or datetime.min,
+                pending_since.get((pair[0], stored_order(str(pair[1]))), meta_ts),
                 pair[0], stored_order(str(pair[1])),
             ))
             selected_verify_pairs = (set(ordered_verify_pairs[:_VERIFY_QUERY_LIMIT])
@@ -633,15 +680,20 @@ def collect_window(
             }
             targets = list(targets_by_pair.values())
             existing_license_pairs = set()
+            active_license_pks = {}
             target_nos = sorted({no for no, _ in targets_by_pair})
             for start in range(0, len(target_nos), 500):
-                existing_license_pairs.update(
-                    (no, classifier.normalize_order(ord_)) for no, ord_ in session.execute(
-                        select(BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord).where(
+                for no, ord_, group, sequence, superseded_at in session.execute(
+                        select(BidLicenseLimit.bid_ntce_no, BidLicenseLimit.bid_ntce_ord,
+                               BidLicenseLimit.lmt_grp_no, BidLicenseLimit.lmt_sno,
+                               BidLicenseLimit.superseded_at).where(
                             BidLicenseLimit.bid_ntce_no.in_(target_nos[start:start + 500])
-                        ).distinct()
-                    )
-                )
+                        )):
+                    existing_pair = (no, classifier.normalize_order(ord_))
+                    existing_license_pairs.add(existing_pair)
+                    if superseded_at is None:
+                        active_license_pks.setdefault(existing_pair, set()).add(
+                            (no, stored_order(ord_), group, sequence))
             if len(targets) >= 50:
                 logger.warning("면허 보정·확인 대상 %d건(확인 %d건) — 이번 창 공고 %d건",
                                len(targets), len(verify_targets), len(notices))
@@ -678,6 +730,7 @@ def collect_window(
                             meta_ts, fix,
                         )
                         return halt("license_fix", result)
+                validation_error = None
                 if result["outcome"] == "ok":
                     valid_rows = [row for row in rows if
                                   (row["bid_ntce_no"], classifier.normalize_order(row["bid_ntce_ord"]))
@@ -688,14 +741,16 @@ def collect_window(
                     if len(valid_rows) != len(rows):
                         anomaly_reasons.append("전체 조회 다른 공고·차수 행 포함")
                     # 일시적 미완료는 재조회하고, 지속적 이상은 정상 소속 행만 저장한다.
-                    validation_error = None
                     if result.get("total_count_changed"):
                         validation_error = "전체 조회 페이지 사이 totalCount 변화"
                     keep_pks = {_license_key(row) for row in valid_rows}
-                    # 한 페이지면 동일 빈 키 중복도 전부 수신했으므로 고유 PK 미달을 허용한다.
-                    pk_shortfall = len(keep_pks) < result["total_count"] and result["pages"] != 1
+                    pk_shortfall = len(keep_pks) < result["total_count"]
+                    # 한 페이지 미달은 기존 유효 행이 모두 포함된 경우에만 복원·확인을 허용한다.
+                    safe_shortfall = (pk_shortfall and result["pages"] == 1
+                                      and not (active_license_pks.get(pair, set()) - keep_pks))
                     # 기존 유효·대체 행이 모두 없으면 해시 중복은 저장만 하고 대조는 생략한다.
                     if (validation_error is None and not anomaly_reasons and pk_shortfall
+                            and not safe_shortfall
                             and (pair in existing_license_pairs or pair in verify_pairs)):
                         validation_error = (f"전체 조회 변환 후 고유 PK 미달: "
                                             f"고유 {len(keep_pks)} / 전체 {result['total_count']}")
@@ -716,7 +771,7 @@ def collect_window(
                                 anomalies.append({"notice": f"{no}-{stored_order(ord_)}", "reason": reason})
                             logger.warning("면허 전체 조회 이상 %s-%s: %s — 정상 소속 행만 저장, 대체·복원 생략",
                                            no, stored_order(ord_), reason)
-                        elif pk_shortfall:
+                        elif pk_shortfall and not safe_shortfall:
                             licenses.update({_license_key(row): row for row in valid_rows})
                             skipped = fix["pk_shortfall_skipped"]
                             if len(skipped) < 50:
@@ -724,13 +779,16 @@ def collect_window(
                         elif keep_pks:
                             # 새 응답 적용 여부를 저장 잠금 안에서 판단한 뒤에만 전체 행을 저장한다.
                             full_rows[(no, stored_order(ord_))] = {_license_key(row): row for row in valid_rows}
+                            if safe_shortfall:
+                                shortfall_pairs.add((no, stored_order(ord_)))
                             verification_responses.append((no, ord_, received_at, keep_pks, None))
                     if anomaly_reasons and result["outcome"] == "ok":
                         verification_responses.append((no, ord_, received_at, None,
                                                        "; ".join(anomaly_reasons)))
                 if result["outcome"] == "failed":
                     verification_responses.append((no, ord_, received_at, None, result["error_msg"]))
-                    if pair in verify_pairs and pair not in missing_pairs:
+                    if (pair in verify_pairs and pair not in missing_pairs
+                            or validation_error == "전체 조회 0행 응답"):
                         # 일괄 행은 정상 저장하고 실패는 대기 상태로 재시도한다(창 정상 전진).
                         if result.get("truncated"):
                             fix["truncated"] = True
@@ -753,12 +811,21 @@ def collect_window(
             values.update(collected_at=meta_ts, updated_at=meta_ts)
             values_list.append(values)
         with classifier.CLASSIFY_WRITE_LOCK:
+            rejected_shortfalls = {}
             full_license_keys, stale_pairs = _apply_license_verifications(
                 session, registrations, verification_responses, meta_ts, fix,
+                bulk_received_at=bulk_received_at, bulk_pairs=bulk_pairs,
+                shortfall_pairs=shortfall_pairs, rejected_shortfalls=rejected_shortfalls,
             )
-            # 더 새 전체 결과가 적용된 공고·차수는 이번 일괄 행도 저장하지 않는다.
+            for (no, ord_), error in rejected_shortfalls.items():
+                if (no, classifier.normalize_order(ord_)) in missing_pairs:
+                    fix["outcome"] = "failed"
+                    fix["failed"].append(no)
+                    fix["error_msg"] = "; ".join(filter(None, [fix.get("error_msg"), error]))
+                    failed.append(("license_fix", {"last_code": None, "error_msg": error}))
+            # 전체 조회를 하지 않은 공고·차수도 더 새 검증이 있으면 일괄 행을 제외한다.
             stale_keys = [pk for pk in licenses if pk[:2] in stale_pairs]
-            fix["stale_bulk_skipped"] = len(stale_keys)
+            fix["stale_bulk_skipped"] = len(bulk_keys.intersection(stale_keys))
             for pk in stale_keys:
                 del licenses[pk]
             for no, ord_, _ in full_license_keys:
