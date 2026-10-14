@@ -2863,3 +2863,190 @@ def test_single_page_shortfall_rechecks_active_rows_under_save_lock(monkeypatch,
         state = session.get(LicenseVerification, (no, "000"))
         assert state.pending_since == WIN_END and state.attempts == 2 and state.verified_at is None
         assert "고유 PK 미달" in state.last_error
+
+
+@pytest.mark.parametrize("include_bulk", [False, True])
+def test_single_page_shortfall_preserves_this_run_bulk_rows(monkeypatch, db_engine, include_bulk):
+    _, Local = db_engine
+    _verification_clock(monkeypatch, [WIN_END])
+    no = "SHORTFALL-BULK"
+    old = _license(no, code="9999", lmtGrpNo="1", lmtSno="1")
+    hashed = _license(no, code="8888")
+    new = _license(no, code="1468", lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice(no, indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(old), _stored_license(hashed))
+    rows = [old, hashed, hashed] + ([new] if include_bulk else [])
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice(no)], 1)
+        return (_ok_result([new], 1) if params["inqryDiv"] == "1"
+                else _ok_result(rows, len(rows)))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and len(calls) == 3
+    assert fix["superseded"] == fix["restored"] == 0
+    assert fix["verified"] == ([f"{no}-000"] if include_bulk else [])
+    assert fix["verify_failed"] == ([] if include_bulk else [f"{no}-000"])
+    with Local() as session:
+        assert all(row.superseded_at is None for row in session.scalars(select(BidLicenseLimit)))
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(new))) is not None
+        notice = session.get(BidNotice, no)
+        assert notice.list_visible is True and notice.matched_indstryty_cds == "1468"
+        state = session.get(LicenseVerification, (no, "000"))
+        assert state.pending_since == (None if include_bulk else WIN_END)
+        assert state.attempts == (0 if include_bulk else 1)
+        assert state.verified_at == (WIN_END if include_bulk else None)
+
+
+def test_shortfall_save_lock_also_requires_bulk_pks(db_engine):
+    _, Local = db_engine
+    no = "SHORTFALL-BULK-LOCK"
+    old = _license(no, code="9999", lmtGrpNo="1", lmtSno="1")
+    new = _license(no, lmtGrpNo="1", lmtSno="2")
+    old_pk = collector._license_key(collector.license_values(old))
+    new_pk = collector._license_key(collector.license_values(new))
+    _seed(Local, _stored_license(old), LicenseVerification(
+        bid_ntce_no=no, bid_ntce_ord="000", pending_since=WIN_END, attempts=1))
+    fix = {"verified_count": 0, "verified": [], "verify_failed_count": 0, "verify_failed": []}
+    rejected = {}
+    with Local() as session, classifier.CLASSIFY_WRITE_LOCK:
+        applicable, stale = collector._apply_license_verifications(
+            session, [], [(no, "0", WIN_END, {old_pk}, None)], WIN_END, fix,
+            bulk_received_at=WIN_END, bulk_pairs={(no, "000")}, bulk_keys={new_pk},
+            shortfall_pairs={(no, "000")}, rejected_shortfalls=rejected,
+        )
+        assert applicable == [] and stale == set()
+        assert (no, "000") in rejected and "일괄 행 누락" in rejected[(no, "000")]
+        state = session.get(LicenseVerification, (no, "000"))
+        assert state.pending_since == WIN_END and state.attempts == 2 and state.verified_at is None
+        assert fix["verified_count"] == 0 and fix["verify_failed_count"] == 1
+
+
+@pytest.mark.parametrize("limit", ["age", "attempts"])
+@pytest.mark.parametrize("outcome", ["success", "servc_halt", "license_halt", "license_fix_halt"])
+def test_expired_pending_does_not_hold_write_lock_during_api(
+    monkeypatch, tmp_path, limit, outcome,
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'verification-test.db'}",
+                          connect_args={"timeout": 0.1}, future=True)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+    Base.metadata.create_all(engine)
+    Local = sessionmaker(bind=engine, autoflush=False, future=True)
+    monkeypatch.setattr(collector, "SessionLocal", Local)
+    _verification_clock(monkeypatch, [WIN_END])
+    pending = WIN_END - timedelta(days=7) if limit == "age" else WIN_END
+    attempts = 0 if limit == "age" else 24
+    _seed(Local, AppConfig(id=1, auto_halted=False, indstryty_cds="1468", num_of_rows=20,
+                          max_retries=0, interval_minutes=60),
+          LicenseVerification(bid_ntce_no="EXPIRED", bid_ntce_ord="000",
+                              pending_since=pending, attempts=attempts),
+          LicenseVerification(bid_ntce_no="RETRY", bid_ntce_ord="000",
+                              pending_since=WIN_END, attempts=1))
+
+    def responder(op, params):
+        # 별도 연결이 조회마다 설정을 쓰고 커밋할 수 있어야 한다.
+        with Local() as other:
+            state = other.get(LicenseVerification, ("EXPIRED", "000"))
+            assert state.pending_since == pending and state.gave_up_at is None
+            cfg = other.get(AppConfig, 1)
+            cfg.interval_minutes += 1
+            other.commit()
+        stage = ("servc" if op == collector.OPERATION else
+                 "license" if params["inqryDiv"] == "1" else "license_fix")
+        if outcome == f"{stage}_halt":
+            result = _failed_result()
+            result.result_code = "22"
+            return result
+        return _ok_result()
+
+    original_finish = repository.finish_run
+
+    def check_expiration_in_finish_commit(session, run, **kwargs):
+        assert classifier.CLASSIFY_WRITE_LOCK._is_owned()
+        state = session.get(LicenseVerification, ("EXPIRED", "000"))
+        assert state.pending_since is None and state.gave_up_at == WIN_END
+        original_finish(session, run, **kwargs)
+
+    calls = _fake_api(monkeypatch, responder)
+    monkeypatch.setattr(repository, "finish_run", check_expiration_in_finish_commit)
+    try:
+        run = collector.collect_window(WIN_BGN, WIN_END)
+        assert run.status == ("success" if outcome == "success" else "failed")
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert fix["verify_pending"] == 2 and fix["verify_gave_up"] == ["EXPIRED-000"]
+        assert fix["verify_gave_up_count"] == 1
+        assert all(params.get("bidNtceNo") != "EXPIRED" for _, params in calls)
+        with Local() as session:
+            state = session.get(LicenseVerification, ("EXPIRED", "000"))
+            assert state.pending_since is None and state.gave_up_at == WIN_END
+            assert state.attempts == attempts and state.last_attempt_at is None
+            assert session.get(AppConfig, 1).interval_minutes == 60 + len(calls)
+    finally:
+        engine.dispose()
+
+
+def test_expired_pending_rolls_back_with_failed_finish_commit(monkeypatch, db_engine):
+    _, Local = db_engine
+    _verification_clock(monkeypatch, [WIN_END])
+    pending = WIN_END - timedelta(days=7)
+    _seed(Local, LicenseVerification(bid_ntce_no="EXPIRED-ATOMIC", bid_ntce_ord="000",
+                                    pending_since=pending, attempts=2))
+    _fake_api(monkeypatch, lambda op, params: _ok_result())
+    original_finish = repository.finish_run
+
+    def fail_finish(session, run, **kwargs):
+        def before_commit(session):
+            state = session.get(LicenseVerification, ("EXPIRED-ATOMIC", "000"))
+            assert state.pending_since is None and state.gave_up_at == WIN_END
+            fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+            assert fix["verify_gave_up"] == ["EXPIRED-ATOMIC-000"]
+            raise RuntimeError("가짜 포기 기록 커밋 실패")
+
+        event.listen(session, "before_commit", before_commit, once=True)
+        original_finish(session, run, **kwargs)
+
+    monkeypatch.setattr(repository, "finish_run", fail_finish)
+    with pytest.raises(RuntimeError, match="가짜 포기 기록 커밋 실패"):
+        collector.collect_window(WIN_BGN, WIN_END)
+    with Local() as session:
+        state = session.get(LicenseVerification, ("EXPIRED-ATOMIC", "000"))
+        assert state.pending_since == pending and state.gave_up_at is None and state.attempts == 2
+        run = session.scalar(select(CollectionRun))
+        assert run.status == "running" and run.detail_json is None
+
+
+@pytest.mark.parametrize("halt", [False, True])
+def test_expiration_rechecks_concurrent_completion_after_api(monkeypatch, db_engine, halt):
+    _, Local = db_engine
+    _verification_clock(monkeypatch, [WIN_END])
+    _seed(Local, LicenseVerification(bid_ntce_no="EXPIRED-NEWER", bid_ntce_ord="000",
+                                    pending_since=WIN_END - timedelta(days=7), attempts=2))
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            with Local() as newer:
+                state = newer.get(LicenseVerification, ("EXPIRED-NEWER", "000"))
+                state.pending_since = None
+                state.attempts = 0
+                state.verified_at = WIN_END
+                newer.commit()
+            if halt:
+                result = _failed_result()
+                result.result_code = "22"
+                return result
+        return _ok_result()
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("failed" if halt else "success")
+    assert fix["verify_pending"] == 1 and fix["verify_gave_up_count"] == 0
+    assert fix["verify_gave_up"] == []
+    with Local() as session:
+        state = session.get(LicenseVerification, ("EXPIRED-NEWER", "000"))
+        assert state.pending_since is None and state.gave_up_at is None
+        assert state.verified_at == WIN_END and state.attempts == 0

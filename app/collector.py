@@ -219,30 +219,35 @@ def _give_up_license_verification(state, at, fix):
 
 
 def _pending_license_verifications(session, at, fix):
-    """선택 전에 모든 대기를 평가하고, 포기는 공용 쓰기 잠금 안에서 재확인한다."""
+    """만료 대기는 메모리에서만 제외해 API 조회 중 쓰기 잠금을 잡지 않는다."""
     query = select(LicenseVerification).where(
         LicenseVerification.pending_since.is_not(None), LicenseVerification.gave_up_at.is_(None),
     ).execution_options(populate_existing=True)
     states = session.scalars(query).all()
     fix["verify_pending"] = len(states)
 
-    def expired(state):
-        return (state.attempts >= _VERIFY_MAX_ATTEMPTS
-                or at - state.pending_since >= _VERIFY_MAX_AGE)
-
-    if any(expired(state) for state in states):
-        with classifier.CLASSIFY_WRITE_LOCK:
-            states = session.scalars(query).all()
-            for state in states:
-                if expired(state):
-                    _give_up_license_verification(state, at, fix)
-            session.flush()
     return {(state.bid_ntce_no, state.bid_ntce_ord): state.pending_since
-            for state in states if state.pending_since is not None}
+            for state in states if not _license_verification_expired(state, at)}
+
+
+def _license_verification_expired(state, at):
+    return (state.attempts >= _VERIFY_MAX_ATTEMPTS
+            or at - state.pending_since >= _VERIFY_MAX_AGE)
+
+
+def _expire_license_verifications(session, at, fix):
+    """조회 종료 후 공용 쓰기 잠금 안에서 만료를 재확인하고 기존 종료 커밋에 맡긴다."""
+    states = session.scalars(select(LicenseVerification).where(
+        LicenseVerification.pending_since.is_not(None), LicenseVerification.gave_up_at.is_(None),
+    ).execution_options(populate_existing=True)).all()
+    for state in states:
+        if _license_verification_expired(state, at):
+            _give_up_license_verification(state, at, fix)
+    session.flush()
 
 
 def _apply_license_verifications(session, registrations, responses, at, fix, *,
-                                 bulk_received_at=None, bulk_pairs=(), shortfall_pairs=(),
+                                 bulk_received_at=None, bulk_pairs=(), bulk_keys=(), shortfall_pairs=(),
                                  rejected_shortfalls=None):
     """공용 쓰기 잠금 안에서 상태를 재조회해 적용할 전체 조회와 오래된 공고·차수를 반환한다.
 
@@ -279,6 +284,8 @@ def _apply_license_verifications(session, registrations, responses, at, fix, *,
 
     applicable = []
     # 이번 실행의 대조를 적용하기 전 상태와 일괄 응답 수신 시각을 비교한다.
+    # 시스템 시계 단조 증가 전제: 뒤로 조정되면 그 공고·차수의 일괄 행이 한 번
+    # 제외될 수 있으며, 창 겹침으로 대부분 다시 수신한다.
     stale_pairs = {pair for pair in bulk_pairs if pair in states
                    and states[pair].verified_at is not None
                    and states[pair].verified_at > bulk_received_at}
@@ -292,6 +299,10 @@ def _apply_license_verifications(session, registrations, responses, at, fix, *,
                 BidLicenseLimit.superseded_at.is_(None))):
             active_pks.setdefault((no, stored_order(ord_)), set()).add(
                 (no, stored_order(ord_), group, sequence))
+    # 이번 커밋에서 저장할 일괄 행도 미달 응답으로 대체하지 않는다.
+    for pk in bulk_keys:
+        if pk[:2] in shortfall_pairs and pk[:2] not in stale_pairs:
+            active_pks.setdefault(pk[:2], set()).add(pk)
     for no, ord_, received_at, keep_pks, error in responses:
         if not keep_pks and (no, stored_order(ord_)) not in states:
             continue  # 누락 보정만 실패한 경우 확인 대기로 새로 등록하지 않는다.
@@ -305,7 +316,7 @@ def _apply_license_verifications(session, registrations, responses, at, fix, *,
         if (keep_pks and (no, stored_order(ord_)) in shortfall_pairs
                 and active_pks.get((no, stored_order(ord_)), set()) - keep_pks):
             keep_pks = None
-            error = "전체 조회 변환 후 고유 PK 미달: 기존 유효 행 누락"
+            error = "전체 조회 변환 후 고유 PK 미달: 기존 유효 행 또는 일괄 행 누락"
             if rejected_shortfalls is not None:
                 rejected_shortfalls[(no, stored_order(ord_))] = error
         if keep_pks:
@@ -600,13 +611,15 @@ def collect_window(
         def halt(stage: str, result: dict) -> CollectionRun:
             reason = f"{stage} 에서 비재시도 에러 {result['error_msg']} — 스케줄 자동 중단."
             logger.error("halt: %s", reason)
-            repository.set_halt(session, result["halt_code"], reason)
-            repository.finish_run(
-                session, run, status="failed", total_fetched=0, total_new=0, total_updated=0,
-                retry_count=sum(detail["retry_count"] for detail in by_call.values()),
-                error_code=result["halt_code"], error_msg=reason,
-                detail_json=_build_detail_json(by_call, []),
-            )
+            with classifier.CLASSIFY_WRITE_LOCK:
+                repository.set_halt(session, result["halt_code"], reason)
+                _expire_license_verifications(session, meta_ts, fix)
+                repository.finish_run(
+                    session, run, status="failed", total_fetched=0, total_new=0, total_updated=0,
+                    retry_count=sum(detail["retry_count"] for detail in by_call.values()),
+                    error_code=result["halt_code"], error_msg=reason,
+                    detail_json=_build_detail_json(by_call, []),
+                )
             logger.info("수집 종료: status=failed 공고=%d 면허보존=%d 보정=%d 분류표시=0 "
                         "verify_targets=%d superseded=%d restored=%d "
                         "verify_pending=%d verified=%d verify_failed=%d verify_gave_up=%d",
@@ -694,6 +707,9 @@ def collect_window(
                     if superseded_at is None:
                         active_license_pks.setdefault(existing_pair, set()).add(
                             (no, stored_order(ord_), group, sequence))
+            for pk in bulk_keys:
+                bulk_pair = (pk[0], classifier.normalize_order(pk[1]))
+                active_license_pks.setdefault(bulk_pair, set()).add(pk)
             if len(targets) >= 50:
                 logger.warning("면허 보정·확인 대상 %d건(확인 %d건) — 이번 창 공고 %d건",
                                len(targets), len(verify_targets), len(notices))
@@ -724,6 +740,7 @@ def collect_window(
                     verification_responses.append((no, ord_, received_at, None, result["error_msg"]))
                     # halt 시 공고·면허 저장은 중단하되 확인 대기와 실패 시도는 보존한다.
                     with classifier.CLASSIFY_WRITE_LOCK:
+                        _expire_license_verifications(session, meta_ts, fix)
                         _apply_license_verifications(
                             session, registrations,
                             [response for response in verification_responses if not response[3]],
@@ -745,7 +762,7 @@ def collect_window(
                         validation_error = "전체 조회 페이지 사이 totalCount 변화"
                     keep_pks = {_license_key(row) for row in valid_rows}
                     pk_shortfall = len(keep_pks) < result["total_count"]
-                    # 한 페이지 미달은 기존 유효 행이 모두 포함된 경우에만 복원·확인을 허용한다.
+                    # 한 페이지 미달은 DB 유효 행·이번 일괄 행이 모두 포함돼야 확인을 허용한다.
                     safe_shortfall = (pk_shortfall and result["pages"] == 1
                                       and not (active_license_pks.get(pair, set()) - keep_pks))
                     # 기존 유효·대체 행이 모두 없으면 해시 중복은 저장만 하고 대조는 생략한다.
@@ -811,13 +828,15 @@ def collect_window(
             values.update(collected_at=meta_ts, updated_at=meta_ts)
             values_list.append(values)
         with classifier.CLASSIFY_WRITE_LOCK:
+            _expire_license_verifications(session, meta_ts, fix)
             rejected_shortfalls = {}
             full_license_keys, stale_pairs = _apply_license_verifications(
                 session, registrations, verification_responses, meta_ts, fix,
-                bulk_received_at=bulk_received_at, bulk_pairs=bulk_pairs,
+                bulk_received_at=bulk_received_at, bulk_pairs=bulk_pairs, bulk_keys=bulk_keys,
                 shortfall_pairs=shortfall_pairs, rejected_shortfalls=rejected_shortfalls,
             )
             for (no, ord_), error in rejected_shortfalls.items():
+                # 동시 수집 등으로 누락 보정 대상에 유효 행이 생긴 경우에도 partial을 유지한다.
                 if (no, classifier.normalize_order(ord_)) in missing_pairs:
                     fix["outcome"] = "failed"
                     fix["failed"].append(no)
