@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import db
 from app.classifier import DEFAULT_LIST_RULES
-from app.models import AppConfig, BidNotice, BidNoticeRaw, ListRule, SchemaMigration
+from app.models import AppConfig, BidLicenseLimit, BidNotice, BidNoticeRaw, ListRule, SchemaMigration
 
 
 NOW = datetime(2026, 10, 14, 12)
@@ -62,6 +62,52 @@ def _old_notice_table(engine):
             "bid_ntce_no": "LEGACY", "raw_json": RAW_JSON,
             "collected_at": NOW, "updated_at": NOW,
         })
+
+
+def test_superseded_column_competitor_is_rechecked_without_full_retry(database, monkeypatch):
+    """13.7 ALTER 경합도 단계 내 재확인으로 흡수하고 기존 행·반복 초기화를 보존한다."""
+    engine = database
+    metadata = MetaData()
+    table = Table("bid_license_limit", metadata, *[
+        Column(c.name, c.type, primary_key=c.primary_key, nullable=c.nullable)
+        for c in BidLicenseLimit.__table__.columns if c.name != "superseded_at"
+    ])
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(table.insert(), {
+            "bid_ntce_no": "LEGACY-LICENSE", "bid_ntce_ord": "000",
+            "lmt_grp_no": "1", "lmt_sno": "1", "lcns_cd": "1468", "collected_at": NOW,
+        })
+    competed, errors, sleeps = [], [], []
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
+
+    def compete(conn, cursor, statement, parameters, context, executemany):
+        if competed or not statement.startswith("ALTER TABLE bid_license_limit ADD COLUMN superseded_at"):
+            return
+        competed.append(True)
+        with engine.begin() as other:
+            assert other is not conn
+            other.exec_driver_sql(statement, parameters)
+
+    def record_error(context):
+        errors.append(context.sqlalchemy_exception)
+
+    event.listen(engine, "before_cursor_execute", compete)
+    event.listen(engine, "handle_error", record_error)
+    try:
+        db.init_db()
+        db.init_db()
+    finally:
+        event.remove(engine, "before_cursor_execute", compete)
+        event.remove(engine, "handle_error", record_error)
+    assert competed == [True] and len(errors) == 1
+    assert isinstance(errors[0], OperationalError) and sleeps == []
+    column = next(c for c in inspect(engine).get_columns("bid_license_limit") if c["name"] == "superseded_at")
+    assert column["nullable"] is True
+    with sessionmaker(bind=engine)() as session:
+        row = session.scalars(select(BidLicenseLimit)).one()
+        assert row.superseded_at is None and row.lcns_cd == "1468"
+    _assert_initialized(engine)
 
 
 def _assert_initialized(engine, *, legacy=False):

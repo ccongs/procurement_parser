@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, func, or_, select, tuple_
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -32,6 +32,7 @@ from app.models import (
     ListRule,
     PreSpec,
 )
+from app.ordering import normalize_order, stored_order
 
 # bid_notice 저장 컬럼 — 원문은 별도 테이블로 보내고 컬럼이 아닌 키는 무시한다.
 _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
@@ -240,36 +241,83 @@ def upsert_bid_notices(
 def upsert_license_limits(
     session: Session, rows: list[dict[str, Any]], collected_at: datetime,
 ) -> tuple[int, int]:
-    """면허 복합 PK 를 묶음 IN 조회해 upsert 하고 flush 만 한다(삭제 없음).
+    """공고번호를 묶음 IN 조회해 면허 복합 PK 로 upsert 하고 flush 만 한다(삭제 없음).
 
     같은 배치의 중복 PK 는 마지막 값으로 흡수하며 최초 collected_at 은 보존한다.
+    기존 대체 상태는 유지한다. 대체·복원은 검증된 전체 조회 대조에서만 수행한다.
     """
     pk_names = ("bid_ntce_no", "bid_ntce_ord", "lmt_grp_no", "lmt_sno")
-    deduped = {tuple(row[name] for name in pk_names): row for row in rows}
-    pks = list(deduped)
+    normalized_rows = [{**row, "bid_ntce_ord": stored_order(row["bid_ntce_ord"])} for row in rows]
+    deduped = {tuple(row[name] for name in pk_names): row for row in normalized_rows}
+    nos = sorted({pk[0] for pk in deduped})
     existing = {}
-    pk_columns = tuple_(*(getattr(BidLicenseLimit, name) for name in pk_names))
-    # 복합 PK 4개 × 200행으로 SQLite 바인드 수에도 여유를 둔다.
-    for start in range(0, len(pks), 200):
+    # 기존 비정규 차수도 같은 PK 로 찾아 상태·물리 PK 를 보존한다(바인드 수 여유).
+    for start in range(0, len(nos), 200):
         for row in session.scalars(select(BidLicenseLimit).where(
-            pk_columns.in_(pks[start:start + 200])
+            BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 200])
         )):
-            existing[tuple(getattr(row, name) for name in pk_names)] = row
+            pk = (row.bid_ntce_no, stored_order(row.bid_ntce_ord), row.lmt_grp_no, row.lmt_sno)
+            existing.setdefault(pk, []).append(row)
     inserted = updated = 0
     columns = {column.name for column in BidLicenseLimit.__table__.columns}
     for pk, values in deduped.items():
         data = {key: value for key, value in values.items()
-                if key in columns and key != "collected_at"}
-        row = existing.get(pk)
-        if row is None:
-            session.add(BidLicenseLimit(**data, collected_at=collected_at))
+                if key in columns and key not in {"collected_at", "superseded_at"}}
+        matched_rows = existing.get(pk)
+        if matched_rows is None:
+            session.add(BidLicenseLimit(**data, collected_at=collected_at, superseded_at=None))
             inserted += 1
         else:
-            for key, value in data.items():
-                setattr(row, key, value)
+            for row in matched_rows:
+                for key, value in data.items():
+                    if key not in pk_names:
+                        setattr(row, key, value)
             updated += 1
     session.flush()
     return inserted, updated
+
+
+def reconcile_license_limits(
+    session: Session, snapshots: list[tuple[str, str, set[tuple]]], at: datetime,
+) -> dict:
+    """검증된 전체 조회별로 대체·복원하고 flush 만 한다(공고번호 500개 이하 IN 조회).
+
+    superseded_notices 와 그 개수에는 복원만 일어난 공고·차수도 포함한다.
+    """
+    by_pair = {
+        (no, normalize_order(ord_)): {
+            (pk[0], stored_order(pk[1]), *pk[2:]) for pk in keep_pks
+        }
+        for no, ord_, keep_pks in snapshots if keep_pks
+    }  # 0행 응답은 지연·이상 가능성이 있어 기존 행을 보존한다.
+    superseded = restored = 0
+    changed_pairs = set()
+    nos = sorted({no for no, _ in by_pair})
+    for start in range(0, len(nos), 500):
+        for row in session.scalars(select(BidLicenseLimit).where(
+            BidLicenseLimit.bid_ntce_no.in_(nos[start:start + 500]),
+        )):
+            pair = (row.bid_ntce_no, normalize_order(row.bid_ntce_ord))
+            keep_pks = by_pair.get(pair)
+            if keep_pks is None:
+                continue
+            pk = (row.bid_ntce_no, stored_order(row.bid_ntce_ord), row.lmt_grp_no, row.lmt_sno)
+            if pk in keep_pks:
+                if row.superseded_at is not None:
+                    row.superseded_at = None
+                    restored += 1
+                    changed_pairs.add(pair)
+            elif row.superseded_at is None:
+                row.superseded_at = at
+                superseded += 1
+                changed_pairs.add(pair)
+    session.flush()
+    labels = {(no, normalize_order(ord_)): f"{no}-{stored_order(ord_)}"
+              for no, ord_, keep_pks in snapshots if keep_pks}
+    notices = sorted(labels[pair] for pair in changed_pairs)
+    return {"superseded": superseded, "restored": restored,
+            "superseded_notices_count": len(notices),
+            "superseded_notices": notices[:50]}
 
 
 # --- pre_spec upsert (Phase 5.3) ----------------------------------------

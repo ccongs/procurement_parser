@@ -163,6 +163,22 @@ class BidLicenseLimit(Base):
     permsn_cds = Column(Text)                           # 허용업종 코드 CSV
     rgst_dt = Column(DateTime)
     collected_at = Column(DateTime, nullable=False)
+    superseded_at = Column(DateTime, nullable=True)     # 대체된 면허는 보존하되 분류에서 제외
+
+
+class LicenseVerification(Base):
+    """공고·정규화 차수별 전체 면허 조회의 확인 대기·최종 적용 시각."""
+
+    __tablename__ = "license_verification"
+
+    bid_ntce_no = Column(String(40), primary_key=True)
+    bid_ntce_ord = Column(String(3), primary_key=True)
+    pending_since = Column(DateTime, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(String(200), nullable=True)
+    verified_at = Column(DateTime, nullable=True)
+    gave_up_at = Column(DateTime, nullable=True)
 
 
 class ListRule(Base):

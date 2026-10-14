@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app import db
-from app.models import BidLicenseLimit, BidNotice, BidNoticeRaw, ListRule, SchemaMigration
+from app.models import BidLicenseLimit, BidNotice, BidNoticeRaw, LicenseVerification, ListRule, SchemaMigration
 
 
 NEW_COLUMNS = {
@@ -102,6 +102,40 @@ def _old_notice_table(engine, retained_columns=()):
     ])
     metadata.create_all(engine)
     return table
+
+
+def test_license_superseded_column_migration_twice_preserves_old_rows(database):
+    engine, local = database
+    metadata = MetaData()
+    table = Table("bid_license_limit", metadata, *[
+        Column(c.name, c.type, primary_key=c.primary_key, nullable=c.nullable)
+        for c in BidLicenseLimit.__table__.columns if c.name != "superseded_at"
+    ])
+    metadata.create_all(engine)
+    values = dict(bid_ntce_no="OLD-LICENSE", bid_ntce_ord="001", lmt_grp_no="1",
+                  lmt_sno="1", lcns_cd="1468", collected_at=NOW)
+    with engine.begin() as conn:
+        conn.execute(table.insert(), values)
+    alters = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("ALTER TABLE bid_license_limit"):
+            alters.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        for _ in range(2):
+            db.init_db()
+            column = next(c for c in inspect(engine).get_columns("bid_license_limit")
+                          if c["name"] == "superseded_at")
+            assert column["nullable"] is True
+            with local() as session:
+                row = session.scalars(select(BidLicenseLimit)).one()
+                assert row.superseded_at is None
+                assert all(getattr(row, name) == value for name, value in values.items())
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert len(alters) == 1
 
 
 def _snapshot(engine):
@@ -367,3 +401,40 @@ def test_raw_migration_batch_rolls_back_and_retries(database, failed_batch):
         assert all(row.raw_json is None and row.bef_bid_bbanc_no == "OLD"
                    and row.pub_prcrmnt_clsfc_nm == "분류" for row in notices)
         assert all(raw.raw_json == original and raw.updated_at == NOW for raw in raw_rows)
+
+
+def test_license_verification_create_all_twice_schema_defaults_and_preservation(database):
+    engine, local = database
+    db.init_db()
+    inspector = inspect(engine)
+    columns = {c["name"]: c for c in inspector.get_columns("license_verification")}
+    assert inspector.get_pk_constraint("license_verification")["constrained_columns"] == [
+        "bid_ntce_no", "bid_ntce_ord",
+    ]
+    assert columns["bid_ntce_no"]["type"].length == 40
+    assert columns["bid_ntce_ord"]["type"].length == 3
+    assert columns["last_error"]["type"].length == 200
+    assert columns["attempts"]["nullable"] is False
+    for name in ("pending_since", "last_attempt_at", "last_error", "verified_at", "gave_up_at"):
+        assert columns[name]["nullable"] is True
+    assert inspector.get_indexes("license_verification") == []
+    with local() as session:
+        session.add(LicenseVerification(bid_ntce_no="NEW", bid_ntce_ord="001"))
+        session.commit()
+        state = session.get(LicenseVerification, ("NEW", "001"))
+        assert state.attempts == 0
+        assert all(getattr(state, name) is None for name in (
+            "pending_since", "last_attempt_at", "last_error", "verified_at", "gave_up_at",
+        ))
+        state.pending_since = NOW
+        state.attempts = 2
+        state.last_error = "검증 실패"
+        session.commit()
+    # 표준 SQL INSERT에도 DB 기본값 0이 적용된다.
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO license_verification (bid_ntce_no, bid_ntce_ord) VALUES ('SQL', '000')"))
+    db.init_db()
+    with local() as session:
+        assert session.get(LicenseVerification, ("SQL", "000")).attempts == 0
+        state = session.get(LicenseVerification, ("NEW", "001"))
+        assert state.pending_since == NOW and state.attempts == 2 and state.last_error == "검증 실패"

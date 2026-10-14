@@ -21,7 +21,7 @@ from sqlalchemy.orm import sessionmaker
 from app import collector, repository
 from app.collector import _RETRY_BACKOFF_SECONDS
 from app.db import Base
-from app.models import AppConfig, BidNotice, BidNoticeRaw, CollectionRun
+from app.models import AppConfig, BidNotice, BidNoticeRaw, CollectionRun, LicenseVerification
 
 WIN_BGN = datetime(2026, 5, 1, 0, 0)
 WIN_END = datetime(2026, 6, 1, 0, 0)
@@ -392,13 +392,16 @@ def test_optional_license_keys_preserved_and_updated_on_recollection(
             return _ok_result([_notice("NEW")], "1")
         if params["inqryDiv"] == "1" and stage == "license_fix" and not replay:
             return _ok_result()
-        return _ok_result(rows, str(len(rows)))
+        # 저장 중복 검증에 맞춰 전체 조회의 총건수는 실제 고유 면허 수를 반환한다.
+        count = len({collector._license_key(collector.license_values(row)) for row in rows})
+        return _ok_result(rows, str(count if params["inqryDiv"] == "2" else len(rows)))
 
     calls = _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
     assert run.status == "success" and run.error_msg is None
     detail = json.loads(run.detail_json)["by_call"][stage]
-    assert detail["total_count"] == detail["unique_items"] == len(rows)
+    assert detail["total_count"] == (len(set(codes)) if stage == "license_fix" else len(rows))
+    assert detail["unique_items"] == len(rows)
     assert sum(params["inqryDiv"] == "2" for _, params in calls) == (stage == "license_fix")
     with Local() as session:
         stored = session.scalars(select(BidLicenseLimit)).all()
@@ -458,7 +461,14 @@ def test_missing_license_only_current_limited_notices_are_called(monkeypatch, db
     assert run.status == "success"
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": 2, "called": 2, "found": 1,
-                   "failed": [], "retry_count": 0, "total_count": 1, "unique_items": 1}
+                   "failed": [], "retry_count": 0, "total_count": 1, "unique_items": 1,
+                   "verify_targets": 0, "superseded": 0, "restored": 0,
+                   "superseded_notices": [], "superseded_notices_count": 0,
+                   "verify_pending": 0, "verified": ["FIX-001"], "verified_count": 1,
+                   "verify_failed": [], "verify_gave_up": [], "stale_skipped": [],
+                   "verify_failed_count": 0, "verify_gave_up_count": 0,
+                   "anomalies": [], "pk_shortfall_skipped": [],
+                   "verify_deferred": 0, "stale_bulk_skipped": 0}
     with Local() as session:
         assert session.get(BidNotice, "MISS").list_visible is False
         assert session.get(BidNotice, "FIX").match_basis == "업종"
@@ -507,7 +517,15 @@ def test_missing_license_fix_queries_all_targets(monkeypatch, db_engine, count):
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": count, "called": count,
                    "found": (count + 1) // 2, "failed": [], "retry_count": 0,
-                   "total_count": (count + 1) // 2, "unique_items": (count + 1) // 2}
+                   "total_count": (count + 1) // 2, "unique_items": (count + 1) // 2,
+                   "verify_targets": 0, "superseded": 0, "restored": 0,
+                   "superseded_notices": [], "superseded_notices_count": 0,
+                   "verify_pending": 0, "verified": [f"A-{i}-000" for i in range(0, count, 2)][:50],
+                   "verified_count": (count + 1) // 2,
+                   "verify_failed": [], "verify_gave_up": [], "stale_skipped": [],
+                   "verify_failed_count": 0, "verify_gave_up_count": 0,
+                   "anomalies": [], "pk_shortfall_skipped": [],
+                   "verify_deferred": 0, "stale_bulk_skipped": 0}
     fixes = [params for op, params in calls
              if op == collector.LICENSE_OPERATION and params["inqryDiv"] == "2"]
     assert [params["bidNtceNo"] for params in fixes] == [item["bidNtceNo"] for item in notices]
@@ -538,7 +556,8 @@ def test_many_missing_license_targets_warns_without_changing_status(monkeypatch,
                 if record.name == "app.collector" and record.levelno == logging.WARNING]
     if count >= 50:
         assert len(warnings) == 1
-        assert warnings[0].getMessage() == f"면허 누락 보정 대상 {count}건 — 이번 창 공고 {len(notices)}건"
+        assert warnings[0].getMessage() == (f"면허 보정·확인 대상 {count}건(확인 0건) "
+                                            f"— 이번 창 공고 {len(notices)}건")
     else:
         assert warnings == []
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
@@ -574,7 +593,13 @@ def test_missing_license_fix_no_rows_advances_successive_windows(monkeypatch, db
         fix = json.loads(run.detail_json)["by_call"]["license_fix"]
         assert fix == {"outcome": "ok", "targets": 205, "called": 205,
                        "found": 0, "failed": [], "retry_count": 0, "total_count": 0,
-                       "unique_items": 0}
+                       "unique_items": 0, "verify_targets": 0, "superseded": 0, "restored": 0,
+                       "superseded_notices": [], "superseded_notices_count": 0,
+                       "verify_pending": 0, "verified": [], "verified_count": 0,
+                       "verify_failed": [], "verify_gave_up": [], "stale_skipped": [],
+                       "verify_failed_count": 0, "verify_gave_up_count": 0,
+                       "anomalies": [], "pk_shortfall_skipped": [],
+                       "verify_deferred": 0, "stale_bulk_skipped": 0}
         assert len(calls) == 207
         with Local() as session:
             assert session.get(AppConfig, 1).last_success_dt == window_end
@@ -871,10 +896,10 @@ def test_safety_limit_is_partial_and_preserves_received_data(monkeypatch, db_eng
         assert session.get(AppConfig, 1).last_success_dt == WIN_BGN
         assert session.get(AppConfig, 1).auto_halted is False
         notice = session.get(BidNotice, "NEW")
-        assert notice.list_visible is (stage != "license")
+        assert notice.list_visible is (stage == "servc")
         assert session.get(BidNoticeRaw, "NEW") is not None
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
-            1 if stage == "servc" else 2
+            1 if stage == "servc" else 2 if stage == "license" else 0
         )
 
 
@@ -952,10 +977,10 @@ def test_short_api_pages_are_partial_and_keep_received_data(
         assert session.scalar(select(func.count()).select_from(BidNotice)) == (
             received if stage == "servc" else 1)
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
-            0 if stage == "servc" else received)
+            received if stage == "license" else 0)
         notice = session.get(BidNotice, "NEW-0" if stage == "servc" else "NEW")
-        assert notice.list_visible is True
-        assert detail["classify"]["visible"] == (received if stage == "servc" else 1)
+        assert notice.list_visible is (stage != "license_fix")
+        assert detail["classify"]["visible"] == (received if stage == "servc" else 1 if stage == "license" else 0)
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -1001,7 +1026,7 @@ def test_received_count_at_least_total_is_success(monkeypatch, db_engine, stage,
             return _ok_result()
         rows = ([_notice(f"NEW-{i}") for i in range(received if stage == current else 1)]
                 if current == "servc" else
-                [_license("NEW-0", lmtSno=str(i))
+                [_license(params.get("bidNtceNo", "NEW-0"), lmtSno=str(i))
                  for i in range(received if stage == current else 1)])
         return _ok_result(rows, "1")
 
@@ -1036,7 +1061,7 @@ def test_bulk_999_pages_receive_full_seven_day_counts(monkeypatch, operation, to
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
-@pytest.mark.parametrize("second_code", ["00", "03"])
+@pytest.mark.parametrize("second_code", ["00", "03", "03_total"])
 def test_first_total_count_is_preserved_when_later_page_changes(monkeypatch, stage, second_code):
     operation = collector.OPERATION if stage == "servc" else collector.LICENSE_OPERATION
     page_size = 20 if stage == "license_fix" else 999
@@ -1054,8 +1079,9 @@ def test_first_total_count_is_preserved_when_later_page_changes(monkeypatch, sta
     result = collector._fetch_pages(operation, {"inqryDiv": "2" if stage == "license_fix" else "1"},
                                     collector._ConfigSnapshot("1", "1", None, 20, 0))
     assert result["total_count"] == total and len(calls) == 2
+    assert result.get("total_count_changed", False) is (second_code != "03")
     assert result["outcome"] == ("ok" if second_code == "00" else "failed")
-    if second_code == "03":
+    if second_code != "00":
         assert result["error_msg"] == f"건수 미달: 고유 {page_size} / 전체 {total}"
 
 
@@ -1181,7 +1207,7 @@ def test_repeated_page_key_cannot_hide_missing_row(monkeypatch, db_engine, stage
         assert session.scalar(select(func.count()).select_from(BidNotice)) == (
             999 if stage == "servc" else 1)
         assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == (
-            0 if stage == "servc" else 999)
+            999 if stage == "license" else 0)
 
 
 @pytest.mark.parametrize("stage", ["servc", "license", "license_fix"])
@@ -1267,3 +1293,1760 @@ def test_finish_run_commit_failure_rolls_back_notices_licenses_and_classificatio
         run = session.scalar(select(CollectionRun))
         assert run.status == "running" and run.run_finished_at is None
         assert session.get(AppConfig, 1).last_success_dt is None
+
+
+# --- Phase 13.7 대체 표시·전체 조회 확인 --------------------------------
+def _stored_license(raw, *, superseded_at=None):
+    return BidLicenseLimit(**collector.license_values(raw), collected_at=WIN_BGN,
+                           superseded_at=superseded_at)
+
+
+@pytest.mark.parametrize("key_fields", [{}, {"lmtGrpNo": "1", "lmtSno": "2"}])
+@pytest.mark.parametrize("license_only", [False, True])
+def test_new_license_pk_verified_and_old_row_superseded_without_deletion(
+    monkeypatch, db_engine, key_fields, license_only,
+):
+    _, Local = db_engine
+    old = _license("CHANGE")
+    new = _license("CHANGE", code="9999", **key_fields)
+    _seed(Local, _existing_notice("CHANGE", indstryty_lmt_yn="Y", list_visible=True,
+                                 match_basis="업종", matched_indstryty_cds="1468"),
+          _stored_license(old), _stored_license(_license("CHANGE", "001")),
+          _existing_notice("OTHER"), _stored_license(_license("OTHER")))
+
+    def responder(op, params):
+        rows = ([] if license_only else [_notice("CHANGE")]) if op == collector.OPERATION else [new]
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    assert run.status == "success"
+    assert [params["bidNtceNo"] for _, params in calls if params["inqryDiv"] == "2"] == ["CHANGE"]
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert (fix["targets"], fix["verify_targets"], fix["called"], fix["superseded"], fix["restored"]) == (1, 1, 1, 1, 0)
+    with Local() as session:
+        old_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+        new_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(new)))
+        assert old_row.superseded_at == new_row.collected_at
+        assert old_row.collected_at == WIN_BGN and old_row.lcns_cd == "1468"
+        assert new_row.superseded_at is None
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == 4
+        assert all(row.superseded_at is None for row in session.scalars(select(BidLicenseLimit).where(
+            (BidLicenseLimit.bid_ntce_no == "OTHER") | (BidLicenseLimit.bid_ntce_ord == "001")
+        )))
+        notice = session.get(BidNotice, "CHANGE")
+        assert notice.list_visible is False and notice.match_basis is None
+        assert notice.matched_indstryty_cds is None
+
+
+def test_verify_normal_addition_keeps_existing_and_new_rows(monkeypatch, db_engine):
+    _, Local = db_engine
+    old, new = _license("ADD", lmtSno="1"), _license("ADD", code="9999", lmtSno="2")
+    _seed(Local, _existing_notice("ADD", indstryty_lmt_yn="Y"), _stored_license(old))
+
+    def responder(op, params):
+        rows = [_notice("ADD")] if op == collector.OPERATION else (
+            [new] if params["inqryDiv"] == "1" else [old, new])
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    assert run.status == "success" and len(calls) == 3
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["verify_targets"] == 1 and fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == 2 and all(row.superseded_at is None for row in rows)
+        assert session.get(BidNotice, "ADD").match_basis == "업종"
+
+
+@pytest.mark.parametrize("outcome", ["empty00", "empty03", "failed", "shortfall", "halt", "late_halt"])
+def test_verify_empty_failed_or_halted_never_supersedes(monkeypatch, db_engine, outcome):
+    _, Local = db_engine
+    old, new = _license("SAFE"), _license("SAFE", code="9999")
+    _seed(Local, _existing_notice("SAFE", indstryty_lmt_yn="Y", list_visible=True,
+                                 match_basis="업종", matched_indstryty_cds="1468"),
+          _stored_license(old))
+    with Local() as session:
+        cfg = session.get(AppConfig, 1)
+        cfg.max_retries = 0
+        cfg.num_of_rows = 1 if outcome == "late_halt" else 20
+        cfg.last_success_dt = WIN_BGN
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("SAFE")], 1)
+        if params["inqryDiv"] == "1":
+            return _ok_result([new], 1)
+        if outcome.startswith("empty"):
+            result = _ok_result()
+            result.result_code = outcome[-2:]
+            return result
+        if outcome == "shortfall" or (outcome == "late_halt" and params["pageNo"] == "1"):
+            return _ok_result([new], 2)
+        result = _failed_result()
+        if outcome in {"halt", "late_halt"}:
+            result.result_code = "22"
+        return result
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    halted = outcome in {"halt", "late_halt"}
+    assert run.status == ("failed" if halted else "success")
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["verify_targets"] == 1 and fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == (1 if halted else 2)
+        assert all(row.superseded_at is None for row in rows)
+        assert session.get(BidNotice, "SAFE").match_basis == "업종"
+        cfg = session.get(AppConfig, 1)
+        assert cfg.auto_halted is halted
+        assert cfg.last_success_dt == (WIN_END if run.status == "success" else WIN_BGN)
+
+
+def test_superseded_license_restored_by_later_full_response(monkeypatch, db_engine):
+    _, Local = db_engine
+    old, new, third = (_license("RETURN", code=code) for code in ("1468", "9999", "8888"))
+    _seed(Local, _existing_notice("RETURN", indstryty_lmt_yn="Y"), _stored_license(old))
+    replay = False
+
+    def responder(op, params):
+        rows = [_notice("RETURN")] if op == collector.OPERATION else (
+            [third if replay else new] if params["inqryDiv"] == "1" else
+            [old, new, third] if replay else [new])
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    first = collector.collect_window(WIN_BGN, WIN_END)
+    assert json.loads(first.detail_json)["by_call"]["license_fix"]["superseded"] == 1
+    with Local() as session:
+        assert session.get(BidNotice, "RETURN").list_visible is False
+    replay = True
+    second = collector.collect_window(WIN_END, WIN_END + timedelta(days=1))
+    fix = json.loads(second.detail_json)["by_call"]["license_fix"]
+    assert fix["verify_targets"] == fix["restored"] == 1 and fix["superseded"] == 0
+    assert sum(params["inqryDiv"] == "2" for _, params in calls) == 2
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == 3 and all(row.superseded_at is None for row in rows)
+        old_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+        assert old_row.collected_at == WIN_BGN
+        assert session.get(BidNotice, "RETURN").matched_indstryty_cds == "1468"
+        assert session.get(BidNotice, "RETURN").match_basis == "업종"
+
+
+def test_missing_fix_restores_superseded_rows(monkeypatch, db_engine):
+    _, Local = db_engine
+    old = _license("MISSING", lmtSno="1")
+    _seed(Local, _existing_notice("MISSING", indstryty_lmt_yn="Y"),
+          _stored_license(old, superseded_at=WIN_BGN),
+          _stored_license(_license("MISSING", lmtSno="2"), superseded_at=WIN_BGN))
+
+    def responder(op, params):
+        rows = [_notice("MISSING")] if op == collector.OPERATION else (
+            [] if params["inqryDiv"] == "1" else [old])
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert len(calls) == 3 and fix["targets"] == 1 and fix["verify_targets"] == 0
+    assert fix["superseded"] == 0 and fix["restored"] == 1
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit).order_by(BidLicenseLimit.lmt_sno)).all()
+        assert rows[0].superseded_at is None and rows[1].superseded_at == WIN_BGN
+        assert session.get(BidNotice, "MISSING").match_basis == "업종"
+
+
+@pytest.mark.parametrize("bulk_codes", [("9999",), ("1468", "8888")])
+def test_verify_requires_new_pk_and_missing_active_row(monkeypatch, db_engine, bulk_codes):
+    _, Local = db_engine
+    _seed(Local, _existing_notice("NO-VERIFY", indstryty_lmt_yn="Y"),
+          _stored_license(_license("NO-VERIFY", code="1468")),
+          _stored_license(_license("NO-VERIFY", code="9999")),
+          _stored_license(_license("NO-VERIFY", code="7777"), superseded_at=WIN_BGN))
+    # 기존 유효 PK 만 수신하거나 모든 유효 행+새 PK 수신이면 확인 대상 제외.
+    rows = [_license("NO-VERIFY", code=code) for code in bulk_codes]
+    if "8888" in bulk_codes:
+        rows.append(_license("NO-VERIFY", code="9999"))
+
+    def responder(op, params):
+        assert params["inqryDiv"] == "1"
+        items = [_notice("NO-VERIFY")] if op == collector.OPERATION else rows
+        return _ok_result(items, len(items))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert len(calls) == 2 and fix["targets"] == fix["verify_targets"] == 0
+    assert fix["superseded"] == fix["restored"] == 0
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_verify_and_missing_targets_deduplicated_by_normalized_pair(monkeypatch, db_engine, pending):
+    _, Local = db_engine
+    old, new = _license("OVERLAP"), _license("OVERLAP", code="9999")
+    _seed(Local, _existing_notice("OVERLAP", indstryty_lmt_yn="Y"), _stored_license(old))
+    if pending:
+        _seed(Local, LicenseVerification(bid_ntce_no="OVERLAP", bid_ntce_ord="000",
+                                         pending_since=datetime.now(), attempts=3))
+    monkeypatch.setattr(collector, "_missing_license_targets",
+                        lambda session, notices, licenses: [_notice("OVERLAP", "0")])
+
+    def responder(op, params):
+        rows = [_notice("OVERLAP")] if op == collector.OPERATION else [new]
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert len(calls) == 3 and fix["targets"] == fix["called"] == fix["verify_targets"] == 1
+    assert fix["superseded"] == 1 and fix["verify_pending"] == int(pending)
+    with Local() as session:
+        state = session.scalars(select(LicenseVerification)).one()
+        assert state.bid_ntce_ord == "000" and state.pending_since is None and state.attempts == 0
+
+
+@pytest.mark.parametrize("failed_stage", ["servc", "license"])
+def test_verify_skipped_unless_both_bulk_stages_ok(monkeypatch, db_engine, failed_stage):
+    _, Local = db_engine
+    _seed(Local, _existing_notice("GATE", indstryty_lmt_yn="Y"),
+          _stored_license(_license("GATE")))
+
+    def responder(op, params):
+        assert params["inqryDiv"] == "1"
+        stage = "servc" if op == collector.OPERATION else "license"
+        rows = [_notice("GATE")] if stage == "servc" else [_license("GATE", code="9999")]
+        return _ok_result(rows, 2 if stage == failed_stage else 1)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "partial" and len(calls) == 2
+    assert fix["outcome"] == "skipped"
+    assert fix["verify_targets"] == fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        assert all(row.superseded_at is None for row in session.scalars(select(BidLicenseLimit)))
+
+
+@pytest.mark.parametrize("count", [50, 51, 205, 501])
+def test_verify_query_budget_defers_and_persists_new_registrations(monkeypatch, db_engine, caplog, count):
+    _, Local = db_engine
+    _seed(Local, *[_existing_notice(f"VERIFY-{i}", indstryty_lmt_yn="Y") for i in range(count)],
+          *[_stored_license(_license(f"VERIFY-{i}")) for i in range(count)])
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 999
+        session.commit()
+    bulk = [_license(f"VERIFY-{i}", code="9999") for i in range(count)]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        rows = bulk if params["inqryDiv"] == "1" else [_license(params["bidNtceNo"], code="9999")]
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    with caplog.at_level(logging.INFO, logger="app.collector"):
+        run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success"
+    queried = min(count, collector._VERIFY_QUERY_LIMIT)
+    assert fix["verify_targets"] == fix["targets"] == fix["called"] == fix["superseded"] == queried
+    assert fix["verify_deferred"] == count - queried
+    assert len(calls) == queried + 2
+    assert fix["superseded_notices_count"] == queried
+    if count <= 50:
+        assert set(fix["superseded_notices"]) == {f"VERIFY-{i}-000" for i in range(count)}
+    else:
+        assert len(fix["superseded_notices"]) == 50
+    assert f"면허 보정·확인 대상 {queried}건(확인 {queried}건)" in caplog.text
+    ending = next(record.getMessage() for record in caplog.records
+                  if "수집 종료:" in record.getMessage())
+    assert f"verify_targets={queried} superseded={queried} restored=0" in ending
+    with Local() as session:
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit)) == count * 2
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit).where(
+            BidLicenseLimit.superseded_at.is_not(None))) == queried
+        assert session.scalar(select(func.count()).select_from(LicenseVerification).where(
+            LicenseVerification.pending_since.is_not(None))) == count - queried
+    remaining = count - queried
+    while remaining:
+        calls.clear()
+        run = collector.collect_window(WIN_BGN, WIN_END)
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        called = min(remaining, collector._VERIFY_QUERY_LIMIT)
+        remaining -= called
+        assert run.status == "success" and fix["verify_pending"] == remaining + called
+        assert fix["called"] == fix["superseded"] == called
+        assert fix["verify_deferred"] == remaining
+        assert len(calls) == called + 2
+    with Local() as session:
+        assert session.scalar(select(func.count()).select_from(LicenseVerification).where(
+            LicenseVerification.pending_since.is_not(None))) == 0
+        assert session.scalar(select(func.count()).select_from(BidLicenseLimit).where(
+            BidLicenseLimit.superseded_at.is_not(None))) == count
+
+
+@pytest.mark.parametrize("old_order,new_order", [("0", "000"), ("001", "1"), ("A", "00A")])
+def test_verify_and_supersede_normalize_order_notation(monkeypatch, db_engine, old_order, new_order):
+    _, Local = db_engine
+    old = _license("ORDER", old_order)
+    new = _license("ORDER", new_order, code="9999")
+    notice = _existing_notice("ORDER", indstryty_lmt_yn="Y")
+    notice.bid_ntce_ord = new_order
+    _seed(Local, notice, _stored_license(old))
+
+    def responder(op, params):
+        rows = [_notice("ORDER", new_order)] if op == collector.OPERATION else [new]
+        return _ok_result(rows, len(rows))
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["verify_targets"] == fix["superseded"] == 1
+    with Local() as session:
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(old))).superseded_at is not None
+        assert session.get(BidNotice, "ORDER").list_visible is False
+
+
+@pytest.mark.parametrize("second_outcome", ["failed", "halt"])
+def test_full_snapshots_saved_on_verify_failure_but_discarded_on_later_halt(
+    monkeypatch, db_engine, second_outcome,
+):
+    _, Local = db_engine
+    _seed(Local, *[_existing_notice(no, indstryty_lmt_yn="Y") for no in ("A", "B")],
+          *[_stored_license(_license(no)) for no in ("A", "B")])
+    with Local() as session:
+        session.get(AppConfig, 1).max_retries = 0
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        if params["inqryDiv"] == "1":
+            return _ok_result([_license(no, code="9999") for no in ("A", "B")], 2)
+        if params["bidNtceNo"] == "B":
+            result = _failed_result()
+            if second_outcome == "halt":
+                result.result_code = "22"
+            return result
+        return _ok_result([_license("A", code="9999")], 1)
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    halted = second_outcome == "halt"
+    assert run.status == ("failed" if halted else "success")
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["called"] == 2 and fix["failed"] == (["B"] if halted else [])
+    assert fix["superseded"] == (0 if halted else 1)
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == (2 if halted else 4)
+        superseded = [row for row in rows if row.superseded_at is not None]
+        assert [row.bid_ntce_no for row in superseded] == ([] if halted else ["A"])
+
+
+@pytest.mark.parametrize("failure_point", ["classification", "finish_commit"])
+def test_superseded_and_restored_roll_back_with_classification_and_run(
+    monkeypatch, db_engine, failure_point,
+):
+    _, Local = db_engine
+    old, restored, new = (_license("ATOMIC", code=code) for code in ("1470", "1468", "9999"))
+    _seed(Local, _existing_notice("ATOMIC", indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(old), _stored_license(restored, superseded_at=WIN_BGN))
+    original_classify = classifier.reclassify_notices
+    original_finish = repository.finish_run
+
+    def responder(op, params):
+        rows = [_notice("ATOMIC", bidNtceNm="변경")] if op == collector.OPERATION else (
+            [new] if params["inqryDiv"] == "1" else [new, restored])
+        return _ok_result(rows, len(rows))
+
+    def check_then_fail(session):
+        session.flush()
+        old_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+        restored_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(restored)))
+        assert old_row.superseded_at is not None and restored_row.superseded_at is None
+        assert session.get(BidNotice, "ATOMIC").match_basis == "업종"
+        raise RuntimeError("가짜 대체 표시 커밋 실패")
+
+    def classify_then_fail(session, **kwargs):
+        original_classify(session, **kwargs)
+        check_then_fail(session)
+
+    def finish_then_fail(session, run, **kwargs):
+        detail = json.loads(kwargs["detail_json"])["by_call"]["license_fix"]
+        assert detail["superseded"] == detail["restored"] == 1
+        event.listen(session, "before_commit", check_then_fail, once=True)
+        original_finish(session, run, **kwargs)
+
+    _fake_api(monkeypatch, responder)
+    if failure_point == "classification":
+        monkeypatch.setattr(classifier, "reclassify_notices", classify_then_fail)
+    else:
+        monkeypatch.setattr(repository, "finish_run", finish_then_fail)
+    with pytest.raises(RuntimeError, match="가짜 대체 표시 커밋 실패"):
+        collector.collect_window(WIN_BGN, WIN_END)
+    with Local() as session:
+        rows = {row.lcns_cd: row for row in session.scalars(select(BidLicenseLimit))}
+        assert set(rows) == {"1470", "1468"}
+        assert rows["1470"].superseded_at is None and rows["1468"].superseded_at == WIN_BGN
+        notice = session.get(BidNotice, "ATOMIC")
+        assert notice.list_visible is False and notice.match_basis is None and notice.bid_ntce_nm is None
+        run = session.scalars(select(CollectionRun)).one()
+        assert run.status == "running" and run.run_finished_at is None and run.detail_json is None
+        assert session.get(AppConfig, 1).last_success_dt is None
+        assert session.get(LicenseVerification, ("ATOMIC", "000")) is None
+
+
+@pytest.mark.parametrize("full_outcome", [
+    "includes", "excludes", "failed", "shortfall", "empty", "halt", "late_halt",
+])
+def test_bulk_reappearing_superseded_pk_requires_valid_full_snapshot(
+    monkeypatch, db_engine, caplog, full_outcome,
+):
+    _, Local = db_engine
+    old = _license("REAPPEAR", lmtGrpNo="1", lmtSno="1")
+    active = _license("REAPPEAR", code="9999", lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice("REAPPEAR", indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(old, superseded_at=WIN_BGN), _stored_license(active))
+    with Local() as session:
+        cfg = session.get(AppConfig, 1)
+        cfg.max_retries = 0
+        cfg.num_of_rows = 1 if full_outcome == "late_halt" else 20
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("REAPPEAR")], 1)
+        if params["inqryDiv"] == "1":
+            return _ok_result([old], 1)
+        if full_outcome == "empty":
+            return _ok_result()
+        if full_outcome == "shortfall" or (full_outcome == "late_halt" and params["pageNo"] == "1"):
+            return _ok_result([old], 2)
+        if full_outcome in {"failed", "halt", "late_halt"}:
+            result = _failed_result()
+            if full_outcome != "failed":
+                result.result_code = "22"
+            return result
+        rows = [active, old] if full_outcome == "includes" else [active]
+        return _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    with caplog.at_level(logging.INFO, logger="app.collector"):
+        run = collector.collect_window(WIN_BGN, WIN_END)
+    halted = full_outcome in {"halt", "late_halt"}
+    assert run.status == ("failed" if halted else "success")
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert fix["verify_targets"] == fix["targets"] == fix["called"] == 1
+    assert fix["restored"] == int(full_outcome == "includes") and fix["superseded"] == 0
+    assert fix["superseded_notices"] == (["REAPPEAR-000"] if full_outcome == "includes" else [])
+    assert f"verify_targets=1 superseded=0 restored={fix['restored']}" in caplog.text
+    assert any(params["inqryDiv"] == "2" for _, params in calls)
+    with Local() as session:
+        rows = {row.lmt_sno: row for row in session.scalars(select(BidLicenseLimit))}
+        assert rows["1"].superseded_at == (None if full_outcome == "includes" else WIN_BGN)
+        assert rows["2"].superseded_at is None
+        assert session.get(BidNotice, "REAPPEAR").list_visible is (full_outcome == "includes")
+
+
+@pytest.mark.parametrize("failed_stage", ["servc", "license"])
+def test_bulk_alone_never_restores_when_full_query_gate_fails(monkeypatch, db_engine, failed_stage):
+    _, Local = db_engine
+    old = _license("BULK-ONLY")
+    _seed(Local, _existing_notice("BULK-ONLY", indstryty_lmt_yn="Y"),
+          _stored_license(old, superseded_at=WIN_BGN))
+
+    def responder(op, params):
+        assert params["inqryDiv"] == "1"
+        stage = "servc" if op == collector.OPERATION else "license"
+        rows = [_notice("BULK-ONLY")] if stage == "servc" else [old]
+        return _ok_result(rows, 2 if stage == failed_stage else 1)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "partial" and len(calls) == 2
+    assert fix["outcome"] == "skipped" and fix["restored"] == fix["superseded"] == 0
+    with Local() as session:
+        assert session.scalars(select(BidLicenseLimit)).one().superseded_at == WIN_BGN
+
+
+@pytest.mark.parametrize("bad_row,reason", [
+    ({"bidNtceOrd": "000"}, "변환 불가"),
+    ({"bidNtceNo": "INVALID"}, "변환 불가"),
+    (None, "변환 불가"),
+    (_license("OTHER", lmtSno="3"), "다른 공고·차수"),
+    (_license("INVALID", "001", lmtSno="3"), "다른 공고·차수"),
+])
+def test_full_snapshot_rejects_any_unconvertible_or_wrong_pair_row(
+    monkeypatch, db_engine, bad_row, reason,
+):
+    _, Local = db_engine
+    active = _license("INVALID", lmtSno="1")
+    old = _license("INVALID", code="1470", lmtSno="2")
+    new = _license("INVALID", code="9999", lmtSno="4")
+    _seed(Local, _existing_notice("INVALID", indstryty_lmt_yn="Y"),
+          _stored_license(active), _stored_license(old, superseded_at=WIN_BGN))
+
+    def responder(op, params):
+        rows = [_notice("INVALID")] if op == collector.OPERATION else (
+            [new] if params["inqryDiv"] == "1" else [new, old, bad_row])
+        return _ok_result(rows, len(rows))
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and fix["outcome"] == "ok"
+    # 기존 13.3 수신 건수 검증은 통과해도 대체·복원용 검증에서 거절한다.
+    assert fix["unique_items"] == fix["total_count"] == 3
+    assert run.error_msg is None and reason in fix["anomalies"][0]["reason"]
+    assert fix["anomalies"][0]["notice"] == "INVALID-000"
+    assert fix["failed"] == [] and fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(active))).superseded_at is None
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(old))).superseded_at == WIN_BGN
+        assert session.get(BidNotice, "INVALID").list_visible is True
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+
+@pytest.mark.parametrize("stored_ord,response_ord", [("001", "1"), ("A", "00A"), ("00A", "A")])
+def test_full_snapshot_same_pk_with_unpadded_order_neither_supersedes_nor_duplicates(
+    monkeypatch, db_engine, stored_ord, response_ord,
+):
+    _, Local = db_engine
+    old = _license("SAME-PK", stored_ord, lmtGrpNo="1", lmtSno="1")
+    new = _license("SAME-PK", stored_ord, code="9999", lmtGrpNo="1", lmtSno="2")
+    notice = _existing_notice("SAME-PK", indstryty_lmt_yn="Y")
+    notice.bid_ntce_ord = stored_ord
+    old_row = _stored_license(old)
+    old_row.bid_ntce_ord = stored_ord  # 기존 비정규 표기의 물리 PK 도 보존한다.
+    _seed(Local, notice, old_row)
+
+    def responder(op, params):
+        rows = [_notice("SAME-PK", stored_ord)] if op == collector.OPERATION else (
+            [new] if params["inqryDiv"] == "1" else [{**old, "bidNtceOrd": response_ord}, new])
+        return _ok_result(rows, len(rows))
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and fix["called"] == 1
+    assert fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == 2 and all(row.superseded_at is None for row in rows)
+        assert {row.bid_ntce_ord for row in rows} == {stored_ord, new["bidNtceOrd"].zfill(3)}
+        assert session.get(BidNotice, "SAME-PK").match_basis == "업종"
+
+
+@pytest.mark.parametrize("duplicate_hash", [True, False])
+def test_full_snapshot_hash_duplicates_cannot_hide_missing_rows(monkeypatch, db_engine, duplicate_hash):
+    _, Local = db_engine
+    active = _license("HASH-COUNT", lmtGrpNo="1", lmtSno="1")
+    hashed = _license("HASH-COUNT", code="9999")
+    new = _license("HASH-COUNT", code="9999", lmtGrpNo="1", lmtSno="2")
+    third = _license("HASH-COUNT", code="9999", lmtGrpNo="1", lmtSno="3")
+    _seed(Local, _existing_notice("HASH-COUNT", indstryty_lmt_yn="Y"),
+          _stored_license(active), _stored_license(hashed))
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 1
+        session.commit()
+    pages = [hashed, hashed if duplicate_hash else third, new]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("HASH-COUNT")], 1)
+        if params["inqryDiv"] == "1":
+            return _ok_result([new], 1)
+        return _ok_result([pages[int(params["pageNo"]) - 1]], 3)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success"
+    assert fix["called"] == 1 and len(calls) == 5
+    assert fix["unique_items"] == fix["total_count"] == 3
+    assert fix["superseded"] == int(not duplicate_hash) and fix["restored"] == 0
+    if duplicate_hash:
+        with Local() as session:
+            assert "변환 후 고유 PK 미달: 고유 2 / 전체 3" in session.get(LicenseVerification, ("HASH-COUNT", "000")).last_error
+    with Local() as session:
+        row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(active)))
+        assert (row.superseded_at is None) is duplicate_hash
+        assert session.get(BidNotice, "HASH-COUNT").list_visible is duplicate_hash
+
+
+@pytest.mark.parametrize("second_total", [2, 3, 1])
+def test_full_snapshot_count_change_neither_supersedes_restores_nor_saves(
+    monkeypatch, db_engine, second_total,
+):
+    _, Local = db_engine
+    active = _license("COUNT-CHANGE", lmtGrpNo="1", lmtSno="1")
+    restored = _license("COUNT-CHANGE", code="1470", lmtGrpNo="1", lmtSno="2")
+    new = _license("COUNT-CHANGE", code="9999", lmtGrpNo="1", lmtSno="3")
+    _seed(Local, _existing_notice("COUNT-CHANGE", indstryty_lmt_yn="Y",
+                                 list_visible=True, match_basis="업종", matched_indstryty_cds="1468"),
+          _stored_license(active), _stored_license(restored, superseded_at=WIN_BGN))
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 1
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        if params["inqryDiv"] == "1":
+            return _ok_result([new], 1)
+        if params["pageNo"] == "1":
+            return _ok_result([{**restored, "lcnsLmtNm": "변경/1470"}], 2)
+        return _ok_result([{**new, "lcnsLmtNm": "전체 조회만/9999"}], second_total)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    changed = second_total != 2
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert len(calls) == 4 and fix["total_count"] == fix["unique_items"] == 2
+    assert run.status == "success"
+    assert fix.get("total_count_changed", False) is changed
+    assert fix["superseded"] == fix["restored"] == int(not changed)
+    assert fix["found"] == int(not changed)
+    if changed:
+        with Local() as session:
+            assert "totalCount 변화" in session.get(LicenseVerification, ("COUNT-CHANGE", "000")).last_error
+    with Local() as session:
+        active_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(active)))
+        restored_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(restored)))
+        new_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(new)))
+        assert (active_row.superseded_at is None) is changed
+        assert restored_row.superseded_at == (WIN_BGN if changed else None)
+        assert restored_row.lcns_nm == (collector.license_values(restored)["lcns_nm"] if changed else "변경")
+        if changed:
+            assert new_row.lcns_nm == collector.license_values(new)["lcns_nm"]
+        else:
+            assert new_row.lcns_nm == "전체 조회만"
+        notice = session.get(BidNotice, "COUNT-CHANGE")
+        assert notice.list_visible is changed
+        assert notice.match_basis == ("업종" if changed else None)
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+
+@pytest.mark.parametrize("bad_row,reason", [
+    (_license("OTHER", lmtSno="3"), "다른 공고·차수"),
+    (_license("REJECT", "001", lmtSno="3"), "다른 공고·차수"),
+    ({"bidNtceOrd": "000"}, "변환 불가"),
+])
+def test_anomalous_full_response_saves_only_valid_pair_without_restoring(
+    monkeypatch, db_engine, bad_row, reason,
+):
+    _, Local = db_engine
+    old = _license("REJECT", code="9999", lmtGrpNo="1", lmtSno="1")
+    new = _license("REJECT", lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice("REJECT", indstryty_lmt_yn="Y", list_visible=False),
+          _existing_notice("OTHER", indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(old, superseded_at=WIN_BGN))
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("REJECT")], 1)
+        if params["inqryDiv"] == "1":
+            return _ok_result()
+        return _ok_result([{**old, "lcnsLmtNm": "거절된 변경/1468"}, new, bad_row], 3)
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and run.error_msg is None
+    assert reason in fix["anomalies"][0]["reason"]
+    assert fix["found"] == 1 and fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == 2 and {row.bid_ntce_no for row in rows} == {"REJECT"}
+        row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+        assert row.superseded_at == WIN_BGN and row.lcns_cd == "1468"
+        assert row.lcns_nm == "거절된 변경"
+        notice = session.get(BidNotice, "REJECT")
+        assert notice.list_visible is True and notice.match_basis == "업종"
+        other = session.get(BidNotice, "OTHER")
+        assert other.list_visible is False and other.match_basis is None
+        assert other.matched_indstryty_cds is None
+        assert session.get(AppConfig, 1).last_success_dt == WIN_END
+
+
+@pytest.mark.parametrize("existing", ["none", "other_order", "active", "superseded"])
+@pytest.mark.parametrize("invalid", [None, "count_change", "wrong_pair", "unconvertible"])
+def test_duplicate_hash_snapshot_skips_comparison_only_without_existing_pair(
+    monkeypatch, db_engine, existing, invalid,
+):
+    _, Local = db_engine
+    hashed = _license("DUPLICATE")
+    old = _license("DUPLICATE", "001" if existing == "other_order" else "000",
+                   code="9999", lmtSno="1")
+    _seed(Local, _existing_notice("DUPLICATE", indstryty_lmt_yn="Y"))
+    if existing != "none":
+        _seed(Local, _stored_license(old, superseded_at=WIN_BGN if existing == "superseded" else None))
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 1
+        session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("DUPLICATE")], 1)
+        if params["inqryDiv"] == "1":
+            # 유효 행이 있으면 새 PK 로 확인 조회를 유도한다.
+            return _ok_result([_license("DUPLICATE", code="9999", lmtSno="2")], 1) if existing == "active" else _ok_result()
+        row = hashed
+        total = 2
+        if params["pageNo"] == "2":
+            if invalid == "count_change":
+                total = 3
+            elif invalid == "wrong_pair":
+                row = {**hashed, "bidNtceNo": "OTHER"}
+            elif invalid == "unconvertible":
+                row = {"bidNtceOrd": "000"}
+        return _ok_result([row], total)
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    accepted = (invalid in {"wrong_pair", "unconvertible"}
+                or invalid is None and existing in {"none", "other_order"})
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("success" if accepted or existing == "active" else "partial")
+    assert fix["called"] == 1 and fix["superseded"] == fix["restored"] == 0
+    assert fix["found"] == int(accepted)
+    if invalid is None and not accepted:
+        if existing == "active":
+            with Local() as session:
+                assert "고유 PK 미달" in session.get(LicenseVerification, ("DUPLICATE", "000")).last_error
+        else:
+            assert "고유 PK 미달" in run.error_msg
+    if invalid in {"wrong_pair", "unconvertible"}:
+        assert fix["anomalies"][0]["notice"] == "DUPLICATE-000"
+        assert fix["pk_shortfall_skipped"] == []
+    elif accepted:
+        assert fix["pk_shortfall_skipped"] == ["DUPLICATE-000"]
+    with Local() as session:
+        row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(hashed)))
+        assert (row is not None) is accepted
+        if row is not None:
+            assert row.superseded_at is None
+        if existing != "none":
+            row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+            assert row.superseded_at == (WIN_BGN if existing == "superseded" else None)
+        assert session.get(AppConfig, 1).last_success_dt == (WIN_END if run.status == "success" else None)
+
+
+@pytest.mark.parametrize("stage", ["servc", "license"])
+def test_bulk_count_change_only_records_history_without_changing_outcome(monkeypatch, db_engine, stage):
+    def responder(op, params):
+        current = "servc" if op == collector.OPERATION else "license"
+        if current != stage:
+            return _ok_result()
+        if params["pageNo"] == "1":
+            return _ok_result([{"page": 1}] * 999, 1000)
+        return _ok_result([{"page": 2}], 1001)
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    detail = json.loads(run.detail_json)["by_call"][stage]
+    assert run.status == "success" and detail["outcome"] == "ok"
+    assert len(calls) == 3 and detail["pages"] == 2
+    assert detail["total_count"] == detail["unique_items"] == 1000
+    assert detail["total_count_changed"] is True and detail["error_msg"] is None
+
+
+@pytest.mark.parametrize("failure", ["count_change", "shortfall", "pk_shortfall", "retry", "client"])
+@pytest.mark.parametrize("reappeared", [False, True])
+def test_transient_verify_persists_and_retries_outside_next_window(
+    monkeypatch, db_engine, failure, reappeared,
+):
+    """일괄 새 PK 저장·창 전진 후에도 영속 대기 상태로 창 밖 공고를 재조회한다."""
+    _, Local = db_engine
+    old = _license("RETRY-VERIFY", lmtSno="1")
+    incoming = _license("RETRY-VERIFY", code="9999")
+    companion = _license("RETRY-VERIFY", code="9999", lmtSno="3")
+    unrelated = _license("UNRELATED", lmtSno="1")
+    _seed(Local, _existing_notice("RETRY-VERIFY", indstryty_lmt_yn="Y"),
+          _existing_notice("UNRELATED", indstryty_lmt_yn="Y"), _stored_license(old))
+    if reappeared:
+        _seed(Local, _stored_license(incoming, superseded_at=WIN_BGN))
+    with Local() as session:
+        cfg = session.get(AppConfig, 1)
+        cfg.num_of_rows = 1
+        cfg.max_retries = 0
+        cfg.last_success_dt = WIN_BGN
+        session.commit()
+    attempt = 0
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("RETRY-VERIFY")], 1) if attempt == 0 else _ok_result()
+        if params["inqryDiv"] == "1":
+            return _ok_result([incoming, unrelated], 2) if attempt == 0 else _ok_result()
+        page = int(params["pageNo"])
+        if attempt == 0:
+            if failure == "retry":
+                return _failed_result()
+            if failure == "client":
+                raise collector.api_client.ApiClientError("가짜 클라이언트 오류")
+            if failure == "shortfall":
+                return _ok_result([incoming], 2) if page == 1 else _ok_result()
+            if failure == "pk_shortfall":
+                return _ok_result([incoming], 2)
+            return _ok_result([incoming if page == 1 else companion], 2 if page == 1 else 3)
+        return _ok_result([incoming if page == 1 else companion], 2)
+
+    calls = _fake_api(monkeypatch, responder)
+    for attempt in range(3):
+        end = WIN_END + timedelta(hours=attempt)
+        run = collector.collect_window(WIN_BGN if attempt == 0 else end - timedelta(hours=1), end)
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert run.status == "success"
+        assert fix["verify_targets"] == fix["called"] == int(attempt < 2)
+        assert fix["superseded"] == int(attempt == 1)
+        assert fix["restored"] == int(attempt == 1 and reappeared)
+        assert fix["anomalies"] == []
+        with Local() as session:
+            incoming_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(incoming)))
+            old_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+            if attempt == 0:
+                assert incoming_row is not None
+                state = session.get(LicenseVerification, ("RETRY-VERIFY", "000"))
+                assert state.attempts == 1 and state.pending_since is not None
+                assert state.verified_at is None and state.last_error
+                if reappeared:
+                    assert incoming_row.superseded_at == WIN_BGN
+                    assert incoming_row.lcns_nm == collector.license_values(incoming)["lcns_nm"]
+                assert old_row.superseded_at is None
+                assert session.get(AppConfig, 1).last_success_dt == end
+            else:
+                assert old_row.superseded_at is not None and incoming_row.superseded_at is None
+                assert session.get(AppConfig, 1).last_success_dt == end
+                state = session.get(LicenseVerification, ("RETRY-VERIFY", "000"))
+                assert state.pending_since is None and state.attempts == 0 and state.last_error is None
+                assert state.verified_at is not None
+            assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(unrelated))) is not None
+    assert sum(params["inqryDiv"] == "2" and params["pageNo"] == "1" for _, params in calls) == 2
+
+
+@pytest.mark.parametrize("foreign_order", ["001", "1"])
+def test_persistent_wrong_order_missing_fix_saves_then_advances_without_retry(
+    monkeypatch, db_engine, foreign_order, caplog,
+):
+    _, Local = db_engine
+    valid = _license("MISSING-ANOMALY", "000")
+    foreign = _license("MISSING-ANOMALY", foreign_order, code="9999")
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("MISSING-ANOMALY")], 1)
+        return _ok_result() if params["inqryDiv"] == "1" else _ok_result([valid, foreign], 2)
+
+    calls = _fake_api(monkeypatch, responder)
+    for attempt in range(3):
+        end = WIN_END + timedelta(hours=attempt)
+        with caplog.at_level(logging.WARNING, logger="app.collector"):
+            run = collector.collect_window(WIN_BGN, end)
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert run.status == "success" and fix["called"] == int(attempt == 0)
+        assert fix["superseded"] == fix["restored"] == 0
+        if attempt == 0:
+            assert fix["anomalies"] == [{"notice": "MISSING-ANOMALY-000",
+                                         "reason": "전체 조회 다른 공고·차수 행 포함"}]
+        else:
+            assert fix["anomalies"] == [] and fix["targets"] == 0
+        with Local() as session:
+            row = session.scalars(select(BidLicenseLimit)).one()
+            assert row.bid_ntce_ord == "000" and row.superseded_at is None
+            assert session.get(BidNotice, "MISSING-ANOMALY").match_basis == "업종"
+            assert session.get(AppConfig, 1).last_success_dt == end
+    assert sum(params["inqryDiv"] == "2" for _, params in calls) == 1
+    assert "면허 전체 조회 이상 MISSING-ANOMALY-000" in caplog.text
+
+
+@pytest.mark.parametrize("anomaly", ["unconvertible", "wrong_pair", "both"])
+def test_persistent_verify_anomalies_keep_advancing_without_reconciliation(
+    monkeypatch, db_engine, anomaly, caplog,
+):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old = _license("VERIFY-ANOMALY", lmtSno="1")
+    superseded = _license("VERIFY-ANOMALY", code="1470", lmtSno="2")
+    _seed(Local, _existing_notice("VERIFY-ANOMALY", indstryty_lmt_yn="Y"),
+          _existing_notice("OTHER-ANOMALY", indstryty_lmt_yn="Y"),
+          _stored_license(old), _stored_license(superseded, superseded_at=WIN_BGN))
+    attempt = 0
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("VERIFY-ANOMALY")], 1)
+        new = _license("VERIFY-ANOMALY", code="9999", lmtSno=str(attempt + 3))
+        if params["inqryDiv"] == "1":
+            return _ok_result([new], 1)
+        rows = [new, superseded]
+        if anomaly in {"unconvertible", "both"}:
+            rows.append({"bidNtceOrd": "000"})
+        if anomaly in {"wrong_pair", "both"}:
+            rows.append(_license("OTHER-ANOMALY"))
+        return _ok_result(rows, len(rows))
+
+    _fake_api(monkeypatch, responder)
+    for attempt in range(3):
+        end = WIN_END + timedelta(hours=attempt)
+        now[0] = end
+        with caplog.at_level(logging.WARNING, logger="app.collector"):
+            run = collector.collect_window(WIN_BGN, end)
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert run.status == "success" and run.error_msg is None
+        assert fix["verify_targets"] == fix["called"] == fix["found"] == 1
+        assert fix["superseded"] == fix["restored"] == 0
+        assert fix["anomalies"][0]["notice"] == "VERIFY-ANOMALY-000"
+        reason = fix["anomalies"][0]["reason"]
+        assert ("변환 불가" in reason) is (anomaly in {"unconvertible", "both"})
+        assert ("다른 공고·차수" in reason) is (anomaly in {"wrong_pair", "both"})
+        with Local() as session:
+            rows = session.scalars(select(BidLicenseLimit)).all()
+            state = session.get(LicenseVerification, ("VERIFY-ANOMALY", "000"))
+            assert state.pending_since == WIN_END and state.attempts == attempt + 1
+            assert state.verified_at is None and state.last_error == reason
+            assert len(rows) == attempt + 3 and {row.bid_ntce_no for row in rows} == {"VERIFY-ANOMALY"}
+            assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(old))).superseded_at is None
+            assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(superseded))).superseded_at == WIN_BGN
+            assert session.get(AppConfig, 1).last_success_dt == end
+            assert session.get(BidNotice, "VERIFY-ANOMALY").match_basis == "업종"
+    assert caplog.text.count("면허 전체 조회 이상 VERIFY-ANOMALY-000") == 3
+
+
+@pytest.mark.parametrize("kind", ["anomalies", "pk_shortfall_skipped"])
+def test_license_fix_anomaly_and_multi_page_skipped_history_capped_at_fifty(monkeypatch, db_engine, kind, caplog):
+    _, Local = db_engine
+    notices = [_notice(f"LIMIT-{i}") for i in range(51)]
+    if kind == "pk_shortfall_skipped":
+        with Local() as session:
+            session.get(AppConfig, 1).num_of_rows = 1
+            session.commit()
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result(notices, len(notices))
+        if params["inqryDiv"] == "1":
+            return _ok_result()
+        valid = _license(params["bidNtceNo"])
+        if kind == "pk_shortfall_skipped":
+            return _ok_result([valid], 2)
+        return _ok_result([valid, {"bidNtceOrd": "000"} if kind == "anomalies" else valid], 2)
+
+    _fake_api(monkeypatch, responder)
+    with caplog.at_level(logging.WARNING, logger="app.collector"):
+        run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and fix["found"] == fix["called"] == 51
+    assert len(fix[kind]) == 50 and fix["superseded"] == fix["restored"] == 0
+    if kind == "anomalies":
+        assert caplog.text.count("면허 전체 조회 이상 LIMIT-") == 51
+    with Local() as session:
+        assert len(session.scalars(select(BidLicenseLimit)).all()) == 51
+
+
+def _verification_clock(monkeypatch, now):
+    class Clock(datetime):
+        @classmethod
+        def now(cls):
+            return now[0]
+    monkeypatch.setattr(collector, "datetime", Clock)
+
+
+@pytest.mark.parametrize("code", ["00", "03"])
+def test_zero_row_verification_persists_then_retries_outside_window(monkeypatch, db_engine, code):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old, new = _license("ZERO-PENDING"), _license("ZERO-PENDING", code="9999")
+    _seed(Local, _existing_notice("ZERO-PENDING", indstryty_lmt_yn="Y"), _stored_license(old))
+    attempt = 0
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        if params["inqryDiv"] == "1":
+            return _ok_result([new], 1) if attempt == 0 else _ok_result()
+        result = _ok_result() if attempt == 0 else _ok_result([new], 1)
+        result.result_code = code if attempt == 0 else "00"
+        return result
+
+    calls = _fake_api(monkeypatch, responder)
+    for attempt in range(2):
+        now[0] = WIN_END + timedelta(hours=attempt)
+        run = collector.collect_window(now[0] - timedelta(hours=1), now[0])
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert run.status == "success" and run.error_msg is None
+        assert fix["verify_pending"] == attempt and fix["called"] == 1
+        assert fix["verify_failed"] == (["ZERO-PENDING-000"] if attempt == 0 else [])
+        assert fix["verified"] == ([] if attempt == 0 else ["ZERO-PENDING-000"])
+        with Local() as session:
+            state = session.get(LicenseVerification, ("ZERO-PENDING", "000"))
+            assert state.pending_since == (WIN_END if attempt == 0 else None)
+            assert state.attempts == (1 if attempt == 0 else 0)
+            assert state.last_attempt_at == now[0]
+            assert state.verified_at == (None if attempt == 0 else now[0])
+            assert state.last_error == ("ZERO-PENDING-000: 전체 조회 0행 응답" if attempt == 0 else None)
+            assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(new))) is not None
+            assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(old))).superseded_at == (None if attempt == 0 else now[0])
+            assert session.get(AppConfig, 1).last_success_dt == now[0]
+    assert sum(params["inqryDiv"] == "2" for _, params in calls) == 2
+
+
+@pytest.mark.parametrize("limit", ["attempts", "age"])
+@pytest.mark.parametrize("single_page", [False, True])
+def test_hash_duplicates_missing_active_advance_until_give_up_and_reregister(
+    monkeypatch, db_engine, limit, single_page, caplog,
+):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old, new = _license("GIVE-UP"), _license("GIVE-UP", code="9999")
+    newer = _license("GIVE-UP", code="8888")
+    _seed(Local, _existing_notice("GIVE-UP", indstryty_lmt_yn="Y"), _stored_license(old))
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 20 if single_page else 1
+        session.commit()
+    attempt = 0
+    final_attempt = 23 if limit == "attempts" else 1
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        if params["inqryDiv"] == "1":
+            row = new if attempt == 0 else newer if attempt == final_attempt + 2 else None
+            return _ok_result([row], 1) if row else _ok_result()
+        return _ok_result([new, new] if single_page else [new], 2)  # 기존 유효 행이 빠진 미달은 거절한다.
+
+    calls = _fake_api(monkeypatch, responder)
+    with caplog.at_level(logging.WARNING, logger="app.collector"):
+        for attempt in range(final_attempt + 3):
+            now[0] = WIN_END + (timedelta(hours=attempt) if limit == "attempts"
+                                else timedelta(days=7 if attempt > 0 else 0, hours=max(0, attempt - 1)))
+            run = collector.collect_window(now[0] - timedelta(hours=1), now[0])
+            fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+            assert run.status == "success" and run.error_msg is None
+            assert fix["superseded"] == fix["restored"] == 0
+            assert fix["verify_gave_up"] == (["GIVE-UP-000"] if attempt == final_attempt else [])
+            assert fix["called"] == int(attempt != final_attempt + 1 and not (limit == "age" and attempt == final_attempt))
+            with Local() as session:
+                state = session.get(LicenseVerification, ("GIVE-UP", "000"))
+                assert state.verified_at is None
+                if attempt <= final_attempt:
+                    assert state.attempts == (1 if limit == "age" else attempt + 1)
+                    assert state.pending_since == (None if attempt == final_attempt else WIN_END)
+                elif attempt == final_attempt + 1:
+                    assert state.pending_since is None and state.gave_up_at is not None
+                else:
+                    assert state.attempts == 1 and state.pending_since == now[0] and state.gave_up_at is None
+                assert session.get(AppConfig, 1).last_success_dt == now[0]
+                assert all(row.superseded_at is None for row in session.scalars(select(BidLicenseLimit)))
+    assert caplog.text.count("면허 확인 포기 GIVE-UP-000") == 1
+    assert sum(params["inqryDiv"] == "2" and params["pageNo"] == "1"
+               for _, params in calls) == final_attempt + 2 - int(limit == "age")
+
+
+@pytest.mark.parametrize("stage", ["servc", "license"])
+def test_pending_verification_retries_even_when_bulk_failed(monkeypatch, db_engine, stage):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old, new = _license("PENDING-FAILED"), _license("PENDING-FAILED", code="9999")
+    _seed(Local, _existing_notice("PENDING-FAILED", indstryty_lmt_yn="Y"), _stored_license(old),
+          LicenseVerification(bid_ntce_no="PENDING-FAILED", bid_ntce_ord="000", pending_since=WIN_END - timedelta(days=1)))
+    with Local() as session:
+        session.get(AppConfig, 1).max_retries = 0
+        session.commit()
+
+    def responder(op, params):
+        if params["inqryDiv"] == "2":
+            return _ok_result([new], 1)
+        current = "servc" if op == collector.OPERATION else "license"
+        return _failed_result() if current == stage else _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "partial" and len(calls) == 3
+    assert fix["verify_pending"] == 1 and fix["verified"] == ["PENDING-FAILED-000"]
+    with Local() as session:
+        state = session.get(LicenseVerification, ("PENDING-FAILED", "000"))
+        assert state.pending_since is None and state.verified_at == WIN_END
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(old))).superseded_at is not None
+
+
+@pytest.mark.parametrize("newer_delta", [timedelta(0), timedelta(seconds=1)])
+def test_older_or_equal_response_commits_after_newer_collection_are_skipped(
+    monkeypatch, db_engine, newer_delta,
+):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old = _license("REVERSE", lmtGrpNo="1", lmtSno="1")
+    common = _license("REVERSE", code="9999", lmtGrpNo="1", lmtSno="2")
+    stale_only = _license("REVERSE", code="1468", lmtGrpNo="1", lmtSno="3")
+    latest_only = _license("REVERSE", code="9999", lmtGrpNo="1", lmtSno="4")
+    _seed(Local, _existing_notice("REVERSE", indstryty_lmt_yn="Y"), _stored_license(old),
+          LicenseVerification(bid_ntce_no="REVERSE", bid_ntce_ord="000",
+                              verified_at=WIN_END - timedelta(seconds=1)))
+    nested = False
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        rows = [common, latest_only if nested else stale_only]
+        return _ok_result(rows, len(rows))
+
+    original_apply = collector._apply_license_verifications
+
+    def newer_commit_before_old_apply(session, registrations, responses, at, fix, **kwargs):
+        nonlocal nested
+        if not nested:
+            cached = session.get(LicenseVerification, ("REVERSE", "000"))
+            assert cached.verified_at == WIN_END - timedelta(seconds=1)
+            nested = True
+            now[0] += newer_delta
+            newer_run = collector.collect_window(WIN_BGN, WIN_END)
+            assert newer_run.status == "success"
+            assert json.loads(newer_run.detail_json)["by_call"]["license_fix"]["verified"] == ["REVERSE-000"]
+        return original_apply(session, registrations, responses, at, fix, **kwargs)
+
+    _fake_api(monkeypatch, responder)
+    monkeypatch.setattr(collector, "_apply_license_verifications", newer_commit_before_old_apply)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and fix["stale_skipped"] == ["REVERSE-000"]
+    assert fix["stale_bulk_skipped"] == 2
+    assert fix["verified"] == fix["verify_failed"] == []
+    assert fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        rows = {row.lmt_sno: row for row in session.scalars(select(BidLicenseLimit))}
+        assert set(rows) == {"1", "2", "4"}
+        assert rows["1"].superseded_at is not None
+        assert rows["2"].superseded_at is rows["4"].superseded_at is None
+        assert session.get(BidNotice, "REVERSE").list_visible is False
+        state = session.get(LicenseVerification, ("REVERSE", "000"))
+        assert state.verified_at == now[0] and state.pending_since is None
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "halt", "gave_up"])
+def test_verification_history_lists_always_present_and_capped(monkeypatch, db_engine, outcome):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    if outcome != "skipped":
+        _seed(Local, *[LicenseVerification(
+            bid_ntce_no=f"HISTORY-{i}", bid_ntce_ord="000", pending_since=WIN_END,
+            attempts=23,
+        ) for i in range(51)])
+
+    def responder(op, params):
+        if outcome == "halt":
+            result = _failed_result()
+            result.result_code = "22"
+            return result
+        return _ok_result()
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    for key in ("verified", "verify_failed", "verify_gave_up", "stale_skipped", "anomalies",
+                "pk_shortfall_skipped", "superseded_notices"):
+        assert isinstance(fix[key], list) and len(fix[key]) <= 50
+    if outcome == "gave_up":
+        assert fix["verify_failed_count"] == fix["verify_gave_up_count"] == 51
+        assert len(fix["verify_failed"]) == len(fix["verify_gave_up"]) == 50
+
+
+@pytest.mark.parametrize("failure", ["retry", "count_change", "pk_shortfall", "anomaly", "empty00", "empty03"])
+def test_pending_and_missing_roles_both_apply_then_complete(monkeypatch, db_engine, failure):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old = _license("OVERLAP", code="9999")
+    normal = _license("OVERLAP", lmtSno="1")
+    _seed(Local, _existing_notice("OVERLAP", indstryty_lmt_yn="Y"),
+          _stored_license(old, superseded_at=WIN_BGN),
+          LicenseVerification(bid_ntce_no="OVERLAP", bid_ntce_ord="000",
+                              pending_since=WIN_END, attempts=2))
+    with Local() as session:
+        cfg = session.get(AppConfig, 1)
+        cfg.max_retries = 0
+        cfg.num_of_rows = 1
+        cfg.last_success_dt = WIN_BGN
+        session.commit()
+    attempt = 0
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("OVERLAP", "0")], 1)
+        if params["inqryDiv"] == "1":
+            return _ok_result()
+        if attempt == 1:
+            return _ok_result([normal], 1)
+        if failure in {"empty00", "empty03"}:
+            result = _ok_result()
+            result.result_code = "00" if failure == "empty00" else "03"
+            return result
+        if failure == "retry":
+            return _failed_result()
+        if failure == "anomaly":
+            return _ok_result([normal, {"bidNtceOrd": "000"}], 2)
+        total = 3 if failure == "count_change" and params["pageNo"] == "2" else 2
+        return _ok_result([old], total)
+
+    calls = _fake_api(monkeypatch, responder)
+    for attempt in range(2):
+        now[0] = WIN_END + timedelta(hours=attempt)
+        run = collector.collect_window(WIN_BGN, now[0])
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert fix["called"] == fix["verify_targets"] == fix["targets"] == 1
+        transient_failure = attempt == 0 and failure not in {"anomaly", "empty00", "empty03"}
+        assert run.status == ("partial" if transient_failure else "success")
+        assert fix["failed"] == (["OVERLAP"] if transient_failure else [])
+        assert fix["verify_failed"] == (["OVERLAP-000"] if attempt == 0 else [])
+        assert fix["verified"] == (["OVERLAP-000"] if attempt == 1 else [])
+        assert bool(fix["anomalies"]) == (attempt == 0 and failure == "anomaly")
+        with Local() as session:
+            state = session.get(LicenseVerification, ("OVERLAP", "000"))
+            assert state.attempts == (3 if attempt == 0 else 0)
+            assert state.pending_since == (WIN_END if attempt == 0 else None)
+            assert state.last_attempt_at == now[0]
+            row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(normal)))
+            assert (row is not None) == (attempt == 1 or failure == "anomaly")
+            assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(old))).superseded_at == WIN_BGN
+            assert session.get(AppConfig, 1).last_success_dt == (WIN_BGN if transient_failure else now[0])
+    assert sum(params["inqryDiv"] == "2" and params["pageNo"] == "1" for _, params in calls) == 2
+
+
+@pytest.mark.parametrize("existing", ["none", "active", "superseded"])
+@pytest.mark.parametrize("include_active", [False, True])
+def test_single_page_hash_shortfall_only_completes_without_missing_active_rows(
+    monkeypatch, db_engine, existing, include_active,
+):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    old = _license("ONE-PAGE", lmtGrpNo="1", lmtSno="1")
+    hashed = _license("ONE-PAGE", code="8888")
+    new = _license("ONE-PAGE", code="9999", lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice("ONE-PAGE", indstryty_lmt_yn="Y"))
+    if existing != "none":
+        _seed(Local, _stored_license(old), _stored_license(hashed),
+              LicenseVerification(bid_ntce_no="ONE-PAGE", bid_ntce_ord="000",
+                                  pending_since=WIN_END, attempts=2))
+    if existing == "superseded":
+        _seed(Local, _stored_license(new, superseded_at=WIN_BGN))
+    rows = ([old] if include_active else []) + [hashed, hashed, new]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice("ONE-PAGE")], 1)
+        return _ok_result() if params["inqryDiv"] == "1" else _ok_result(rows, len(rows))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    accepted = existing == "none" or include_active
+    assert run.status == "success" and len(calls) == 3
+    assert fix["verified"] == (["ONE-PAGE-000"] if accepted else [])
+    assert fix["superseded"] == 0
+    assert fix["restored"] == int(existing == "superseded" and accepted)
+    assert fix["verify_failed"] == ([] if accepted else ["ONE-PAGE-000"])
+    assert fix["verify_gave_up"] == fix["pk_shortfall_skipped"] == []
+    with Local() as session:
+        state = session.get(LicenseVerification, ("ONE-PAGE", "000"))
+        assert state.pending_since == (None if accepted else WIN_END)
+        assert state.attempts == (0 if accepted else 3)
+        assert state.verified_at == (WIN_END if accepted else None)
+        old_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(old)))
+        if old_row:
+            assert old_row.superseded_at is None
+        new_row = session.get(BidLicenseLimit, collector._license_key(collector.license_values(new)))
+        if existing == "superseded":
+            assert new_row.superseded_at == (None if accepted else WIN_BGN)
+        else:
+            assert (new_row is not None) == accepted
+        assert session.get(BidNotice, "ONE-PAGE").list_visible == (existing != "none" or include_active)
+
+
+@pytest.mark.parametrize("bulk_failed", [False, True])
+def test_verification_budget_oldest_pending_first_despite_attempt_times(
+    monkeypatch, db_engine, bulk_failed,
+):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    monkeypatch.setattr(collector, "_VERIFY_QUERY_LIMIT", 2)
+    ages = {"A-RECENT": WIN_END - timedelta(minutes=1),
+            "B-OLD": WIN_END - timedelta(hours=1), "Z-NEVER": None}
+    _seed(Local, *[LicenseVerification(
+        bid_ntce_no=no, bid_ntce_ord="000",
+        pending_since=WIN_END - timedelta(days=1 if no == "Z-NEVER" else 2),
+        last_attempt_at=last_attempt, attempts=2,
+    ) for no, last_attempt in ages.items()])
+    with Local() as session:
+        session.get(AppConfig, 1).max_retries = 0
+        session.commit()
+
+    def responder(op, params):
+        if params["inqryDiv"] == "2":
+            return _ok_result()  # 시도 시각이 바뀌어도 오래된 대기가 먼저 조회된다.
+        return _failed_result() if bulk_failed and op == collector.OPERATION else _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
+    for attempt, expected in enumerate([["A-RECENT", "B-OLD"], ["A-RECENT", "B-OLD"]]):
+        calls.clear()
+        now[0] = WIN_END + timedelta(hours=attempt)
+        run = collector.collect_window(WIN_BGN, now[0])
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert run.status == ("partial" if bulk_failed else "success")
+        assert fix["verify_pending"] == 3 and fix["verify_deferred"] == 1
+        assert fix["verify_targets"] == fix["called"] == 2
+        assert [params["bidNtceNo"] for _, params in calls if params["inqryDiv"] == "2"] == expected
+        with Local() as session:
+            assert session.scalar(select(func.count()).select_from(LicenseVerification).where(
+                LicenseVerification.pending_since.is_not(None))) == 3
+            assert session.get(LicenseVerification, ("Z-NEVER", "000")).attempts == 2
+
+
+def test_missing_role_has_no_cap_even_with_pending_verification(monkeypatch, db_engine):
+    _, Local = db_engine
+    count = collector._VERIFY_QUERY_LIMIT + 5
+    _seed(Local, *[LicenseVerification(
+        bid_ntce_no=f"MISSING-PENDING-{i}", bid_ntce_ord="000", pending_since=datetime.now(),
+    ) for i in range(count)])
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice(f"MISSING-PENDING-{i}") for i in range(count)], count)
+        return (_ok_result() if params["inqryDiv"] == "1"
+                else _ok_result([_license(params["bidNtceNo"])], 1))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and len(calls) == count + 2
+    assert fix["called"] == fix["verify_targets"] == fix["verified_count"] == count
+    assert fix["verify_deferred"] == 0
+    with Local() as session:
+        assert session.scalar(select(func.count()).select_from(LicenseVerification).where(
+            LicenseVerification.pending_since.is_not(None))) == 0
+
+
+def test_stale_bulk_exclusion_is_not_limited_by_history_cap(monkeypatch, db_engine):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    count = 51
+    nos = [f"STALE-CAP-{i}" for i in range(count)]
+    _seed(Local, *[_existing_notice(no, indstryty_lmt_yn="Y") for no in nos],
+          *[_stored_license(_license(no, lmtSno="1")) for no in nos])
+    nested = False
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        code, sequence = ("9999", "3") if nested else ("1468", "2")
+        if params["inqryDiv"] == "1":
+            return _ok_result([_license(no, code=code, lmtSno=sequence) for no in nos], count)
+        return _ok_result([_license(params["bidNtceNo"], code=code, lmtSno=sequence)], 1)
+
+    original_apply = collector._apply_license_verifications
+
+    def newer_commit_before_old_apply(session, registrations, responses, at, fix, **kwargs):
+        nonlocal nested
+        if not nested:
+            nested = True
+            now[0] += timedelta(seconds=1)
+            assert collector.collect_window(WIN_BGN, WIN_END).status == "success"
+        return original_apply(session, registrations, responses, at, fix, **kwargs)
+
+    _fake_api(monkeypatch, responder)
+    monkeypatch.setattr(collector, "_apply_license_verifications", newer_commit_before_old_apply)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and len(fix["stale_skipped"]) == 50
+    assert fix["stale_bulk_skipped"] == count
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == count * 2 and all(row.lmt_sno != "2" for row in rows)
+        assert all(row.superseded_at is None for row in rows if row.lmt_sno == "3")
+        assert all(row.superseded_at is not None for row in rows if row.lmt_sno == "1")
+        assert all(not row.list_visible for row in session.scalars(select(BidNotice)))
+
+
+# --- Phase 13.7 R6 안전 우선·대기 공정성·일괄 수신 시각 -----------------
+def test_new_250_registrations_each_run_do_not_displace_existing_failed_pending(monkeypatch, db_engine):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    count = 250
+    _seed(Local, _existing_notice("ZZ-EXISTING"), _stored_license(_license("ZZ-EXISTING")),
+          LicenseVerification(bid_ntce_no="ZZ-EXISTING", bid_ntce_ord="000",
+                              pending_since=WIN_END - timedelta(days=1), attempts=1,
+                              last_attempt_at=WIN_END - timedelta(minutes=1)),
+          *[_existing_notice(f"NEW-{round_}-{i}") for round_ in range(2) for i in range(count)],
+          *[_stored_license(_license(f"NEW-{round_}-{i}"))
+            for round_ in range(2) for i in range(count)])
+    round_ = 0
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result()
+        if params["inqryDiv"] == "1":
+            return _ok_result([_license(f"NEW-{round_}-{i}", code="9999") for i in range(count)], count)
+        return _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
+    for round_ in range(2):
+        calls.clear()
+        now[0] = WIN_END + timedelta(hours=round_)
+        run = collector.collect_window(WIN_BGN, now[0])
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        queried = [params["bidNtceNo"] for _, params in calls if params["inqryDiv"] == "2"]
+        assert run.status == "success" and len(queried) == collector._VERIFY_QUERY_LIMIT
+        assert queried[0] == "ZZ-EXISTING"
+        assert fix["verify_deferred"] == 1 + count * (round_ + 1) - collector._VERIFY_QUERY_LIMIT
+        with Local() as session:
+            state = session.get(LicenseVerification, ("ZZ-EXISTING", "000"))
+            assert state.attempts == 2 + round_ and state.pending_since == WIN_END - timedelta(days=1)
+
+
+@pytest.mark.parametrize("limit", ["age", "attempts"])
+@pytest.mark.parametrize("halt", [False, True])
+def test_all_pending_expire_before_selection_even_without_queries(monkeypatch, db_engine, limit, halt, caplog):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    monkeypatch.setattr(collector, "_VERIFY_QUERY_LIMIT", 0)
+    pending = WIN_END - timedelta(days=7) if limit == "age" else WIN_END
+    attempts = 0 if limit == "age" else 24
+    _seed(Local, *[LicenseVerification(bid_ntce_no=f"UNQUERIED-{i}", bid_ntce_ord="000",
+                                      pending_since=pending, attempts=attempts) for i in range(51)])
+
+    def responder(op, params):
+        if halt:
+            result = _failed_result()
+            result.result_code = "22"
+            return result
+        return _ok_result()
+
+    calls = _fake_api(monkeypatch, responder)
+    with caplog.at_level(logging.WARNING, logger="app.collector"):
+        run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("failed" if halt else "success")
+    assert all(params["inqryDiv"] != "2" for _, params in calls)
+    assert fix["verify_pending"] == fix["verify_gave_up_count"] == 51
+    assert len(fix["verify_gave_up"]) == 50
+    assert fix["verify_failed_count"] == fix["verify_deferred"] == 0
+    assert caplog.text.count("면허 확인 포기 UNQUERIED-") == 51
+    with Local() as session:
+        for state in session.scalars(select(LicenseVerification)):
+            assert state.pending_since is None and state.gave_up_at == WIN_END
+            assert state.attempts == attempts and state.last_attempt_at is None
+
+
+def test_deferred_unattempted_pending_gives_up_at_seven_days(monkeypatch, db_engine, caplog):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    monkeypatch.setattr(collector, "_VERIFY_QUERY_LIMIT", 0)
+    _seed(Local, LicenseVerification(bid_ntce_no="DEFERRED-AGE", bid_ntce_ord="000",
+                                    pending_since=WIN_END, attempts=0))
+    _fake_api(monkeypatch, lambda op, params: _ok_result())
+    with caplog.at_level(logging.WARNING, logger="app.collector"):
+        for days in (0, 6, 7):
+            now[0] = WIN_END + timedelta(days=days)
+            run = collector.collect_window(WIN_BGN, now[0])
+            fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+            assert run.status == "success" and fix["called"] == 0
+            assert fix["verify_deferred"] == int(days < 7)
+            assert fix["verify_gave_up"] == (["DEFERRED-AGE-000"] if days == 7 else [])
+            with Local() as session:
+                state = session.get(LicenseVerification, ("DEFERRED-AGE", "000"))
+                assert state.attempts == 0 and state.last_attempt_at is None
+                assert state.pending_since == (WIN_END if days < 7 else None)
+    assert caplog.text.count("면허 확인 포기 DEFERRED-AGE-000") == 1
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("delta", [timedelta(0), timedelta(seconds=1)])
+def test_bulk_rows_checked_against_newer_verification_without_full_query(
+    monkeypatch, db_engine, deferred, delta,
+):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    monkeypatch.setattr(collector, "_VERIFY_QUERY_LIMIT", 0)
+    no = "BULK-ONLY-STALE"
+    old = _license(no, code="9999", lmtGrpNo="1", lmtSno="1")
+    payload = _license(no, code="1468", lmtGrpNo="1", lmtSno="1")
+    fresh_pk = _license(no, code="1468", lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice(no, indstryty_lmt_yn="Y", list_visible=False), _stored_license(old),
+          LicenseVerification(bid_ntce_no=no, bid_ntce_ord="000",
+                              pending_since=WIN_END if deferred else None,
+                              verified_at=WIN_BGN))
+    calls = _fake_api(monkeypatch, lambda op, params: (
+        _ok_result() if op == collector.OPERATION else _ok_result([payload, fresh_pk], 2)))
+    original_apply = collector._apply_license_verifications
+
+    def newer_commit_before_apply(session, registrations, responses, at, fix, **kwargs):
+        assert not registrations and not responses
+        # 모의 API 응답 뒤, 저장 잠금 안 재조회 직전에 다른 수집의 커밋을 재현한다.
+        cached = session.get(LicenseVerification, (no, "000"))
+        assert cached.verified_at == WIN_BGN
+        with Local() as newer:
+            state = newer.get(LicenseVerification, (no, "000"))
+            state.verified_at = WIN_END + delta
+            state.pending_since = None
+            newer.commit()
+        return original_apply(session, registrations, responses, at, fix, **kwargs)
+
+    monkeypatch.setattr(collector, "_apply_license_verifications", newer_commit_before_apply)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    skipped = delta > timedelta(0)
+    assert run.status == "success" and len(calls) == 2
+    assert fix["stale_bulk_skipped"] == (2 if skipped else 0)
+    assert fix["stale_skipped"] == [] and fix["verify_deferred"] == int(deferred)
+    with Local() as session:
+        rows = session.scalars(select(BidLicenseLimit)).all()
+        assert len(rows) == (1 if skipped else 2)
+        assert rows[0].lcns_cd == ("9999" if skipped else "1468")
+        assert session.get(BidNotice, no).list_visible == (not skipped)
+
+
+@pytest.mark.parametrize("missing_role", [False, True])
+def test_single_page_shortfall_rechecks_active_rows_under_save_lock(monkeypatch, db_engine, missing_role):
+    _, Local = db_engine
+    now = [WIN_END]
+    _verification_clock(monkeypatch, now)
+    no = "SHORTFALL-LOCK"
+    hashed = _license(no, code="8888")
+    new = _license(no, code="9999", lmtGrpNo="1", lmtSno="1")
+    late = _license(no, lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice(no, indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(new, superseded_at=WIN_BGN),
+          LicenseVerification(bid_ntce_no=no, bid_ntce_ord="000", pending_since=WIN_END, attempts=1))
+    if not missing_role:
+        _seed(Local, _stored_license(hashed))
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice(no)], 1)
+        return _ok_result() if params["inqryDiv"] == "1" else _ok_result([hashed, hashed, new], 3)
+
+    original_apply = collector._apply_license_verifications
+
+    def active_row_arrives_before_apply(session, registrations, responses, at, fix, **kwargs):
+        _seed(Local, _stored_license(late))
+        return original_apply(session, registrations, responses, at, fix, **kwargs)
+
+    _fake_api(monkeypatch, responder)
+    monkeypatch.setattr(collector, "_apply_license_verifications", active_row_arrives_before_apply)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("partial" if missing_role else "success")
+    assert fix["verified"] == [] and fix["verify_failed"] == [f"{no}-000"]
+    assert fix["superseded"] == fix["restored"] == 0
+    with Local() as session:
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(new))).superseded_at == WIN_BGN
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(late))).superseded_at is None
+        state = session.get(LicenseVerification, (no, "000"))
+        assert state.pending_since == WIN_END and state.attempts == 2 and state.verified_at is None
+        assert "고유 PK 미달" in state.last_error
+
+
+@pytest.mark.parametrize("include_bulk", [False, True])
+def test_single_page_shortfall_preserves_this_run_bulk_rows(monkeypatch, db_engine, include_bulk):
+    _, Local = db_engine
+    _verification_clock(monkeypatch, [WIN_END])
+    no = "SHORTFALL-BULK"
+    old = _license(no, code="9999", lmtGrpNo="1", lmtSno="1")
+    hashed = _license(no, code="8888")
+    new = _license(no, code="1468", lmtGrpNo="1", lmtSno="2")
+    _seed(Local, _existing_notice(no, indstryty_lmt_yn="Y", list_visible=False),
+          _stored_license(old), _stored_license(hashed))
+    rows = [old, hashed, hashed] + ([new] if include_bulk else [])
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result([_notice(no)], 1)
+        return (_ok_result([new], 1) if params["inqryDiv"] == "1"
+                else _ok_result(rows, len(rows)))
+
+    calls = _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == "success" and len(calls) == 3
+    assert fix["superseded"] == fix["restored"] == 0
+    assert fix["verified"] == ([f"{no}-000"] if include_bulk else [])
+    assert fix["verify_failed"] == ([] if include_bulk else [f"{no}-000"])
+    with Local() as session:
+        assert all(row.superseded_at is None for row in session.scalars(select(BidLicenseLimit)))
+        assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(new))) is not None
+        notice = session.get(BidNotice, no)
+        assert notice.list_visible is True and notice.matched_indstryty_cds == "1468"
+        state = session.get(LicenseVerification, (no, "000"))
+        assert state.pending_since == (None if include_bulk else WIN_END)
+        assert state.attempts == (0 if include_bulk else 1)
+        assert state.verified_at == (WIN_END if include_bulk else None)
+
+
+def test_shortfall_save_lock_also_requires_bulk_pks(db_engine):
+    _, Local = db_engine
+    no = "SHORTFALL-BULK-LOCK"
+    old = _license(no, code="9999", lmtGrpNo="1", lmtSno="1")
+    new = _license(no, lmtGrpNo="1", lmtSno="2")
+    old_pk = collector._license_key(collector.license_values(old))
+    new_pk = collector._license_key(collector.license_values(new))
+    _seed(Local, _stored_license(old), LicenseVerification(
+        bid_ntce_no=no, bid_ntce_ord="000", pending_since=WIN_END, attempts=1))
+    fix = {"verified_count": 0, "verified": [], "verify_failed_count": 0, "verify_failed": []}
+    rejected = {}
+    with Local() as session, classifier.CLASSIFY_WRITE_LOCK:
+        applicable, stale = collector._apply_license_verifications(
+            session, [], [(no, "0", WIN_END, {old_pk}, None)], WIN_END, fix,
+            bulk_received_at=WIN_END, bulk_pairs={(no, "000")}, bulk_keys={new_pk},
+            shortfall_pairs={(no, "000")}, rejected_shortfalls=rejected,
+        )
+        assert applicable == [] and stale == set()
+        assert (no, "000") in rejected and "일괄 행 누락" in rejected[(no, "000")]
+        state = session.get(LicenseVerification, (no, "000"))
+        assert state.pending_since == WIN_END and state.attempts == 2 and state.verified_at is None
+        assert fix["verified_count"] == 0 and fix["verify_failed_count"] == 1
+
+
+@pytest.mark.parametrize("limit", ["age", "attempts"])
+@pytest.mark.parametrize("outcome", ["success", "servc_halt", "license_halt", "license_fix_halt"])
+def test_expired_pending_does_not_hold_write_lock_during_api(
+    monkeypatch, tmp_path, limit, outcome,
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'verification-test.db'}",
+                          connect_args={"timeout": 0.1}, future=True)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+    Base.metadata.create_all(engine)
+    Local = sessionmaker(bind=engine, autoflush=False, future=True)
+    monkeypatch.setattr(collector, "SessionLocal", Local)
+    _verification_clock(monkeypatch, [WIN_END])
+    pending = WIN_END - timedelta(days=7) if limit == "age" else WIN_END
+    attempts = 0 if limit == "age" else 24
+    _seed(Local, AppConfig(id=1, auto_halted=False, indstryty_cds="1468", num_of_rows=20,
+                          max_retries=0, interval_minutes=60),
+          LicenseVerification(bid_ntce_no="EXPIRED", bid_ntce_ord="000",
+                              pending_since=pending, attempts=attempts),
+          LicenseVerification(bid_ntce_no="RETRY", bid_ntce_ord="000",
+                              pending_since=WIN_END, attempts=1))
+
+    def responder(op, params):
+        # 별도 연결이 조회마다 설정을 쓰고 커밋할 수 있어야 한다.
+        with Local() as other:
+            state = other.get(LicenseVerification, ("EXPIRED", "000"))
+            assert state.pending_since == pending and state.gave_up_at is None
+            cfg = other.get(AppConfig, 1)
+            cfg.interval_minutes += 1
+            other.commit()
+        stage = ("servc" if op == collector.OPERATION else
+                 "license" if params["inqryDiv"] == "1" else "license_fix")
+        if outcome == f"{stage}_halt":
+            result = _failed_result()
+            result.result_code = "22"
+            return result
+        return _ok_result()
+
+    original_finish = repository.finish_run
+
+    def check_expiration_in_finish_commit(session, run, **kwargs):
+        assert classifier.CLASSIFY_WRITE_LOCK._is_owned()
+        state = session.get(LicenseVerification, ("EXPIRED", "000"))
+        assert state.pending_since is None and state.gave_up_at == WIN_END
+        original_finish(session, run, **kwargs)
+
+    calls = _fake_api(monkeypatch, responder)
+    monkeypatch.setattr(repository, "finish_run", check_expiration_in_finish_commit)
+    try:
+        run = collector.collect_window(WIN_BGN, WIN_END)
+        assert run.status == ("success" if outcome == "success" else "failed")
+        fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+        assert fix["verify_pending"] == 2 and fix["verify_gave_up"] == ["EXPIRED-000"]
+        assert fix["verify_gave_up_count"] == 1
+        assert all(params.get("bidNtceNo") != "EXPIRED" for _, params in calls)
+        with Local() as session:
+            state = session.get(LicenseVerification, ("EXPIRED", "000"))
+            assert state.pending_since is None and state.gave_up_at == WIN_END
+            assert state.attempts == attempts and state.last_attempt_at is None
+            assert session.get(AppConfig, 1).interval_minutes == 60 + len(calls)
+    finally:
+        engine.dispose()
+
+
+def test_expired_pending_rolls_back_with_failed_finish_commit(monkeypatch, db_engine):
+    _, Local = db_engine
+    _verification_clock(monkeypatch, [WIN_END])
+    pending = WIN_END - timedelta(days=7)
+    _seed(Local, LicenseVerification(bid_ntce_no="EXPIRED-ATOMIC", bid_ntce_ord="000",
+                                    pending_since=pending, attempts=2))
+    _fake_api(monkeypatch, lambda op, params: _ok_result())
+    original_finish = repository.finish_run
+
+    def fail_finish(session, run, **kwargs):
+        def before_commit(session):
+            state = session.get(LicenseVerification, ("EXPIRED-ATOMIC", "000"))
+            assert state.pending_since is None and state.gave_up_at == WIN_END
+            fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+            assert fix["verify_gave_up"] == ["EXPIRED-ATOMIC-000"]
+            raise RuntimeError("가짜 포기 기록 커밋 실패")
+
+        event.listen(session, "before_commit", before_commit, once=True)
+        original_finish(session, run, **kwargs)
+
+    monkeypatch.setattr(repository, "finish_run", fail_finish)
+    with pytest.raises(RuntimeError, match="가짜 포기 기록 커밋 실패"):
+        collector.collect_window(WIN_BGN, WIN_END)
+    with Local() as session:
+        state = session.get(LicenseVerification, ("EXPIRED-ATOMIC", "000"))
+        assert state.pending_since == pending and state.gave_up_at is None and state.attempts == 2
+        run = session.scalar(select(CollectionRun))
+        assert run.status == "running" and run.detail_json is None
+
+
+@pytest.mark.parametrize("halt", [False, True])
+def test_expiration_rechecks_concurrent_completion_after_api(monkeypatch, db_engine, halt):
+    _, Local = db_engine
+    _verification_clock(monkeypatch, [WIN_END])
+    _seed(Local, LicenseVerification(bid_ntce_no="EXPIRED-NEWER", bid_ntce_ord="000",
+                                    pending_since=WIN_END - timedelta(days=7), attempts=2))
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            with Local() as newer:
+                state = newer.get(LicenseVerification, ("EXPIRED-NEWER", "000"))
+                state.pending_since = None
+                state.attempts = 0
+                state.verified_at = WIN_END
+                newer.commit()
+            if halt:
+                result = _failed_result()
+                result.result_code = "22"
+                return result
+        return _ok_result()
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("failed" if halt else "success")
+    assert fix["verify_pending"] == 1 and fix["verify_gave_up_count"] == 0
+    assert fix["verify_gave_up"] == []
+    with Local() as session:
+        state = session.get(LicenseVerification, ("EXPIRED-NEWER", "000"))
+        assert state.pending_since is None and state.gave_up_at is None
+        assert state.verified_at == WIN_END and state.attempts == 0

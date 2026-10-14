@@ -207,6 +207,10 @@ def _migrate_add_columns() -> None:
         stmts.append(("collection_run", "source",
             "ALTER TABLE collection_run ADD COLUMN source VARCHAR(10) DEFAULT 'bid'"
         ))
+    if "bid_license_limit" in tables and "superseded_at" not in colset("bid_license_limit"):
+        stmts.append(("bid_license_limit", "superseded_at",
+            "ALTER TABLE bid_license_limit ADD COLUMN superseded_at TIMESTAMP"
+        ))
     if "app_config" in tables:
         ac = colset("app_config")
         if "pre_spec_enabled" not in ac:
