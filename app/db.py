@@ -98,6 +98,11 @@ _register_sqlite_pragmas(engine)
 class IndexDefinitionMismatchError(RuntimeError):
     """동명 인덱스의 정의가 모델과 달라 초기화를 중단해야 하는 스키마 오류."""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            f"{message}. 해당 인덱스를 DROP 한 뒤 재기동하면 모델 정의로 다시 생성됩니다"
+        )
+
 
 def init_db() -> None:
     """모델 테이블 생성 + 자동 마이그레이션 + 설정·표시 규칙 기본값 시드.
@@ -268,7 +273,11 @@ def _migrate_match_basis_backfill() -> None:
 
 
 def _migrate_bid_notice_indexes() -> None:
-    """모든 모델 테이블의 누락 인덱스를 복구한다(이름 고정 3종 포함)."""
+    """모든 모델 테이블의 누락 인덱스를 복구한다(이름 고정 3종 포함).
+
+    정의 불일치 시 IndexDefinitionMismatchError 로 중단한다.
+    테이블별 inspector 조회 1회를 재사용하며 DDL 실패 뒤에만 재조회한다.
+    """
     for table in Base.metadata.sorted_tables:
         if not table.indexes:
             continue
@@ -281,16 +290,25 @@ def _migrate_bid_notice_indexes() -> None:
 
 
 def _index_definitions(table) -> dict[str, dict]:  # noqa: ANN001
-    return {
-        idx["name"]: {
+    definitions = {}
+    for idx in inspect(engine).get_indexes(table.name, schema=table.schema):
+        actual = {
             "column_names": list(idx["column_names"]), "unique": bool(idx["unique"]),
         }
-        for idx in inspect(engine).get_indexes(table.name, schema=table.schema)
-    }
+        conditions = {
+            key: value for key, value in idx.get("dialect_options", {}).items()
+            if key.endswith("_where") and value is not None
+        }
+        if conditions:
+            actual["dialect_options"] = conditions
+        if idx.get("expressions"):
+            actual["expressions"] = idx["expressions"]
+        definitions[idx["name"].lower()] = actual
+    return definitions
 
 
 def _model_index_exists(index, indexes: dict[str, dict]) -> bool:  # noqa: ANN001
-    actual = indexes.get(index.name)
+    actual = indexes.get(index.name.lower())
     if actual is None:
         return False
     expected = {"column_names": [c.name for c in index.columns], "unique": bool(index.unique)}
@@ -305,10 +323,18 @@ def _model_index_exists(index, indexes: dict[str, dict]) -> bool:  # noqa: ANN00
 def _create_model_index(index, indexes: dict[str, dict]) -> None:  # noqa: ANN001
     try:
         index.create(bind=engine)
-    except (OperationalError, IntegrityError, ProgrammingError):
+    except (OperationalError, IntegrityError, ProgrammingError) as exc:
         # DDL 실패 뒤에만 새 조회로 경쟁자가 만든 인덱스의 정의를 재확인한다.
         indexes.clear()
         indexes.update(_index_definitions(index.table))
+        # SQLite inspector 는 표현식 인덱스를 생략할 수 있어 중복 오류도 확인한다.
+        sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        duplicate = sqlstate in {"42P07", "42710"} or "already exists" in str(exc.orig).lower()
+        if duplicate and index.name.lower() not in indexes:
+            raise IndexDefinitionMismatchError(
+                f"모델 인덱스 정의 불일치: {index.table.fullname}: {index.name}: "
+                "같은 이름의 인덱스가 있으나 정의를 확인할 수 없음"
+            ) from exc
         raise
 
 

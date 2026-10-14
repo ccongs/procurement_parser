@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import Column, Index, MetaData, Table, create_engine, event, inspect, select
-from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, SAWarning
 from sqlalchemy.orm import sessionmaker
 
 from app import db
@@ -68,11 +68,11 @@ def _assert_initialized(engine, *, legacy=False):
     inspector = inspect(engine)
     assert set(db.Base.metadata.tables) <= set(inspector.get_table_names())
     assert NEW_COLUMNS <= {c["name"] for c in inspector.get_columns("bid_notice")}
-    indexes = {i["name"]: i["column_names"] for i in inspector.get_indexes("bid_notice")}
+    indexes = {i["name"].lower(): i["column_names"] for i in inspector.get_indexes("bid_notice")}
     for name, columns in INDEXES.items():
         assert indexes[name] == columns
     for table in db.Base.metadata.sorted_tables:
-        actual = {i["name"]: i for i in inspector.get_indexes(table.name)}
+        actual = {i["name"].lower(): i for i in inspector.get_indexes(table.name)}
         for index in table.indexes:
             assert actual[index.name]["column_names"] == [c.name for c in index.columns]
             assert bool(actual[index.name]["unique"]) == bool(index.unique)
@@ -286,10 +286,11 @@ def test_init_retries_when_final_index_validation_finds_missing_index(
     _assert_initialized(database)
 
 
-@pytest.mark.parametrize("mismatch", ["columns", "column-order", "unique"])
+@pytest.mark.parametrize("uppercase", [False, True], ids=["lowercase", "uppercase"])
+@pytest.mark.parametrize("mismatch", ["columns", "column-order", "unique", "partial"])
 @pytest.mark.parametrize("phase", ["existing", "race", "final-validation"])
 def test_index_definition_mismatch_stops_init_without_retry(
-    database, monkeypatch, caplog, mismatch, phase,
+    database, monkeypatch, caplog, mismatch, phase, uppercase,
 ):
     db.init_db()
     index = next(i for i in BidNotice.__table__.indexes
@@ -305,8 +306,9 @@ def test_index_definition_mismatch_stops_init_without_retry(
         table = Table("bid_notice", metadata, *[
             Column(c.name, c.type) for c in index.columns
         ], Column("bid_ntce_no", BidNotice.__table__.c.bid_ntce_no.type))
-        Index(index.name, *(table.c[c] for c in columns),
-              unique=mismatch == "unique").create(bind=database)
+        options = {"sqlite_where": table.c.list_visible.is_(True)} if mismatch == "partial" else {}
+        Index(index.name.upper() if uppercase else index.name, *(table.c[c] for c in columns),
+              unique=mismatch == "unique", **options).create(bind=database)
 
     attempts, sleeps, competed = [], [], []
     create_tables = db._create_model_tables
@@ -350,10 +352,131 @@ def test_index_definition_mismatch_stops_init_without_retry(
     actual = {"column_names": columns, "unique": mismatch == "unique"}
     message = str(raised.value)
     assert "bid_notice" in message and index.name in message
-    assert f"기대 정의={expected!r}" in message and f"실제 정의={actual!r}" in message
+    assert f"기대 정의={expected!r}" in message
+    if mismatch == "partial":
+        assert "실제 정의=" in message and "sqlite_where" in message
+    else:
+        assert f"실제 정의={actual!r}" in message
+    assert message.endswith("해당 인덱스를 DROP 한 뒤 재기동하면 모델 정의로 다시 생성됩니다")
     assert attempts == [True] and sleeps == []
     assert competed == ([True] if phase == "race" else [])
     assert not [r for r in caplog.records if r.name == "app.db" and r.levelno >= logging.WARNING]
+
+
+def test_uppercase_index_name_with_same_definition_is_accepted(database, monkeypatch):
+    db.init_db()
+    index = next(i for i in BidNotice.__table__.indexes
+                 if i.name == "ix_bid_notice_visible_ntce_dt")
+    index.drop(bind=database)
+    table = Table("bid_notice", MetaData(), *[
+        Column(c.name, c.type) for c in index.columns
+    ])
+    Index(index.name.upper(), *table.c).create(bind=database)
+    sleeps, creates = [], []
+
+    def record_create(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("CREATE INDEX"):
+            creates.append(statement)
+
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
+    event.listen(database, "before_cursor_execute", record_create)
+    try:
+        db.init_db()
+    finally:
+        event.remove(database, "before_cursor_execute", record_create)
+    assert sleeps == [] and creates == []
+    _assert_initialized(database)
+
+
+@pytest.mark.parametrize("uppercase", [False, True], ids=["lowercase", "uppercase"])
+@pytest.mark.parametrize("phase", ["existing", "race"])
+def test_unreflectable_expression_index_stops_init_without_retry(
+    database, monkeypatch, caplog, phase, uppercase,
+):
+    db.init_db()
+    index = next(i for i in BidNotice.__table__.indexes
+                 if i.name == "ix_bid_notice_visible_ntce_dt")
+    index.drop(bind=database)
+    attempts, sleeps, creates = [], [], []
+    create_tables = db._create_model_tables
+
+    def count_attempt():
+        attempts.append(True)
+        create_tables()
+
+    def create_expression_index():
+        with database.begin() as conn:
+            name = index.name.upper() if uppercase else index.name
+            conn.exec_driver_sql(f"CREATE INDEX {name} ON bid_notice (lower(bid_ntce_no))")
+
+    def compete(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith(f"CREATE INDEX {index.name} ") and (
+            "lower(bid_ntce_no)" not in statement
+        ):
+            creates.append(True)
+            if phase == "race" and len(creates) == 1:
+                create_expression_index()
+
+    if phase == "existing":
+        create_expression_index()
+    monkeypatch.setattr(db, "_create_model_tables", count_attempt)
+    monkeypatch.setattr(db, "time", SimpleNamespace(sleep=sleeps.append))
+    event.listen(database, "before_cursor_execute", compete)
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.db"):
+            with pytest.warns(SAWarning, match="Skipped unsupported reflection of expression-based index"):
+                with pytest.raises(db.IndexDefinitionMismatchError) as raised:
+                    db.init_db()
+    finally:
+        event.remove(database, "before_cursor_execute", compete)
+    message = str(raised.value)
+    assert index.name in message and "bid_notice" in message
+    assert "같은 이름의 인덱스가 있으나 정의를 확인할 수 없음" in message
+    assert "DROP 한 뒤 재기동" in message
+    assert attempts == [True] and sleeps == [] and creates == [True]
+    assert not [r for r in caplog.records if r.name == "app.db" and r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("extra", [
+    {"dialect_options": {"sqlite_where": "list_visible = 1"}},
+    {"dialect_options": {"postgresql_where": "list_visible = true"}},
+    {"expressions": ["lower(bid_ntce_no)"]},
+    {"column_names": [None, "bid_ntce_dt"]},
+])
+def test_reflected_condition_or_expression_is_definition_mismatch(monkeypatch, extra):
+    index = next(i for i in BidNotice.__table__.indexes
+                 if i.name == "ix_bid_notice_visible_ntce_dt")
+    reflected = {
+        "name": index.name.upper(), "column_names": [c.name for c in index.columns],
+        "unique": False, **extra,
+    }
+    monkeypatch.setattr(db, "inspect", lambda engine: SimpleNamespace(
+        get_indexes=lambda *args, **kwargs: [reflected],
+    ))
+    definitions = db._index_definitions(index.table)
+    with pytest.raises(db.IndexDefinitionMismatchError, match="모델 인덱스 정의 불일치"):
+        db._model_index_exists(index, definitions)
+
+
+@pytest.mark.parametrize("attribute,code", [("sqlstate", "42P07"), ("pgcode", "42710")])
+def test_unreflectable_index_with_dialect_duplicate_error_is_mismatch(
+    monkeypatch, attribute, code,
+):
+    index = next(i for i in BidNotice.__table__.indexes
+                 if i.name == "ix_bid_notice_visible_ntce_dt")
+    original = Exception("중복 인덱스 오류")
+    setattr(original, attribute, code)
+    error = ProgrammingError(None, None, original)
+
+    def fail_create(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(index, "create", fail_create)
+    monkeypatch.setattr(db, "_index_definitions", lambda table: {})
+    with pytest.raises(db.IndexDefinitionMismatchError,
+                       match="같은 이름의 인덱스가 있으나 정의를 확인할 수 없음") as raised:
+        db._create_model_index(index, {})
+    assert raised.value.__cause__ is error
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["new", "old-schema"])
