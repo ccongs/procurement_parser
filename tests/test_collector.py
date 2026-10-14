@@ -607,7 +607,8 @@ def test_reconcile_batches_notices_and_counts_only_final_state_changes(session):
     finally:
         event.remove(session.bind, "before_cursor_execute", capture)
     assert len(queries) == 2 and all(" IN " in sql and len(params) <= 500 for sql, params in queries)
-    assert changes == {"superseded": 501, "restored": 501, "superseded_notices_count": 501}
+    assert changes == {"superseded": 501, "restored": 501, "superseded_notices_count": 501,
+                       "superseded_notices": sorted(f"RECONCILE-{i}-001" for i in range(501))[:50]}
     assert session.get(BidLicenseLimit, ("RECONCILE-0", "1", "1", "1")).superseded_at is None
     assert session.get(BidLicenseLimit, ("RECONCILE-0", "001", "1", "2")).superseded_at == t2
     assert session.get(BidLicenseLimit, ("RECONCILE-0", "002", "1", "1")).superseded_at is None

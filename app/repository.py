@@ -317,7 +317,7 @@ def reconcile_license_limits(
     notices = sorted(labels[pair] for pair in changed_pairs)
     return {"superseded": superseded, "restored": restored,
             "superseded_notices_count": len(notices),
-            **({"superseded_notices": notices} if len(notices) <= 50 else {})}
+            "superseded_notices": notices[:50]}
 
 
 # --- pre_spec upsert (Phase 5.3) ----------------------------------------

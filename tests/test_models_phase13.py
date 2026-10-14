@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app import db
-from app.models import BidLicenseLimit, BidNotice, BidNoticeRaw, ListRule, SchemaMigration
+from app.models import BidLicenseLimit, BidNotice, BidNoticeRaw, LicenseVerification, ListRule, SchemaMigration
 
 
 NEW_COLUMNS = {
@@ -401,3 +401,40 @@ def test_raw_migration_batch_rolls_back_and_retries(database, failed_batch):
         assert all(row.raw_json is None and row.bef_bid_bbanc_no == "OLD"
                    and row.pub_prcrmnt_clsfc_nm == "분류" for row in notices)
         assert all(raw.raw_json == original and raw.updated_at == NOW for raw in raw_rows)
+
+
+def test_license_verification_create_all_twice_schema_defaults_and_preservation(database):
+    engine, local = database
+    db.init_db()
+    inspector = inspect(engine)
+    columns = {c["name"]: c for c in inspector.get_columns("license_verification")}
+    assert inspector.get_pk_constraint("license_verification")["constrained_columns"] == [
+        "bid_ntce_no", "bid_ntce_ord",
+    ]
+    assert columns["bid_ntce_no"]["type"].length == 40
+    assert columns["bid_ntce_ord"]["type"].length == 3
+    assert columns["last_error"]["type"].length == 200
+    assert columns["attempts"]["nullable"] is False
+    for name in ("pending_since", "last_attempt_at", "last_error", "verified_at", "gave_up_at"):
+        assert columns[name]["nullable"] is True
+    assert inspector.get_indexes("license_verification") == []
+    with local() as session:
+        session.add(LicenseVerification(bid_ntce_no="NEW", bid_ntce_ord="001"))
+        session.commit()
+        state = session.get(LicenseVerification, ("NEW", "001"))
+        assert state.attempts == 0
+        assert all(getattr(state, name) is None for name in (
+            "pending_since", "last_attempt_at", "last_error", "verified_at", "gave_up_at",
+        ))
+        state.pending_since = NOW
+        state.attempts = 2
+        state.last_error = "검증 실패"
+        session.commit()
+    # 표준 SQL INSERT에도 DB 기본값 0이 적용된다.
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO license_verification (bid_ntce_no, bid_ntce_ord) VALUES ('SQL', '000')"))
+    db.init_db()
+    with local() as session:
+        assert session.get(LicenseVerification, ("SQL", "000")).attempts == 0
+        state = session.get(LicenseVerification, ("NEW", "001"))
+        assert state.pending_since == NOW and state.attempts == 2 and state.last_error == "검증 실패"
