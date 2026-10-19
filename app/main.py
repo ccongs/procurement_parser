@@ -112,6 +112,11 @@ def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _link_query(params: dict[str, str]) -> str:
+    """빈 값을 제외한 링크용 쿼리 문자열(HTML 이스케이프 전)."""
+    return urlencode({k: v for k, v in params.items() if v != ""})
+
+
 def _months_ago(d: date, n: int) -> date:
     """d 에서 n개월 전 날짜 (말일 보정)."""
     month = d.month - n
@@ -1370,9 +1375,9 @@ def _sort_header(
         # 미정렬: 중립 양방향 표시(흐린 색).
         arrow = ' <span class="arrow neutral">↕</span>'
     params = {**qs, "sort": next_sort, "page": "1"}
-    query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+    url = f"{base_path}?{_link_query(params)}"
     return (
-        f'<th><a class="sortcol" href="{base_path}?{query}">{_e(header)}{arrow}</a></th>'
+        f'<th><a class="sortcol" href="{_e(url)}">{_e(header)}{arrow}</a></th>'
     )
 
 
@@ -1396,10 +1401,10 @@ def _bid_time_header(
     for field, label in fields:
         option_sort = f"{field}_{direction}"
         params = {**qs, "sort": option_sort, "page": "1"}
-        query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+        url = f"/list?{_link_query(params)}"
         selected = " selected" if field == selected_field else ""
         options.append(
-            f'<option value="/list?{query}"{selected}>{_e(label)}</option>'
+            f'<option value="{_e(url)}"{selected}>{_e(label)}</option>'
         )
 
     if active_field:
@@ -1412,13 +1417,13 @@ def _bid_time_header(
         arrow = "↕"
         arrow_class = "arrow neutral"
     params = {**qs, "sort": next_sort, "page": "1"}
-    query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+    url = f"/list?{_link_query(params)}"
 
     return (
         f'<th class="bidtime-head bidtime-col {_e(column_class)}">{_e(header)} '
         f'<select class="bidtime-sortfield" autocomplete="off" aria-label="{_e(header)} 정렬 기준">'
         f'{"".join(options)}</select> '
-        f'<a class="sortcol time-dir" href="/list?{query}" title="정렬 방향 전환">'
+        f'<a class="sortcol time-dir" href="{_e(url)}" title="정렬 방향 전환">'
         f'<span class="{arrow_class}">{arrow}</span></a></th>'
     )
 
@@ -1616,9 +1621,9 @@ def _render_pager(
         if current:
             return f'<span class="cur-page">{_e(label)}</span>'
         params = {**qs, "page": str(target)}
-        query = "&".join(f"{_e(k)}={_e(v)}" for k, v in params.items() if v != "")
+        url = f"{base_path}?{_link_query(params)}"
         cls = " disabled" if disabled else ""
-        return f'<a class="pager-btn{cls}" href="{base_path}?{query}">{_e(label)}</a>'
+        return f'<a class="pager-btn{cls}" href="{_e(url)}">{_e(label)}</a>'
 
     # 번호 링크: 현재 페이지 중심 최대 5개, 범위 밖은 … 처리.
     num_parts: list[str] = []
@@ -3331,8 +3336,8 @@ def pre_spec_page(
         "price_min": price_min_field,
         "price_max": price_max_field,
         "include_past": "1" if include_past_flag else "",
-        # 제외 키워드는 한글·특수문자를 담을 수 있어 링크에는 URL 인코딩해서 싣는다.
-        "excl_kw": quote(",".join(excl_kws), safe=""),
+        # 원문 CSV를 보존하고 링크를 만들 때 한 번만 URL 인코딩한다.
+        "excl_kw": ",".join(excl_kws),
         "excl_kw_set": "1",
         "sort": sort,
         "page_size": str(page_size),
@@ -3618,8 +3623,8 @@ def list_page(
         "price_max": price_max_qs,
         "include_past": "1" if include_past_flag else "",
         "excl_privt": "1" if excl_privt_flag else "0",
-        # 제외 키워드는 한글·특수문자를 담을 수 있어 링크에는 URL 인코딩해서 싣는다.
-        "excl_kw": quote(",".join(excl_kws), safe=""),
+        # 원문 CSV를 보존하고 링크를 만들 때 한 번만 URL 인코딩한다.
+        "excl_kw": ",".join(excl_kws),
         "excl_kw_set": "1",
         "sort": sort,
         "page_size": str(page_size),
