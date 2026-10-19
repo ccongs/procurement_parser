@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 import json
 from datetime import datetime
+from html import unescape
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from sqlalchemy import create_engine
@@ -1098,18 +1100,13 @@ def test_list_time_header_urls_preserve_filters_and_reset_page(client):
     _thead, options, (direction_url, _arrow_class, _arrow) = _bid_time_header_parts(
         resp.text, "제출일시"
     )
-    for url, _selected in options.values():
-        assert "q=필터보존" in url
-        assert "dt_from=2000-01-01" in url
-        assert "dt_to=2099-12-31" in url
-        assert "date_field=bid_ntce_dt" in url
-        assert "page=1" in url
-        assert "page=2" not in url
-    assert "q=필터보존" in direction_url
-    assert "dt_from=2000-01-01" in direction_url
-    assert "dt_to=2099-12-31" in direction_url
-    assert "page=1" in direction_url
-    assert "page=2" not in direction_url
+    for url in [url for url, _selected in options.values()] + [direction_url]:
+        query = parse_qs(urlsplit(unescape(url)).query)
+        assert query["q"] == ["필터보존"]
+        assert query["dt_from"] == ["2000-01-01"]
+        assert query["dt_to"] == ["2099-12-31"]
+        assert query["date_field"] == ["bid_ntce_dt"]
+        assert query["page"] == ["1"]
 
 
 def test_list_time_headers_are_split_into_notice_and_submission(client):
@@ -2459,10 +2456,12 @@ def test_list_budget_sort_nulls_last_and_header(client, direction, expected, nex
     ]
     thead, options, (direction_url, arrow_class, time_arrow) = _bid_time_header_parts(resp.text)
     budget_header = next(h for h in re.findall(r"<th\b[^>]*>.*?</th>", thead) if "배정예산" in h)
-    assert f"sort=asign_bdgt_amt_{next_direction}" in budget_header
+    budget_url = re.search(r'href="([^"]+)"', budget_header).group(1)
+    query = parse_qs(urlsplit(unescape(budget_url)).query)
+    assert query["sort"] == [f"asign_bdgt_amt_{next_direction}"]
     assert f'<span class="arrow">{arrow}</span>' in budget_header
-    assert "q=배정예산정렬" in budget_header
-    assert "page=1" in budget_header
+    assert query["q"] == ["배정예산정렬"]
+    assert query["page"] == ["1"]
     assert options["게시"][1] is True
     assert "sort=bid_ntce_dt_desc" in direction_url
     assert (arrow_class, time_arrow) == ("arrow neutral", "↕")
