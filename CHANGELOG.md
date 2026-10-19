@@ -7,6 +7,12 @@
 - **MINOR**: 기능 추가·화면 개편(기존 데이터·설정 그대로 사용)
 - **PATCH**: 버그 수정, 문구·스타일 조정
 
+## [1.8.2] - 2026-10-19
+
+### 목록 화면
+- 검색어에 `&`·`#`·`+`·`%`·공백·한글이 들어가도 정렬·일시 정렬 선택·페이지 이동 후 검색 조건이 그대로 유지되도록 링크 주소 인코딩 수정(입찰공고·사전규격 목록)
+- 제외 키워드가 링크에서 두 번 인코딩되지 않도록 정리
+
 ## [1.8.1] - 2026-10-14
 
 ### 운영 안정성
@@ -144,6 +150,7 @@
 ### 첫 버전
 - 입찰공고 API 호출·응답 확인 테스트 화면
 
+[1.8.2]: https://github.com/ccongs/procurement_parser/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/ccongs/procurement_parser/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/ccongs/procurement_parser/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/ccongs/procurement_parser/compare/v1.6.0...v1.7.0
