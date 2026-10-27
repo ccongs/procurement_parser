@@ -564,10 +564,10 @@ def test_rule_save_serializes_collector_storage_in_file_sqlite(client, monkeypat
             assert release_save.wait(5), "규칙 저장 해제 신호 없음"
         return original_classify(session, **kwargs)
 
-    def upsert(session, values):
+    def upsert(session, values, skipped=None):
         assert collector_acquired.is_set()
         upserted.set()
-        return original_upsert(session, values)
+        return original_upsert(session, values, skipped=skipped)
 
     def fake_call(operation, params, max_retries):
         if operation == collector.OPERATION:
