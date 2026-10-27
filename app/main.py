@@ -818,6 +818,8 @@ BASE_CSS = """
   .zipall { display: block; text-align: center; background: #1d7a43; color: #fff; text-decoration: none;
             padding: 9px; border-radius: 7px; margin-bottom: 14px; font-size: 13px; }
   .zipall:hover { background: #166035; }
+  .zipall-msg { color: #b42318; margin: 6px 0; }
+  .zipall-msg.info { color: #667085; }
   /* 파일 목록 테이블(Phase 4.2): 파일명 ellipsis + title(tooltip)으로 전체명 확인 */
   table.filetable { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
   table.filetable th, table.filetable td { border: 1px solid #eef1f6; padding: 7px 8px; text-align: left;
@@ -2220,6 +2222,30 @@ _LIST_SCRIPT = """
     var titleEl = document.getElementById('drawerTitle');
     var listEl = document.getElementById('fileList');
     var zipAll = document.getElementById('zipAll');
+    var zipAllMsg = document.getElementById('zipAllMsg');
+    var zipDownloads = Object.create(null);
+    zipAll.addEventListener('click', function (event) {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      var url = zipAll.getAttribute('href');
+      if (!url || url === '#') return;
+      zipAllMsg.textContent = '다운로드를 요청했습니다. 첨부가 많으면 시작까지 시간이 걸릴 수 있습니다.';
+      zipAllMsg.classList.add('info');
+      zipAllMsg.hidden = false;
+      if (zipDownloads[url]) return;
+      var timer = setTimeout(function () { delete zipDownloads[url]; }, 60 * 1000);
+      zipDownloads[url] = timer;
+      downloadInFrame(url, function (message) {
+        if (zipDownloads[url] === timer) {
+          clearTimeout(timer);
+          delete zipDownloads[url];
+        }
+        if (zipAll.getAttribute('href') !== url) return;
+        zipAllMsg.classList.remove('info');
+        zipAllMsg.textContent = message;
+        zipAllMsg.hidden = false;
+      });
+    });
 
     function closeDrawer() {
       drawer.classList.remove('open');
@@ -2243,6 +2269,8 @@ _LIST_SCRIPT = """
         var no = btn.getAttribute('data-no');
         listEl.innerHTML = '';
         titleEl.textContent = '불러오는 중…';
+        zipAllMsg.textContent = '';
+        zipAllMsg.hidden = true;
         zipAll.setAttribute('href', '/list/' + encodeURIComponent(no) + '/files.zip');
         openDrawer();
         fetch('/list/' + encodeURIComponent(no) + '/files')
@@ -2825,17 +2853,40 @@ _CART_MODAL_HTML = """
 _CART_SCRIPT = """
   var cartFilesDownloading = false;
   var cartSelectedDeleting = false;
+  var cartToastTimer = null;
+
+  function downloadInFrame(url, onError) {
+    var frame = document.createElement('iframe');
+    frame.hidden = true;
+    var cleanup = setTimeout(function () { frame.remove(); }, 30 * 60 * 1000);
+    frame.addEventListener('load', function () {
+      var message;
+      try {
+        message = frame.contentDocument.body.textContent.trim();
+      } catch (error) {
+        return;
+      }
+      if (message) {
+        clearTimeout(cleanup);
+        frame.remove();
+        onError(message);
+      }
+    });
+    document.body.appendChild(frame);
+    frame.src = url;
+  }
 
   function escapeHtml(str) {
     return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  function showCartToast(msg) {
+  function showCartToast(msg, ms) {
     var t = document.getElementById('cartToast');
     if (!t) return;
+    clearTimeout(cartToastTimer);
     t.textContent = msg;
     t.style.display = 'block';
-    setTimeout(function () { t.style.display = 'none'; }, 3000);
+    cartToastTimer = setTimeout(function () { t.style.display = 'none'; }, ms === undefined ? 3000 : ms);
   }
 
   function updateCartBadge(count) {
@@ -2939,25 +2990,27 @@ _CART_SCRIPT = """
     }
     cartFilesDownloading = true;
     updateCartSelectionButtons();
+    var failures = 0;
     try {
+      var message = targets.length + '건 다운로드를 시작했습니다.';
+      if (excluded) message += ' (첨부 없음 ' + excluded + '건 제외)';
+      showCartToast(message);
       for (var i = 0; i < targets.length; i++) {
         var item = targets[i];
         var base = item.itemType === 'bid'
           ? '/list/' + encodeURIComponent(item.itemId)
           : '/pre-spec/' + encodeURIComponent(item.itemId);
-        var link = document.createElement('a');
-        link.style.display = 'none';
-        link.href = base + (item.fileCount >= 2 ? '/files.zip' : '/files/single');
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
+        var url = base + (item.fileCount >= 2 ? '/files.zip' : '/files/single');
+        (function (itemId) {
+          downloadInFrame(url, function (message) {
+            failures++;
+            showCartToast('다운로드 실패 ' + failures + '건 — ' + itemId + ': ' + message, 6000);
+          });
+        })(item.itemId);
         if (i < targets.length - 1) {
           await new Promise(function (resolve) { setTimeout(resolve, 800); });
         }
       }
-      var message = targets.length + '건 다운로드를 시작했습니다.';
-      if (excluded) message += ' (첨부 없음 ' + excluded + '건 제외)';
-      showCartToast(message);
     } finally {
       cartFilesDownloading = false;
       updateCartSelectionButtons();
@@ -3172,6 +3225,30 @@ _PRE_SPEC_SCRIPT = """
     var titleEl = document.getElementById('psDrawerTitle');
     var listEl = document.getElementById('psFileList');
     var zipAll = document.getElementById('psZipAll');
+    var zipAllMsg = document.getElementById('psZipAllMsg');
+    var zipDownloads = Object.create(null);
+    zipAll.addEventListener('click', function (event) {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      var url = zipAll.getAttribute('href');
+      if (!url || url === '#') return;
+      zipAllMsg.textContent = '다운로드를 요청했습니다. 첨부가 많으면 시작까지 시간이 걸릴 수 있습니다.';
+      zipAllMsg.classList.add('info');
+      zipAllMsg.hidden = false;
+      if (zipDownloads[url]) return;
+      var timer = setTimeout(function () { delete zipDownloads[url]; }, 60 * 1000);
+      zipDownloads[url] = timer;
+      downloadInFrame(url, function (message) {
+        if (zipDownloads[url] === timer) {
+          clearTimeout(timer);
+          delete zipDownloads[url];
+        }
+        if (zipAll.getAttribute('href') !== url) return;
+        zipAllMsg.classList.remove('info');
+        zipAllMsg.textContent = message;
+        zipAllMsg.hidden = false;
+      });
+    });
 
     function closeDrawer() {
       drawer.classList.remove('open');
@@ -3195,6 +3272,8 @@ _PRE_SPEC_SCRIPT = """
         var no = btn.getAttribute('data-no');
         listEl.innerHTML = '';
         titleEl.textContent = '불러오는 중…';
+        zipAllMsg.textContent = '';
+        zipAllMsg.hidden = true;
         zipAll.setAttribute('href', '/pre-spec/' + encodeURIComponent(no) + '/files.zip');
         openDrawer();
         fetch('/pre-spec/' + encodeURIComponent(no) + '/files')
@@ -3451,6 +3530,7 @@ def pre_spec_page(
       </div>
       <div class="dz-body">
         <a id="psZipAll" class="zipall" href="#">전체 다운로드 (.zip)</a>
+        <p id="psZipAllMsg" class="zipall-msg" role="status" hidden></p>
         <table class="filetable">
           <thead><tr><th class="c-fn">파일명</th><th class="c-dl">다운로드</th></tr></thead>
           <tbody id="psFileList"></tbody>
@@ -3760,6 +3840,7 @@ def list_page(
       </div>
       <div class="dz-body">
         <a id="zipAll" class="zipall" href="#">전체 다운로드 (.zip)</a>
+        <p id="zipAllMsg" class="zipall-msg" role="status" hidden></p>
         <table class="filetable">
           <thead><tr><th class="c-fn">파일명</th><th class="c-dl">다운로드</th></tr></thead>
           <tbody id="fileList"></tbody>
@@ -3830,7 +3911,7 @@ async def _single_file_response(item_id: str, file: dict[str, Any]) -> Response:
                         "단일 첨부 크기 상한 초과: no=%s idx=%s size=%s",
                         item_id, file["idx"], declared_size,
                     )
-                    return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
+                    return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
                 chunks = []
                 total_bytes = 0
@@ -3841,14 +3922,14 @@ async def _single_file_response(item_id: str, file: dict[str, Any]) -> Response:
                             "단일 첨부 크기 상한 초과: no=%s idx=%s size=%s",
                             item_id, file["idx"], total_bytes,
                         )
-                        return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
+                        return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
                     chunks.append(chunk)
                 content = b"".join(chunks)
                 filename = _filename_from_cd(resp, file["name"] or f"첨부{file['idx']}")
                 media_type = resp.headers.get("content-type") or "application/octet-stream"
     except Exception:  # noqa: BLE001 — 외부 첨부 다운로드 실패를 502로 변환.
         logger.warning("단일 첨부 다운로드 실패: no=%s idx=%s", item_id, file["idx"])
-        return Response("첨부 다운로드에 실패했습니다.", status_code=502)
+        return Response("첨부 다운로드에 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
     return Response(content=content, media_type=media_type, headers=headers)
@@ -3878,10 +3959,10 @@ async def list_file_single(bid_ntce_no: str):
     with SessionLocal() as session:
         notice = session.get(BidNotice, bid_ntce_no)
         if notice is None:
-            return Response("공고를 찾을 수 없습니다.", status_code=404)
+            return Response("공고를 찾을 수 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
         files = repository.get_notice_files(session, bid_ntce_no)
     if not files:
-        return Response("첨부가 없습니다.", status_code=404)
+        return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
     return await _single_file_response(bid_ntce_no, files[0])
 
 
@@ -3918,11 +3999,11 @@ async def list_files_zip(bid_ntce_no: str):
     with SessionLocal() as session:
         notice = session.get(BidNotice, bid_ntce_no)
         if notice is None:
-            return Response("공고를 찾을 수 없습니다.", status_code=404)
+            return Response("공고를 찾을 수 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
         files = repository.get_notice_files(session, bid_ntce_no)
         zip_label = notice.bid_ntce_nm or bid_ntce_no
     if not files:
-        return Response("첨부가 없습니다.", status_code=404)
+        return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
 
     buf = io.BytesIO()
     ok = 0
@@ -3964,8 +4045,8 @@ async def list_files_zip(bid_ntce_no: str):
 
     if ok == 0:
         if limit_hit:
-            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
-        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
+            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
+        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
     filename = quote(f"{zip_label}.zip")
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
@@ -3997,10 +4078,10 @@ async def pre_spec_file_single(bf_spec_rgst_no: str):
     with SessionLocal() as session:
         spec = session.get(PreSpec, bf_spec_rgst_no)
         if spec is None:
-            return Response("사전규격을 찾을 수 없습니다.", status_code=404)
+            return Response("사전규격을 찾을 수 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
         files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
     if not files:
-        return Response("첨부가 없습니다.", status_code=404)
+        return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
     return await _single_file_response(bf_spec_rgst_no, files[0])
 
 
@@ -4015,11 +4096,11 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     with SessionLocal() as session:
         spec = session.get(PreSpec, bf_spec_rgst_no)
         if spec is None:
-            return Response("사전규격을 찾을 수 없습니다.", status_code=404)
+            return Response("사전규격을 찾을 수 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
         files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
         zip_label = spec.prdct_clsfc_no_nm or bf_spec_rgst_no
     if not files:
-        return Response("첨부가 없습니다.", status_code=404)
+        return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
 
     buf = io.BytesIO()
     ok = 0
@@ -4061,8 +4142,8 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
 
     if ok == 0:
         if limit_hit:
-            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
-        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
+            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
+        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
     filename = quote(f"{zip_label}.zip")
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}

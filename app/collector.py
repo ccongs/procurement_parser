@@ -166,10 +166,22 @@ def _regressed_notices(session, notices: list[dict]) -> list[dict]:
     return result
 
 
+def _regressed_pair(no, ord_, stored_by_no) -> bool:
+    stored = stored_by_no.get(_text(no))
+    return bool(stored and _text(ord_) and is_higher_order(stored, ord_))
+
+
+def _record_fix_failure(fix, label: str, reason: str) -> None:
+    fix["failure_details_count"] += 1
+    if len(fix["failure_details"]) < 50:
+        fix["failure_details"].append({"notice": label, "reason": reason})
+
+
 def _failure_summary(failures: list[tuple[str, str]]) -> str | None:
     """같은 사유를 묶어 건수·공고 예시만 남긴다. 공고별 상세는 별도 목록에 보존한다."""
     grouped: dict[str, list[str]] = {}
     for label, reason in failures:
+        reason = re.sub(r": 고유 \d+ / 전체 \d+(?: \(중복 \d+\))?$", "", reason)
         grouped.setdefault(reason, []).append(label)
     return "; ".join(f"{reason} ({len(labels)}건: {', '.join(labels[:5])})"
                      for reason, labels in grouped.items()) or None
@@ -652,7 +664,7 @@ def collect_window(
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
                             "found": 0, "failed": [], "retry_count": 0, "total_count": None,
                             "unique_items": 0, "verify_targets": 0, "error_msg": None,
-                            "failure_details": [], "verify_pending_after": 0,
+                            "failure_details": [], "failure_details_count": 0, "verify_pending_after": 0,
                             "verify_reregistered": [], "verify_reregistered_count": 0,
                             "verify_pending": 0, "verified": [],
                             "verify_deferred": 0, "stale_bulk_skipped": 0,
@@ -710,8 +722,10 @@ def collect_window(
 
         regress_skipped = _regressed_notices(session, notices)
         regress_nos = {row["bid_ntce_no"] for row in regress_skipped}
+        stored_by_no = {row["bid_ntce_no"]: row["stored_ord"] for row in regress_skipped}
         active_notices = [item for item in notices if _text(item["bidNtceNo"]) not in regress_nos]
-        pending_targets = [item for item in pending_targets if item["bidNtceNo"] not in regress_nos]
+        pending_targets = [item for item in pending_targets
+                           if not _regressed_pair(item["bidNtceNo"], item["bidNtceOrd"], stored_by_no)]
         license_result = _fetch_pages(LICENSE_OPERATION, {
             "inqryDiv": "1", "inqryBgnDt": fmt_dt(window_bgn), "inqryEndDt": fmt_dt(window_end),
         }, snapshot)
@@ -719,7 +733,8 @@ def collect_window(
         _warn_unkeyed_licenses("일괄", license_result["items"])
         licenses = _keep_licenses(session, [item for item in license_result["items"]
                                   if isinstance(item, dict)
-                                  and _text(item.get("bidNtceNo")) not in regress_nos], notice_nos)
+                                  and not _regressed_pair(item.get("bidNtceNo"), item.get("bidNtceOrd"),
+                                                         stored_by_no)], notice_nos)
         bulk_keys = set(licenses)
         bulk_pairs = {pk[:2] for pk in bulk_keys}
         by_call["license"] = _call_detail(
@@ -817,6 +832,14 @@ def collect_window(
                     verification_responses.append((no, ord_, received_at, None, result["error_msg"]))
                     # halt 시 공고·면허 저장은 중단하되 확인 대기와 실패 시도는 보존한다.
                     with classifier.CLASSIFY_WRITE_LOCK:
+                        final_skipped = _regressed_notices(session, notices)
+                        regress_skipped = list({row["bid_ntce_no"]: row
+                                                for row in regress_skipped + final_skipped}.values())
+                        stored_by_no = {row["bid_ntce_no"]: row["stored_ord"] for row in regress_skipped}
+                        registrations = [item for item in registrations if not _regressed_pair(
+                            item["bidNtceNo"], item["bidNtceOrd"], stored_by_no)]
+                        verification_responses = [row for row in verification_responses
+                                                  if not _regressed_pair(row[0], row[1], stored_by_no)]
                         gave_up_pairs = _expire_license_verifications(session, meta_ts, fix)
                         _apply_license_verifications(
                             session, registrations,
@@ -890,7 +913,7 @@ def collect_window(
                     fix["outcome"] = "failed"
                     reason = f"검증 실패 — {validation_error}" if validation_error else result["error_msg"]
                     fix_failures.append((f"{no}-{stored_order(ord_)}", reason))
-                    fix["failure_details"].append({"notice": f"{no}-{stored_order(ord_)}", "reason": reason})
+                    _record_fix_failure(fix, f"{no}-{stored_order(ord_)}", reason)
                     if result.get("truncated"):
                         fix["truncated"] = True
                     fix["failed"].append(no)
@@ -909,17 +932,20 @@ def collect_window(
             values.update(collected_at=meta_ts, updated_at=meta_ts)
             values_list.append(values)
         with classifier.CLASSIFY_WRITE_LOCK:
-            new_count, updated_count, ord_changes = repository.upsert_bid_notices(session, values_list)
-            # 기존 2인자 호출을 유지하고, 저장 잠금이 유지된 같은 트랜잭션에서 최종 차수를 읽는다.
-            final_skipped = _regressed_notices(session, notices)
+            final_skipped = []
+            new_count, updated_count, ord_changes = repository.upsert_bid_notices(
+                session, values_list, skipped=final_skipped)
             regress_skipped = list({row["bid_ntce_no"]: row
                                     for row in regress_skipped + final_skipped}.values())
-            regress_nos = {row["bid_ntce_no"] for row in regress_skipped}
-            licenses = {pk: row for pk, row in licenses.items() if pk[0] not in regress_nos}
-            registrations = [item for item in registrations if item["bidNtceNo"] not in regress_nos]
-            verification_responses = [row for row in verification_responses if row[0] not in regress_nos]
-            bulk_keys = {pk for pk in bulk_keys if pk[0] not in regress_nos}
-            bulk_pairs = {pair for pair in bulk_pairs if pair[0] not in regress_nos}
+            stored_by_no = {row["bid_ntce_no"]: row["stored_ord"] for row in regress_skipped}
+            licenses = {pk: row for pk, row in licenses.items()
+                        if not _regressed_pair(pk[0], pk[1], stored_by_no)}
+            registrations = [item for item in registrations if not _regressed_pair(
+                item["bidNtceNo"], item["bidNtceOrd"], stored_by_no)]
+            verification_responses = [row for row in verification_responses
+                                      if not _regressed_pair(row[0], row[1], stored_by_no)]
+            bulk_keys = {pk for pk in bulk_keys if not _regressed_pair(pk[0], pk[1], stored_by_no)}
+            bulk_pairs = {pair for pair in bulk_pairs if not _regressed_pair(pair[0], pair[1], stored_by_no)}
             gave_up_pairs = _expire_license_verifications(session, meta_ts, fix)
             rejected_shortfalls = {}
             full_license_keys, stale_pairs = _apply_license_verifications(
@@ -934,7 +960,7 @@ def collect_window(
                     fix["outcome"] = "failed"
                     fix["failed"].append(no)
                     fix_failures.append((f"{no}-{stored_order(ord_)}", error))
-                    fix["failure_details"].append({"notice": f"{no}-{stored_order(ord_)}", "reason": error})
+                    _record_fix_failure(fix, f"{no}-{stored_order(ord_)}", error)
             # 전체 조회를 하지 않은 공고·차수도 더 새 검증이 있으면 일괄 행을 제외한다.
             stale_keys = [pk for pk in licenses if pk[:2] in stale_pairs]
             fix["stale_bulk_skipped"] = len(bulk_keys.intersection(stale_keys))

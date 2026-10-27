@@ -114,7 +114,8 @@ def init_db() -> None:
       마이그레이션이 시드보다 **먼저** 와야 신규 컬럼을 시드 행이 채울 수 있다.
     - 동시 실행 경합은 단계 내 재확인·원문 배치 1회 재처리로 우선 흡수한다.
       남은 DB 오류는 마지막 안전장치로 전체 단계를 처음부터 최대 3회 실행한다.
-    - 잠금 재시도·busy_timeout은 SQLite 전용 경로다(최대 3회).
+    - 잠금 대기 오류(database is locked)는 시도마다 busy_timeout 만큼 대기(최대 3회).
+      이 잠금 재시도·busy_timeout은 SQLite 전용 경로다.
       PostgreSQL로 옮기면 중복 DDL이 ProgrammingError로 오므로 _run_once의 예외 처리와
       재시도 조건을 다시 봐야 한다.
     - 하위 단계(_run_once·_seed_app_config)의 자체 재시도와 겹칠 수 있다.
