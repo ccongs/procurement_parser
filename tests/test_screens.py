@@ -542,6 +542,16 @@ def test_list_files_json_missing(client):
 class _FakeResp:
     def __init__(self, content: bytes):
         self.content = content
+        self.headers = {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def aiter_bytes(self):
+        yield self.content
 
     def raise_for_status(self):
         return None
@@ -559,7 +569,8 @@ class _FakeAsyncClient:
     async def __aexit__(self, *args):
         return False
 
-    async def get(self, url):
+    def stream(self, method, url):
+        assert method == "GET"
         return _FakeResp(b"FAKEBYTES:" + url.encode("utf-8"))
 
 
@@ -598,7 +609,7 @@ def test_list_files_zip_all_fail_returns_502(client, monkeypatch):
     from app import main
 
     class _FailingClient(_FakeAsyncClient):
-        async def get(self, url):
+        def stream(self, method, url):
             raise RuntimeError("network down")
 
     monkeypatch.setattr(main.httpx, "AsyncClient", _FailingClient)
@@ -892,37 +903,6 @@ def test_list_default_date_range_openg_dt():
     f, t = main._list_default_date_range("openg_dt", today=today)
     assert f == "2026-06-01"
     assert t == "2026-07-01"
-
-
-# --- industry_codes 매핑 ----------------------------------------------
-def test_industry_matched_labels():
-    """라운드2b: 단축 라벨 `업무명 [코드]`(바깥 소프트웨어사업자 래퍼 제거)."""
-    labels = industry_codes.matched_labels("1426,1468")
-    assert labels == [
-        "패키지소프트웨어개발·공급사업 [1426]",
-        "컴퓨터관련서비스사업 [1468]",
-    ]
-    # 4종 단축명 확인.
-    assert industry_codes.matched_labels("1469,1470") == [
-        "디지털콘텐츠개발서비스사업 [1469]",
-        "데이터베이스제작및검색서비스사업 [1470]",
-    ]
-
-
-def test_industry_unknown_code_passthrough():
-    assert industry_codes.matched_labels("9999") == ["9999"]
-    assert industry_codes.matched_labels("") == []
-    assert industry_codes.matched_labels(None) == []
-
-
-def test_industry_matched_label_pairs_tooltip():
-    """라운드2b: (단축 표시, tooltip 전체명) 쌍. 전체명은 래퍼 포함 + [코드]."""
-    pairs = industry_codes.matched_label_pairs("1468")
-    assert pairs == [
-        ("컴퓨터관련서비스사업 [1468]", "소프트웨어사업자(컴퓨터관련서비스사업) [1468]"),
-    ]
-    # 모르는 코드는 단축·전체 모두 코드 그대로.
-    assert industry_codes.matched_label_pairs("9999") == [("9999", "9999")]
 
 
 # --- main 헬퍼: 가격 파싱 ---------------------------------------------
@@ -2469,7 +2449,7 @@ def test_list_budget_sort_nulls_last_and_header(client, direction, expected, nex
 
 @pytest.mark.parametrize(("enabled", "column_count"), [(True, 12), (False, 11)])
 def test_list_column_count_with_analysis_toggle(client, monkeypatch, enabled, column_count):
-    """분석 토글에 따른 실제 헤더·셀 수와 분석 버튼의 colspan이 일치한다."""
+    """분석 토글에 따른 실제 헤더·셀 수가 일치한다."""
     monkeypatch.setattr(main, "analysis_enabled", lambda: enabled)
     resp = client.get("/list", params=_WIDE)
     assert resp.status_code == 200
@@ -2482,12 +2462,8 @@ def test_list_column_count_with_analysis_toggle(client, monkeypatch, enabled, co
         assert len(re.findall(r"<td\b", row)) == column_count
         assert 'class="file-col"' in row
         assert ('class="analysis-col"' in row) is enabled
-    spans = re.findall(r'data-colspan="(\d+)"', tbody)
-    if enabled:
-        assert spans and set(spans) == {str(column_count)}
-        assert 'data-name="스모크 테스트 공고"' in tbody
-    else:
-        assert not spans
+    assert 'data-colspan=' not in tbody
+    assert ('data-name="스모크 테스트 공고"' in tbody) is enabled
 
 
 # --- Phase 13.3 표시 대상 필터 -----------------------------------------

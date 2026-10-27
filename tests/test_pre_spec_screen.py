@@ -731,14 +731,33 @@ def test_pre_spec_files_route_404_for_missing(client_with_files):
     assert resp.status_code == 404
 
 
-def test_pre_spec_files_zip_route_responds(client_with_files):
-    """/pre-spec/{no}/files.zip 라우트가 zip Content-Type 또는 오류를 반환한다(네트워크 X)."""
-    # 실제 URL을 다운로드하지 않으므로 네트워크 실패 → 502 또는 404.
-    # 라우트가 존재하고 DB 조회까지는 수행됨을 확인(405 미발생).
+def test_pre_spec_files_zip_route_responds(client_with_files, monkeypatch):
+    """외부 네트워크 없이 첨부 두 건이 실제 ZIP으로 반환된다."""
+    from contextlib import asynccontextmanager
+    from io import BytesIO
+    from zipfile import ZipFile
+    import httpx
+    from app import main
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        @asynccontextmanager
+        async def stream(self, method, url):
+            assert method == "GET"
+            yield httpx.Response(200, content=b"spec", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: FakeClient())
     resp = client_with_files.get("/pre-spec/FW-1/files.zip")
-    # 네트워크 접근 실패(외부 URL 없음) → 502. 파일 없는 경우 404.
-    # 라우트가 살아 있으면 405(Method Not Allowed)나 422(Unprocessable Entity)가 아니어야 함.
-    assert resp.status_code in (200, 404, 502)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    with ZipFile(BytesIO(resp.content)) as archive:
+        assert len(archive.namelist()) == 2
+        assert all(archive.read(name) == b"spec" for name in archive.namelist())
 
 
 def test_pre_spec_files_zip_404_for_no_attachments(client_with_files):
