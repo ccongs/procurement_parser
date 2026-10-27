@@ -1,8 +1,8 @@
 """DB 연결·세션·초기화 — Phase 3.1.
 
 SQLAlchemy engine / SessionLocal / Base 를 제공하고, init_db()로
-테이블 4종(bid_notice·collection_run·app_config·pre_spec)을 생성한 뒤
-app_config 단일 행(id=1)을 기본값으로 시드한다(pre_spec 시드는 없음).
+모델에 정의된 테이블 전체를 생성한 뒤 app_config 단일 행(id=1)을 기본값으로
+시드하고 목록 규칙을 1회 시드한다(pre_spec 시드는 없음).
 
 - DB 경로는 .env 의 DATABASE_URL 에서 로드(없으면 sqlite:///procurement.db).
 - SQLite 파일은 프로젝트 루트에 생성한다.
@@ -180,8 +180,8 @@ def _migrate_add_columns() -> None:
     `collection_run.source` 기존 행은 DEFAULT 'bid' 로 채워진다. 기존 표시 공고의 NULL 분류값은
     별도 보정 함수에서 완료 기록을 기준으로 1회 보정한다. init_db() 반복 호출은 안전하다.
 
-    list_visible 기본값 TRUE 는 SQLite·PostgreSQL 공통 표기다.
-    기존 pre_spec_enabled 의 DEFAULT 1 은 PostgreSQL 이전 시 true 로 조정해야 한다.
+    BOOLEAN DEFAULT TRUE·TIMESTAMP 는 SQLite·PostgreSQL 공통 표기다.
+    이 DDL은 해당 컬럼이 없어 새로 ALTER가 필요한 옛 스키마 DB에만 적용된다.
     """
     insp = inspect(engine)
     tables = set(insp.get_table_names())
@@ -214,13 +214,12 @@ def _migrate_add_columns() -> None:
     if "app_config" in tables:
         ac = colset("app_config")
         if "pre_spec_enabled" not in ac:
-            # PG 이전 시 DEFAULT 1 → DEFAULT true 로 조정.
             stmts.append(("app_config", "pre_spec_enabled",
-                "ALTER TABLE app_config ADD COLUMN pre_spec_enabled BOOLEAN NOT NULL DEFAULT 1"
+                "ALTER TABLE app_config ADD COLUMN pre_spec_enabled BOOLEAN NOT NULL DEFAULT TRUE"
             ))
         if "pre_spec_last_success_dt" not in ac:
             stmts.append(("app_config", "pre_spec_last_success_dt",
-                "ALTER TABLE app_config ADD COLUMN pre_spec_last_success_dt DATETIME"
+                "ALTER TABLE app_config ADD COLUMN pre_spec_last_success_dt TIMESTAMP"
             ))
         # Phase 4.9-R2-D: 사전규격 배정예산액 기본 범위(신규 컬럼 2개).
         if "pre_spec_amt_bgn" not in ac:
@@ -253,6 +252,7 @@ def _run_once(name: str, work: Callable[[Connection], None]) -> None:
                 if conn.execute(completed).first():
                     return
                 work(conn)
+                # applied_at은 naive UTC(_utcnow) — 다른 열 일부는 지역 시각을 쓴다.
                 conn.execute(migration.insert().values(name=name))
             return
         except (IntegrityError, OperationalError):

@@ -374,6 +374,11 @@ def test_auto_migration_adds_columns_idempotent(monkeypatch, tmp_path):
         cfg = s.get(AppConfig, 1)
         assert bool(cfg.pre_spec_enabled) is True
         assert cfg.pre_spec_last_success_dt is None
+        fixed = datetime(2026, 10, 7, 12, 34, 56)
+        cfg.pre_spec_last_success_dt = fixed
+        s.commit()
+        s.expire_all()
+        assert s.get(AppConfig, 1).pre_spec_last_success_dt == fixed
     finally:
         s.close()
 
@@ -381,6 +386,11 @@ def test_auto_migration_adds_columns_idempotent(monkeypatch, tmp_path):
     dbmod.init_db()
     insp2 = inspect(engine)
     assert "source" in {c["name"] for c in insp2.get_columns("collection_run")}
+    with Session() as session:
+        cfg = session.get(AppConfig, 1)
+        assert cfg.pre_spec_enabled is True
+        assert cfg.pre_spec_last_success_dt == fixed
+    engine.dispose()
 
 
 # =====================================================================

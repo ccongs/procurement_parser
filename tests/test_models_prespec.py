@@ -2,7 +2,7 @@
 
 네트워크/실 DB(procurement.db) 비의존. 임시 파일 SQLite 엔진을 만들어
 테이블 생성·PK·컬럼·인덱스를 검증하고, init_db() 는 실 engine/SessionLocal 을
-임시 DB 로 monkeypatch 한 뒤 호출해 테이블 4종 생성·app_config 시드 회귀를 확인한다.
+임시 DB 로 monkeypatch 한 뒤 호출해 모델 테이블 전체 생성·app_config 시드 회귀를 확인한다.
 시각은 고정 datetime 으로 넣어 결정적으로 만든다(datetime.now() 미사용).
 실행: `pytest tests/test_models_prespec.py`
 """
@@ -140,9 +140,9 @@ def test_pre_spec_roundtrip(engine):
         assert row.updated_at == fixed
 
 
-# --- 4. init_db(): 테이블 4종 + app_config 시드 회귀 없음 --------------
-def test_init_db_creates_four_tables_and_seeds_app_config(tmp_path, monkeypatch):
-    """init_db() 를 임시 DB 로 monkeypatch 후 호출 — 테이블 4종·시드 1행 검증."""
+# --- 4. init_db(): 모델 테이블 전체 + app_config 시드 회귀 없음 --------
+def test_init_db_creates_all_model_tables_and_seeds_app_config(tmp_path, monkeypatch):
+    """init_db() 를 임시 DB 로 monkeypatch 후 호출 — 전체 테이블·설정 시드 1행 검증."""
     from app import db as db_module
 
     db_path = tmp_path / "init_db_test.db"
@@ -161,7 +161,11 @@ def test_init_db_creates_four_tables_and_seeds_app_config(tmp_path, monkeypatch)
 
     inspector = inspect(eng)
     tables = set(inspector.get_table_names())
-    assert {"bid_notice", "collection_run", "app_config", "pre_spec"} <= tables
+    assert tables == {
+        "bid_notice", "bid_notice_raw", "bid_license_limit", "license_verification",
+        "list_rule", "schema_migration", "collection_run", "app_config", "pre_spec",
+        "analysis_result", "exclude_keyword", "export_cart",
+    }
 
     # app_config 시드 단일 행(id=1) 회귀 없음.
     with Local() as s:

@@ -663,6 +663,35 @@ def test_invalid_batch_size(database, batch_size):
         list(iter_classifications(session, rules=DEFAULT_RULES, match_codes=(), batch_size=batch_size))
 
 
+@pytest.mark.parametrize("bounds", [
+    {"bid_ntce_dt_from": datetime(2026, 10, 7)},
+    {"bid_ntce_dt_to": datetime(2026, 10, 8)},
+    {"bid_ntce_dt_from": datetime(2026, 10, 7), "bid_ntce_dt_to": datetime(2026, 10, 8)},
+])
+@pytest.mark.parametrize("empty_targets", [False, True])
+def test_number_and_date_filters_rejected_before_iteration(database, bounds, empty_targets):
+    engine, local = database
+    queries = []
+
+    def record_query(conn, cursor, statement, parameters, context, executemany):
+        queries.append(statement)
+
+    def targets():
+        pytest.fail("인자 검사 중 공고번호 iterable을 소비하면 안 됩니다")
+        yield "UNUSED"
+
+    event.listen(engine, "before_cursor_execute", record_query)
+    try:
+        with local() as session, pytest.raises(ValueError, match="공고번호와 공고일 기간"):
+            iter_classifications(
+                session, rules=DEFAULT_RULES, match_codes=(),
+                bid_ntce_nos=[] if empty_targets else targets(), **bounds,
+            )
+        assert queries == []
+    finally:
+        event.remove(engine, "before_cursor_execute", record_query)
+
+
 def test_seed_counts_order_and_idempotence_preserve_operator_changes(database):
     _, local = database
     db.init_db()

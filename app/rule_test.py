@@ -13,7 +13,7 @@ from app import classifier, repository
 
 MAX_RULES_PER_KIND = 300
 MAX_DRAFT_CHARS = 20_000
-STALE_MESSAGE = "다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌어 현재 규칙을 다시 불러왔습니다. 초안을 다시 입력한 뒤 미리보기하세요."
+STALE_MESSAGE = "다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌어 적용하지 않았습니다. 입력하던 초안은 아래에 남겨 두었습니다. 필요한 내용을 복사한 뒤 「현재 규칙 다시 불러오기」를 눌러 현재 규칙에서 다시 미리보기하세요."
 FORM_MESSAGE = "요청 형식이 올바르지 않아 현재 규칙을 다시 불러왔습니다."
 
 

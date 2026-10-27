@@ -175,80 +175,88 @@ def iter_classifications(
     """
     if batch_size <= 0:
         raise ValueError("batch_size 는 양수여야 합니다.")
-    # 호출자의 autoflush 설정과 무관하게 미리보기 중 DB 쓰기를 막는다.
-    with session.no_autoflush:
-        targets = (
-            tuple(sorted({no.strip() for no in bid_ntce_nos if no.strip()}))
-            if bid_ntce_nos is not None else None
-        )
-        if targets == ():
-            return
-        codes = set(match_codes)
-        last_no = None
-        target_offset = 0
-        while True:
-            query = select(BidNotice).order_by(BidNotice.bid_ntce_no)
-            if targets is not None:
-                batch = targets[target_offset:target_offset + batch_size]
-                if not batch:
-                    break
-                target_offset += batch_size
-                query = query.where(BidNotice.bid_ntce_no.in_(batch))
-            else:
-                query = query.limit(batch_size)
-                if bid_ntce_dt_from is not None:
-                    query = query.where(BidNotice.bid_ntce_dt >= bid_ntce_dt_from)
-                if bid_ntce_dt_to is not None:
-                    query = query.where(BidNotice.bid_ntce_dt < bid_ntce_dt_to)
-                if last_no is not None:
-                    query = query.where(BidNotice.bid_ntce_no > last_no)
-            notices = session.scalars(query).all()
-            if not notices:
+    if bid_ntce_nos is not None and (
+        bid_ntce_dt_from is not None or bid_ntce_dt_to is not None
+    ):
+        raise ValueError("공고번호와 공고일 기간은 함께 지정할 수 없습니다.")
+
+    def iterate() -> Iterator[tuple[BidNotice, Classification]]:
+        # 호출자의 autoflush 설정과 무관하게 미리보기 중 DB 쓰기를 막는다.
+        with session.no_autoflush:
+            targets = (
+                tuple(sorted({no.strip() for no in bid_ntce_nos if no.strip()}))
+                if bid_ntce_nos is not None else None
+            )
+            if targets == ():
+                return
+            codes = set(match_codes)
+            last_no = None
+            target_offset = 0
+            while True:
+                query = select(BidNotice).order_by(BidNotice.bid_ntce_no)
+                if targets is not None:
+                    batch = targets[target_offset:target_offset + batch_size]
+                    if not batch:
+                        break
+                    target_offset += batch_size
+                    query = query.where(BidNotice.bid_ntce_no.in_(batch))
+                else:
+                    query = query.limit(batch_size)
+                    if bid_ntce_dt_from is not None:
+                        query = query.where(BidNotice.bid_ntce_dt >= bid_ntce_dt_from)
+                    if bid_ntce_dt_to is not None:
+                        query = query.where(BidNotice.bid_ntce_dt < bid_ntce_dt_to)
+                    if last_no is not None:
+                        query = query.where(BidNotice.bid_ntce_no > last_no)
+                notices = session.scalars(query).all()
+                if not notices:
+                    if targets is None:
+                        break
+                    continue
+                licenses: dict[str, list[BidLicenseLimit]] = defaultdict(list)
+                for row in session.scalars(select(BidLicenseLimit).where(
+                    BidLicenseLimit.bid_ntce_no.in_([notice.bid_ntce_no for notice in notices]),
+                    BidLicenseLimit.superseded_at.is_(None),
+                )):
+                    licenses[row.bid_ntce_no].append(row)
+                for notice in notices:
+                    rows = licenses[notice.bid_ntce_no]
+                    legacy = not rows and bool(notice.matched_indstryty_cds)
+                    license_codes = set()
+                    if rows:
+                        current_ord = (notice.bid_ntce_ord or "").strip()
+                        if current_ord:
+                            # 현재 차수가 없으면 이전 차수로 참가 가능 여부를 추정하지 않는다.
+                            selected_ord = normalize_order(current_ord)
+                        else:
+                            try:
+                                selected_ord = max(int(row.bid_ntce_ord) for row in rows)
+                            except ValueError:
+                                selected_ord = normalize_order(max(
+                                    row.bid_ntce_ord.strip().zfill(3) for row in rows
+                                ))
+                        for row in rows:
+                            if normalize_order(row.bid_ntce_ord) == selected_ord:
+                                license_codes.update(_split_codes(row.lcns_cd))
+                                license_codes.update(_split_codes(row.permsn_cds))
+                    elif legacy:
+                        license_codes = _split_codes(notice.matched_indstryty_cds)
+                    result = classify_notice(
+                        indstryty_lmt_yn=notice.indstryty_lmt_yn,
+                        pub_prcrmnt_clsfc_nm=notice.pub_prcrmnt_clsfc_nm,
+                        bid_ntce_nm=notice.bid_ntce_nm,
+                        license_codes=license_codes,
+                        match_codes=codes,
+                        rules=rules,
+                    )
+                    if legacy:
+                        # 면허가 없는 기존 공고의 유일한 업종 근거는 숨겨져도 보존한다.
+                        result = replace(result, matched_indstryty_cds=notice.matched_indstryty_cds)
+                    yield notice, result
                 if targets is None:
-                    break
-                continue
-            licenses: dict[str, list[BidLicenseLimit]] = defaultdict(list)
-            for row in session.scalars(select(BidLicenseLimit).where(
-                BidLicenseLimit.bid_ntce_no.in_([notice.bid_ntce_no for notice in notices]),
-                BidLicenseLimit.superseded_at.is_(None),
-            )):
-                licenses[row.bid_ntce_no].append(row)
-            for notice in notices:
-                rows = licenses[notice.bid_ntce_no]
-                legacy = not rows and bool(notice.matched_indstryty_cds)
-                license_codes = set()
-                if rows:
-                    current_ord = (notice.bid_ntce_ord or "").strip()
-                    if current_ord:
-                        # 현재 차수가 없으면 이전 차수로 참가 가능 여부를 추정하지 않는다.
-                        selected_ord = normalize_order(current_ord)
-                    else:
-                        try:
-                            selected_ord = max(int(row.bid_ntce_ord) for row in rows)
-                        except ValueError:
-                            selected_ord = normalize_order(max(
-                                row.bid_ntce_ord.strip().zfill(3) for row in rows
-                            ))
-                    for row in rows:
-                        if normalize_order(row.bid_ntce_ord) == selected_ord:
-                            license_codes.update(_split_codes(row.lcns_cd))
-                            license_codes.update(_split_codes(row.permsn_cds))
-                elif legacy:
-                    license_codes = _split_codes(notice.matched_indstryty_cds)
-                result = classify_notice(
-                    indstryty_lmt_yn=notice.indstryty_lmt_yn,
-                    pub_prcrmnt_clsfc_nm=notice.pub_prcrmnt_clsfc_nm,
-                    bid_ntce_nm=notice.bid_ntce_nm,
-                    license_codes=license_codes,
-                    match_codes=codes,
-                    rules=rules,
-                )
-                if legacy:
-                    # 면허가 없는 기존 공고의 유일한 업종 근거는 숨겨져도 보존한다.
-                    result = replace(result, matched_indstryty_cds=notice.matched_indstryty_cds)
-                yield notice, result
-            if targets is None:
-                last_no = notices[-1].bid_ntce_no
+                    last_no = notices[-1].bid_ntce_no
+
+    return iterate()
 
 
 def reclassify_notices(
