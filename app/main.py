@@ -5487,7 +5487,9 @@ async def config_rules_test_apply(request: Request):
     try:
         stats = await run_in_threadpool(save)
     except rule_test.StaleRulesError:
-        return _rule_test_reload_redirect(data, "stale")
+        view = await run_in_threadpool(_rule_test_view, data, err=rule_test.STALE_MESSAGE)
+        view.stale = True
+        return HTMLResponse(_render_rule_test_page(view), status_code=409)
     except rule_test.DraftValidationError as exc:
         err = str(exc)
     except Exception:

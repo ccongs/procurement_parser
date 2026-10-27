@@ -93,14 +93,18 @@ def client(tmp_path, monkeypatch):
         ))
         s.commit()
 
-    def _make_local():
-        return Local()
-
     monkeypatch.setattr(main, "SessionLocal", Local)
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    monkeypatch.setattr(main.scheduler, "start_scheduler", lambda **kwargs: None)
+    monkeypatch.setattr(main.scheduler, "shutdown_scheduler", lambda: None)
     monkeypatch.setenv("USE_ANALYSIS_PROVIDER", "true")  # btn-analyze 존재 전제 테스트: 명시적 true 설정
 
-    with TestClient(main.app, raise_server_exceptions=True) as c:
-        yield c
+    try:
+        with TestClient(main.app, raise_server_exceptions=True) as c:
+            yield c
+    finally:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------

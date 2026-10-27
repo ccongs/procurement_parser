@@ -42,11 +42,16 @@ def client(tmp_path, monkeypatch):
         classifier.reclassify_notices(session)
     monkeypatch.setattr(main, "SessionLocal", local)
     monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    monkeypatch.setattr(main.scheduler, "start_scheduler", lambda **kwargs: None)
+    monkeypatch.setattr(main.scheduler, "shutdown_scheduler", lambda: None)
     monkeypatch.setattr(main.scheduler, "is_running", lambda: False)
     monkeypatch.setattr(main.scheduler, "get_next_run_time", lambda *args: None)
-    with TestClient(main.app) as test_client:
-        yield test_client
-    engine.dispose()
+    try:
+        with TestClient(main.app) as test_client:
+            yield test_client
+    finally:
+        engine.dispose()
 
 
 def _state(no):
@@ -1166,29 +1171,44 @@ def test_rule_test_stale_whole_set_fingerprint_refuses_changes(client, monkeypat
     expected_filters = {"dt_from": [data["dt_from"]], "dt_to": [data["dt_to"]], "q": [data["search"]]}
     assert parse_qs(urlsplit(reload_url).query) == expected_filters
     response = _apply(client, {**data, "fingerprint": fingerprint})
-    assert response.status_code == 303
-    location = response.headers["location"]
-    assert urlsplit(location).fragment == ""
-    assert parse_qs(urlsplit(location).query) == {"err": ["stale"], **expected_filters}
-    refreshed = client.get(location)
+    assert response.status_code == 409
+    assert "location" not in response.headers
+    assert rule_test.STALE_MESSAGE in response.text
+    assert 'id="preview"' not in response.text
+    assert 'window.location.hash' not in response.text
+    assert response.text.index("초안 편집") < response.text.index(rule_test.STALE_MESSAGE) < response.text.index('<textarea')
+    preserved = {kind: html.unescape(re.search(
+        rf'<textarea name="{kind}"[^>]*>(.*?)</textarea>', response.text, re.S)[1])
+        for kind, _, _ in repository.RULE_FIELDS}
+    preserved.update({field: html.unescape(re.search(
+        rf'name="{field}" value="([^"]*)"', response.text)[1])
+        for field in ("fingerprint", "dt_from", "dt_to", "search")})
+    assert preserved == {**data, "fingerprint": fingerprint}
+    assert '&lt;검색&amp;&quot;값&gt;' in response.text
+    assert html.unescape(re.search(
+        r'<a href="([^"]+)">현재 규칙 다시 불러오기\(초안 버림\)</a>', response.text)[1]) == reload_url
+    assert "현재 상태로 계산한 미리보기" not in response.text
+    assert _database_state() == before
+    repeated = _apply(client, preserved)
+    assert repeated.status_code == 409
+    assert repeated.text == response.text
+    assert _database_state() == before
+
+    refreshed = client.get(reload_url)
     assert refreshed.status_code == 200
-    assert rule_test.STALE_MESSAGE in refreshed.text
-    assert 'id="preview"' not in refreshed.text
-    assert 'window.location.hash' not in refreshed.text
-    assert refreshed.text.index("초안 편집") < refreshed.text.index(rule_test.STALE_MESSAGE) < refreshed.text.index('<textarea')
-    new_fingerprint = re.search(r'name="fingerprint" value="([^"]*)"', refreshed.text)[1]
-    assert new_fingerprint != fingerprint
-    assert 'name="dt_from" value="2026-10-01"' in refreshed.text
-    assert 'name="dt_to" value="2026-10-07"' in refreshed.text
-    assert '&lt;검색&amp;&quot;값&gt;' in refreshed.text
-    assert "현재 상태로 계산한 미리보기" not in client.get(reload_url).text
-    assert client.get(location).text == refreshed.text  # 새로고침은 GET만 반복한다.
+    assert "현재 상태로 계산한 미리보기" not in refreshed.text
+    assert rule_test.STALE_MESSAGE not in refreshed.text
+    fresh_data = _rule_test_page_form(refreshed.text)
+    assert fresh_data["fingerprint"] != fingerprint
+    assert fresh_data["keyword"] != data["keyword"]
+    assert fresh_data["dt_from"] == data["dt_from"]
+    assert fresh_data["dt_to"] == data["dt_to"]
+    assert fresh_data["search"] == data["search"]
+    assert client.get(reload_url).text == refreshed.text  # 새로고침은 GET만 반복한다.
     assert _database_state() == before
     monkeypatch.setattr(classifier, "reclassify_notices", original)
-    fresh_data = {kind: html.unescape(re.search(
-        rf'<textarea name="{kind}"[^>]*>(.*?)</textarea>', refreshed.text, re.S)[1])
-        for kind, _, _ in repository.RULE_FIELDS}
-    assert _apply(client, {**data, **fresh_data, "fingerprint": new_fingerprint}).status_code == 303
+    applied = _apply(client, fresh_data)
+    assert applied.status_code == 303 and "applied=1" in applied.headers["location"]
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])

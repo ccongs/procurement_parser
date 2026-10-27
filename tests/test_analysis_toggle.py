@@ -89,9 +89,16 @@ def client_with_seed(tmp_path, monkeypatch):
         s.commit()
 
     monkeypatch.setattr(main, "SessionLocal", Local)
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    monkeypatch.setattr(main.scheduler, "start_scheduler", lambda **kwargs: None)
+    monkeypatch.setattr(main.scheduler, "shutdown_scheduler", lambda: None)
 
-    with TestClient(main.app, raise_server_exceptions=True) as c:
-        yield c, monkeypatch
+    try:
+        with TestClient(main.app, raise_server_exceptions=True) as c:
+            yield c, monkeypatch
+    finally:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------

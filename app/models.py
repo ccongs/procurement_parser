@@ -5,8 +5,7 @@
 `documents/phase2-collection-spec.md` §5를 기준으로 한다.
 
 - PostgreSQL 이전을 대비해 SQLAlchemy ORM 표준 타입만 사용한다(SQLite 전용 기능 금지).
-- 테이블 4종: bid_notice(입찰공고) / collection_run(실행 이력) / app_config(수집 설정)
-  / pre_spec(사전규격, Phase 5.1 추가).
+- init_db()는 모델에 정의된 테이블 전체를 생성하고 app_config 기본값·목록 규칙(1회)을 시드한다.
 - 수집/변환/스케줄러 로직은 이번 단계(3.1)에서 만들지 않는다.
 - pre_spec 의 변환/수집/화면 로직은 Phase 5.2 이후에서 만든다(5.1은 모델/타입만).
 """
@@ -203,6 +202,7 @@ class SchemaMigration(Base):
     __tablename__ = "schema_migration"
 
     name = Column(String(100), primary_key=True)
+    # naive UTC(_utcnow) — 다른 열 일부는 지역 시각을 쓴다.
     applied_at = Column(DateTime, nullable=False, default=_utcnow)
 
 
