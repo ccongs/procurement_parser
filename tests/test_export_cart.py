@@ -337,6 +337,7 @@ class TestApiExportCart:
             assert query["include_past"] == ["1"]
             assert query["excl_kw"] == [""]
             assert query["excl_kw_set"] == ["1"]
+            assert query["price_set"] == ["1"]
         assert parse_qs(urlparse(bid["search_url"]).query)["excl_privt"] == ["0"]
 
     def test_add_duplicate_ignored(self, client):

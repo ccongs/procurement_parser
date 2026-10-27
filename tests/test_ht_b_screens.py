@@ -3,6 +3,7 @@
 import asyncio
 import html
 import io
+import logging
 import re
 import zipfile
 from contextlib import asynccontextmanager
@@ -166,6 +167,51 @@ def test_zip_stream_limits_and_failures(client, monkeypatch, path, case):
         assert responses[0].read_count == 0
 
 
+@pytest.mark.parametrize("path", ["/list/B0", "/pre-spec/P0"])
+@pytest.mark.parametrize("case", [
+    "partial_declared", "partial_chunked", "first_declared", "first_chunked",
+    "failure_then_limit", "all_fail",
+])
+def test_zip_limit_warning_and_empty_result_message(client, monkeypatch, caplog, path, case):
+    responses = [_StreamResponse([b"abc"]) for _ in range(3)]
+    partial = case.startswith("partial_")
+    limit_index = 1 if partial or case == "failure_then_limit" else 0
+    if case == "all_fail":
+        for response in responses:
+            response.fail = True
+    else:
+        responses[limit_index] = (
+            _StreamResponse([b"never read"], length=11)
+            if case.endswith("declared") or case == "failure_then_limit"
+            else _StreamResponse([b"12345678", b"901", b"never read"])
+        )
+        if case == "failure_then_limit":
+            responses[0].fail = True
+    opened, closed = _fake_downloads(monkeypatch, responses)
+    with caplog.at_level(logging.WARNING, logger=main.logger.name):
+        response = client.get(f"{path}/files.zip")
+    assert closed == opened
+    warnings = [record for record in caplog.records
+                if record.getMessage().startswith("zip 누적 총량 상한 초과")]
+    if case == "all_fail":
+        assert response.status_code == 502
+        assert response.text == "첨부 다운로드에 모두 실패했습니다."
+        assert not warnings
+        assert opened == [0, 1, 2]
+    else:
+        assert opened == list(range(limit_index + 1))
+        assert len(warnings) == 1
+        assert warnings[0].args == (path.rsplit("/", 1)[1], limit_index + 1, 3 if partial else 0)
+        if partial:
+            assert response.status_code == 200
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                assert len(archive.namelist()) == 1
+                assert archive.read(archive.namelist()[0]) == b"abc"
+        else:
+            assert response.status_code == 502
+            assert response.text == "첨부 크기가 제한을 초과했습니다."
+
+
 def _rows(text):
     return set(re.findall(r'<tr data-row-id="([^"]+)">', text))
 
@@ -284,14 +330,14 @@ def test_pre_spec_responsive_filter_css(client):
     assert 'style="min-width:260px;"' not in form
     assert 'style="min-width:220px;"' not in form
     selector = '.filter-card form[action="/pre-spec"]'
-    for width in (700, 480):
-        blocks = re.findall(rf'@media \(max-width: {width}px\) \{{(.*?)\n  \}}', main.BASE_CSS, re.S)
-        block = next(block for block in blocks if selector in block)
-        assert selector + ' .field' in block
-        assert selector + ' .kw-field' in block
-        assert 'min-width: 0; width: 100%' in block
     block = next(block for block in re.findall(r'@media \(max-width: 700px\) \{(.*?)\n  \}', main.BASE_CSS, re.S)
                  if selector in block)
+    assert selector + ' .field' in block
+    assert selector + ' .kw-field' in block
+    assert 'min-width: 0; width: 100%' in block
+    narrow_blocks = re.findall(r'@media \(max-width: 480px\) \{(.*?)\n  \}', main.BASE_CSS, re.S)
+    assert all(selector not in block for block in narrow_blocks)
+    assert any('.list-filter .list-group-label' in block for block in narrow_blocks)
     for element in ('.kw-box', '.kw-input', '.kw-wrap', '.quick'):
         assert selector + ' ' + element in block
     assert re.search(r'\.kw-chip\s*\{[^}]*max-width: 100%; min-width: 0;', main.BASE_CSS)
@@ -303,8 +349,9 @@ def test_analysis_keyboard_and_cleanup(client):
     script = main._ANALYSIS_SCRIPT
     for key in ('ArrowDown', 'ArrowUp', 'Home', 'End', 'Escape', 'Tab'):
         assert f"'{key}'" in script
-    assert 'firstItem.focus()' in script
-    assert 'items[index].focus()' in script
+    assert 'firstItem.focus({ preventScroll: true })' in script
+    assert 'items[index].focus({ preventScroll: true })' in script
+    assert "if (index < 0) index = (e.key === 'ArrowUp') ? items.length : -1;" in script
     assert '(index + 1) % items.length' in script
     assert '(index - 1 + items.length) % items.length' in script
     assert "root.querySelector('.analysis-menu-toggle').focus()" in script
@@ -312,10 +359,14 @@ def test_analysis_keyboard_and_cleanup(client):
     assert "var btn = e.target.closest('.btn-analyze[data-status]')" not in script
     assert 'button.btn-analyze.open' not in main.BASE_CSS
     assert 'data-colspan' not in script
+    focus_rule = re.search(r'\.analysis-menu button:focus-visible\s*\{([^}]+)\}', main.BASE_CSS)[1]
+    assert 'background: #f3eeff;' in focus_rule
+    assert 'outline: 2px solid #2767b1;' in focus_rule
+    assert 'outline-offset: -2px;' in focus_rule
     page = client.get('/pre-spec', params=_WIDE).text
     assert '<th>분석</th>' in page
     assert '<td class="analysis-col">' in page
     assert 'data-colspan' not in page
-    assert re.search(r'table:not\(\.listtable\):has\(td.analysis-col\) > thead > tr > th:last-child,\s*'
-                     r'table:not\(\.listtable\) > tbody > tr > td.analysis-col\s*'
+    assert 'table:not(.listtable):has(td.analysis-col) > thead > tr > th:last-child' not in main.BASE_CSS
+    assert re.search(r'table:not\(\.listtable\) > tbody > tr > td.analysis-col\s*'
                      r'\{[^}]*text-align: center;', main.BASE_CSS)

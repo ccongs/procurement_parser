@@ -172,6 +172,8 @@ def iter_classifications(
 
     flush 된 행만 대상이며, 호출자가 필요 시 flush 한다.
     번호 미지정 시 공고일 시작 이상·끝 미만으로 키셋 배치를 조회한다.
+    번호와 공고일 기간은 함께 줄 수 없다(ValueError).
+    인자 검사는 호출 즉시, 질의와 bid_ntce_nos 소비는 순회 때 한다.
     """
     if batch_size <= 0:
         raise ValueError("batch_size 는 양수여야 합니다.")

@@ -161,7 +161,6 @@ def test_done_analysis_button_classes_match_server_and_client_renderers():
         source_type="bid",
         source_id="BID-CLASS-CHECK",
         source_name="분석 버튼 클래스 확인",
-        total_cols=12,
         status="done",
         cell_class="analysis-col",
     )
@@ -188,7 +187,6 @@ def test_done_analysis_button_classes_match_server_and_client_renderers():
             source_type="bid",
             source_id=f"BID-{status.upper()}-CHECK",
             source_name="분석 버튼 상태 확인",
-            total_cols=12,
             status=status,
             cell_class="analysis-col",
         )
