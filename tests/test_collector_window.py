@@ -1268,6 +1268,9 @@ def test_finish_run_commit_failure_rolls_back_notices_licenses_and_classificatio
     original_finish = repository.finish_run
 
     def finish_with_failure(session, run, **kwargs):
+        # 정리 단계의 failed 커밋은 허용하고 정상 종료 커밋에만 한 번 실패를 주입한다.
+        if kwargs["status"] == "failed":
+            return original_finish(session, run, **kwargs)
         def fail_before_commit(session):
             session.flush()
             assert session.get(BidNotice, "OLD").bid_ntce_nm == "변경"
@@ -1291,7 +1294,8 @@ def test_finish_run_commit_failure_rolls_back_notices_licenses_and_classificatio
         for model in (BidLicenseLimit, BidNoticeRaw):
             assert session.scalar(select(func.count()).select_from(model)) == 0
         run = session.scalar(select(CollectionRun))
-        assert run.status == "running" and run.run_finished_at is None
+        assert run.status == "failed" and run.run_finished_at is not None
+        assert "RuntimeError" in run.error_msg
         assert session.get(AppConfig, 1).last_success_dt is None
 
 
@@ -1677,6 +1681,9 @@ def test_superseded_and_restored_roll_back_with_classification_and_run(
         check_then_fail(session)
 
     def finish_then_fail(session, run, **kwargs):
+        # 정상 종료에만 실패를 주입하고 예외 정리 커밋은 허용한다.
+        if kwargs["status"] == "failed":
+            return original_finish(session, run, **kwargs)
         detail = json.loads(kwargs["detail_json"])["by_call"]["license_fix"]
         assert detail["superseded"] == detail["restored"] == 1
         event.listen(session, "before_commit", check_then_fail, once=True)
@@ -1696,7 +1703,8 @@ def test_superseded_and_restored_roll_back_with_classification_and_run(
         notice = session.get(BidNotice, "ATOMIC")
         assert notice.list_visible is False and notice.match_basis is None and notice.bid_ntce_nm is None
         run = session.scalars(select(CollectionRun)).one()
-        assert run.status == "running" and run.run_finished_at is None and run.detail_json is None
+        assert run.status == "failed" and run.run_finished_at is not None and run.detail_json is None
+        assert "RuntimeError" in run.error_msg
         assert session.get(AppConfig, 1).last_success_dt is None
         assert session.get(LicenseVerification, ("ATOMIC", "000")) is None
 
@@ -2999,6 +3007,9 @@ def test_expired_pending_rolls_back_with_failed_finish_commit(monkeypatch, db_en
     original_finish = repository.finish_run
 
     def fail_finish(session, run, **kwargs):
+        # 정상 종료 커밋의 한 번 실패 뒤 정리 커밋은 허용한다.
+        if kwargs["status"] == "failed":
+            return original_finish(session, run, **kwargs)
         def before_commit(session):
             state = session.get(LicenseVerification, ("EXPIRED-ATOMIC", "000"))
             assert state.pending_since is None and state.gave_up_at == WIN_END
@@ -3016,7 +3027,8 @@ def test_expired_pending_rolls_back_with_failed_finish_commit(monkeypatch, db_en
         state = session.get(LicenseVerification, ("EXPIRED-ATOMIC", "000"))
         assert state.pending_since == pending and state.gave_up_at is None and state.attempts == 2
         run = session.scalar(select(CollectionRun))
-        assert run.status == "running" and run.detail_json is None
+        assert run.status == "failed" and run.run_finished_at is not None and run.detail_json is None
+        assert "RuntimeError" in run.error_msg
 
 
 @pytest.mark.parametrize("halt", [False, True])

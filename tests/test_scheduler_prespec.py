@@ -131,7 +131,7 @@ def test_tick_pre_spec_backfill_window_when_no_last_success(monkeypatch):
 
     window_bgn, window_end, _ = calls[0]
     assert window_bgn == now - timedelta(days=30)
-    assert window_end == now
+    assert window_end == now - timedelta(days=2)  # 첫 28일 조각 후 None 반환으로 중단
 
 
 def test_tick_pre_spec_swallows_collect_exception(monkeypatch):
@@ -471,12 +471,12 @@ def test_tick_pre_spec_scheduled_twice_no_dup(monkeypatch, sched_db):
         assert total == 2  # PK 중복 0(2건만)
         pks = s.execute(select(PreSpec.bf_spec_rgst_no)).scalars().all()
         assert len(pks) == len(set(pks)) == 2
-        # source 분포: pre_spec run 2건.
+        # 최초 30일 백필 2조각 + 다음 tick 1조각: pre_spec run 3건.
         ps_runs = s.execute(
             select(func.count()).select_from(CollectionRun).where(
                 CollectionRun.source == "pre_spec"
             )
         ).scalar_one()
-        assert ps_runs == 2
+        assert ps_runs == 3
     finally:
         s.close()

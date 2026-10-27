@@ -39,6 +39,7 @@ from app.collector import classify_result_code, fmt_dt, total_pages
 from app.db import SessionLocal, init_db
 from app.models import CollectionRun
 from app.transform import item_to_pre_spec_values
+from app.window_split import collect_in_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def _fetch_pre_spec(
                     "outcome": "halt",
                     "halt_code": halt_code,
                     "error_msg": f"resultCode={halt_code} "
-                    f"({api_client.ERROR_CODES.get(halt_code or '', '알 수 없는 코드')})",
+                    f"({result.result_msg or api_client.ERROR_CODES.get(halt_code or '', '알 수 없는 코드')})",
                 }
             if outcome == "failed":
                 return {
@@ -224,6 +225,8 @@ def collect_pre_spec_window(
     `set_halt`·`update_last_success_dt` 를 호출하지 않는다.
     """
     session = SessionLocal()
+    run_id = None
+    retry_count = 0
     try:
         config = repository.get_config(session)
 
@@ -237,6 +240,7 @@ def collect_pre_spec_window(
         run = repository.create_run(
             session, trigger, window_bgn, window_end, source="pre_spec"
         )
+        run_id = run.id
 
         logger.info(
             "사전규격 수집 시작: trigger=%s window=%s~%s swBizObjYn=%s",
@@ -247,6 +251,7 @@ def collect_pre_spec_window(
         )
 
         r = _fetch_pre_spec(window_bgn, window_end, snapshot)
+        retry_count = r["retry_count"]
         detail_json = _build_detail_json(r)
 
         # --- halt 발생: 저장하지 않고 중단(failed). set_halt 호출 안 함(§2). ---
@@ -325,6 +330,21 @@ def collect_pre_spec_window(
             r["retry_count"],
         )
         return _detach_run(session, run)
+    except Exception as exc:
+        try:
+            session.rollback()
+            if run_id is not None:
+                failed_run = session.get(CollectionRun, run_id)
+                if failed_run is not None and failed_run.status == "running":
+                    repository.finish_run(
+                        session, failed_run, status="failed", total_fetched=0,
+                        total_new=0, total_updated=0, retry_count=retry_count,
+                        error_code=None,
+                        error_msg=f"처리 중 예외로 중단: {type(exc).__name__}: {exc}"[:500],
+                    )
+        except Exception:
+            logger.exception("예외로 중단된 사전규격 실행 기록 정리 실패(run_id=%s)", run_id)
+        raise
     finally:
         session.close()
 
@@ -340,7 +360,7 @@ def _run_backfill() -> None:
     window_end = datetime.now()
     window_bgn = window_end - timedelta(days=backfill_days)
 
-    run = collect_pre_spec_window(window_bgn, window_end, trigger="backfill")
+    run = collect_in_chunks(collect_pre_spec_window, window_bgn, window_end, trigger="backfill")
     if run is None:
         print("사전규격 수집이 실행되지 않았습니다(로그 확인).")
         return

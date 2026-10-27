@@ -38,6 +38,7 @@ PRESPEC_BASE_URL = os.getenv(
     "http://apis.data.go.kr/1230000/ao/HrcspSsstndrdInfoService",
 ).strip().rstrip("/")
 DEFAULT_RESPONSE_TYPE = os.getenv("PROCUREMENT_RESPONSE_TYPE", "json").strip() or "json"
+_ERROR_ENVELOPE_KEYS = ("nkoneps.com.response.ResponseError",)
 
 
 # --- 에러코드 (00-common.md 참고) ---------------------------------------
@@ -214,11 +215,18 @@ def _extract_from_parsed(parsed: Any) -> tuple[str | None, str | None, list[dict
         return None, None, [], None
 
     response = parsed.get("response", parsed)
+    error_envelope = False
+    if "response" not in parsed:
+        for key in _ERROR_ENVELOPE_KEYS:
+            if key in parsed:
+                response = parsed[key]
+                error_envelope = True
+                break
     if not isinstance(response, dict):
         return None, None, [], None
 
     header = response.get("header") or {}
-    body = response.get("body") or {}
+    body = {} if error_envelope else response.get("body") or {}
 
     result_code = header.get("resultCode")
     result_msg = header.get("resultMsg")
