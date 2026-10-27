@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, func, inspect, select, text
@@ -125,13 +126,16 @@ def test_tick_pre_spec_backfill_window_when_no_last_success(monkeypatch):
         backfill_days=30,
         pre_spec_last_success_dt=None,
     )
-    calls = _patch_tick_pre_spec(monkeypatch, config)
+    calls = []
 
+    def collect(bgn, end, trigger="manual"):
+        calls.append((bgn, end))
+        return SimpleNamespace(status="success")
+
+    _patch_tick_pre_spec(monkeypatch, config, collect)
     scheduler.tick_pre_spec(now=now)
-
-    window_bgn, window_end, _ = calls[0]
-    assert window_bgn == now - timedelta(days=30)
-    assert window_end == now - timedelta(days=2)  # 첫 28일 조각 후 None 반환으로 중단
+    assert calls == [(now - timedelta(days=30), now - timedelta(days=2)),
+                     (now - timedelta(days=2), now)]
 
 
 def test_tick_pre_spec_swallows_collect_exception(monkeypatch):
@@ -365,6 +369,11 @@ def test_auto_migration_adds_columns_idempotent(monkeypatch, tmp_path):
     assert "source" in cr_cols
     assert "pre_spec_enabled" in ac_cols
     assert "pre_spec_last_success_dt" in ac_cols
+
+    with engine.connect() as conn:
+        columns = {row[1]: row for row in conn.execute(text("PRAGMA table_info(app_config)"))}
+    assert columns["pre_spec_enabled"][4] == "TRUE"
+    assert columns["pre_spec_last_success_dt"][2] == "TIMESTAMP"
 
     # 기존 collection_run 행 source 기본 'bid'(무손상), app_config pre_spec_enabled truthy.
     s = Session()

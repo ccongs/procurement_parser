@@ -3,13 +3,13 @@
 APScheduler BackgroundScheduler 로 수집을 주기 실행한다. **두 개의 통합 잡**을 같은
 스케줄러·같은 interval 로 운영한다:
 - 입찰 잡(`collect`): tick → 게이트(enabled/auto_halted) → 윈도우(last_success_dt) →
-  collector.collect_window(trigger="scheduled").
+  window_split.collect_in_chunks로 28일 이하 조각을 차례로 수집(성공 아닌 조각에서 중단).
 - 사전규격 잡(`collect_pre_spec`, 5.4): tick_pre_spec → 게이트(**pre_spec_enabled 단독**,
   입찰 auto_halted 와 무관) → 윈도우(pre_spec_last_success_dt) →
-  pre_spec_collector.collect_pre_spec_window(trigger="scheduled").
+  window_split.collect_in_chunks로 28일 이하 조각을 차례로 수집(성공 아닌 조각에서 중단).
 
 수집/페이징/dedup/upsert/재시도/halt/collection_run 기록/last_success 갱신은 전부
-각 collect_*_window 안에 있다. 스케줄러는 **"언제·어떤 윈도우로 collect 를 부를지"만**
+각 collect_*_window 안에 있다. 스케줄러는 **언제·어떤 창을 나누어 차례로 수집할지**
 책임진다(수집 로직을 재구현하지 않는다). 두 잡은 같은 순수 헬퍼(compute_window)를 공유한다.
 
 화면(/list·/config·/api-test)·FastAPI 통합, interval 동적 재스케줄은 3.5.
@@ -76,7 +76,9 @@ def should_autostart(enabled: bool, auto_halted: bool, pre_spec_enabled: bool) -
 
 # --- 주기 잡 ------------------------------------------------------------
 def tick(now: datetime | None = None) -> None:
-    """주기마다 1회: 게이트 확인 → 윈도우 산정 → collect_window(trigger='scheduled').
+    """주기마다 1회: 게이트 확인 → 윈도우 산정 → window_split.collect_in_chunks.
+
+    창을 28일 이하 조각으로 나눠 차례로 수집하며 성공이 아닌 조각에서 멈춘다.
 
     - 매 호출마다 최신 설정을 다시 읽는다(/config 편집 즉시 반영). 짧은 세션으로 읽고
       필요한 스칼라 값만 들고 나간다(ORM 객체를 잡 바깥으로 들고 다니지 않음).
@@ -124,7 +126,9 @@ def tick(now: datetime | None = None) -> None:
 
 
 def tick_pre_spec(now: datetime | None = None) -> None:
-    """사전규격 주기 잡(Phase 5.4): 게이트(pre_spec_enabled) → 윈도우 → collect_pre_spec_window.
+    """사전규격 주기 잡(Phase 5.4): 게이트(pre_spec_enabled) → 윈도우 → window_split.collect_in_chunks.
+
+    창을 28일 이하 조각으로 나눠 차례로 수집하며 성공이 아닌 조각에서 멈춘다.
 
     입찰 `tick` 과 동형이되 **게이트가 `pre_spec_enabled` 단독**이다. 입찰 `auto_halted` 를
     쓰지 않으므로(사전규격은 입찰 중단과 무관) `should_run` 을 호출하지 않는다.

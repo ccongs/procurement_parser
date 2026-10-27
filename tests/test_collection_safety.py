@@ -267,3 +267,21 @@ def test_already_finished_run_is_not_finished_again(monkeypatch, local_db, sourc
     assert finishes == (["failed"] if halted else ["success"])
     with local_db() as session:
         assert session.scalars(select(CollectionRun)).one().status == finishes[0]
+
+
+@pytest.mark.parametrize("source", ["bid", "pre_spec"])
+@pytest.mark.parametrize("api_message", ["SERVICE_KEY_IS_NOT_REGISTERED_ERROR", ""])
+def test_halt_reason_keeps_internal_hint_and_api_message(monkeypatch, local_db, source, api_message):
+    def call(op, params, **kwargs):
+        return api_client.ApiResult(operation=op, request_url="", sent_params={}, response_type="json",
+            status_code=200, raw_text="", parsed=None, result_code="30", result_msg=api_message,
+            items=[], total_count=None)
+
+    monkeypatch.setattr(api_client, "call_endpoint", call)
+    collect = collector.collect_window if source == "bid" else pre_spec_collector.collect_pre_spec_window
+    run = collect(BGN, NOW)
+    assert run.status == "failed" and run.error_code == "30"
+    assert "등록되지 않은 서비스 키 (키 오류 또는 URL 인코딩 문제)" in run.error_msg
+    assert (" — API: " in run.error_msg) == bool(api_message)
+    if api_message:
+        assert api_message in run.error_msg

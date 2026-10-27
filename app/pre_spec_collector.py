@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app import api_client, repository
-from app.collector import classify_result_code, fmt_dt, total_pages
+from app.collector import _halt_message, _OK_CODES, classify_result_code, fmt_dt, total_pages
 from app.db import SessionLocal, init_db
 from app.models import CollectionRun
 from app.transform import item_to_pre_spec_values
@@ -89,6 +89,20 @@ def _call_with_retry(
         time.sleep(_RETRY_BACKOFF_SECONDS * used_retries)  # 선형 백오프
 
 
+def _count_unique_items(items: list[dict]) -> int:
+    """사전규격 등록번호로 중복을 세며 번호가 없는 행은 각각 수신 건수에 포함한다."""
+    keys = set()
+    unkeyed = 0
+    for item in items:
+        key = item.get("bfSpecRgstNo") if isinstance(item, dict) else None
+        key = str(key).strip() if key is not None else ""
+        if key:
+            keys.add(key)
+        else:
+            unkeyed += 1
+    return len(keys) + unkeyed
+
+
 def _fetch_pre_spec(
     window_bgn: datetime,
     window_end: datetime,
@@ -103,10 +117,11 @@ def _fetch_pre_spec(
     반환 dict: items, pages, last_code, retry_count, outcome, halt_code, error_msg.
       outcome ∈ {"ok","failed","halt"}.
     """
+    page_size = max(1, min(snapshot.num_of_rows, 999))
     base_params: dict[str, str] = {
         "inqryDiv": INQRY_DIV,
         "swBizObjYn": SW_BIZ_OBJ_YN,  # §6 고정 필터
-        "numOfRows": str(snapshot.num_of_rows),
+        "numOfRows": str(page_size),
         "inqryBgnDt": fmt_dt(window_bgn),
         "inqryEndDt": fmt_dt(window_end),
     }
@@ -117,6 +132,15 @@ def _fetch_pre_spec(
     last_code: str | None = None
     max_page: int | None = None
     page = 1
+    total_count = None
+    paging_flags = {}
+
+    def summary(outcome, error_msg=None, halt_code=None, **flags):
+        return {"items": items, "pages": pages_fetched, "last_code": last_code,
+                "retry_count": retry_count, "outcome": outcome, "halt_code": halt_code,
+                "error_msg": error_msg, "total_count": total_count,
+                "unique_items": _count_unique_items(items), "page_size": page_size,
+                **paging_flags, **flags}
 
     try:
         while True:
@@ -126,37 +150,37 @@ def _fetch_pre_spec(
             last_code = result.result_code
 
             if outcome == "halt":
-                halt_code = result.result_code
-                return {
-                    "items": items,
-                    "pages": pages_fetched,
-                    "last_code": last_code,
-                    "retry_count": retry_count,
-                    "outcome": "halt",
-                    "halt_code": halt_code,
-                    "error_msg": f"resultCode={halt_code} "
-                    f"({result.result_msg or api_client.ERROR_CODES.get(halt_code or '', '알 수 없는 코드')})",
-                }
+                return summary("halt", _halt_message(result), result.result_code)
             if outcome == "failed":
-                return {
-                    "items": items,
-                    "pages": pages_fetched,
-                    "last_code": last_code,
-                    "retry_count": retry_count,
-                    "outcome": "failed",
-                    "halt_code": None,
-                    "error_msg": result.error
-                    or f"일시 장애 재시도 소진(resultCode={last_code})",
-                }
+                return summary("failed", result.error
+                               or f"일시 장애 재시도 소진(resultCode={last_code})")
 
             # outcome == "ok"
             pages_fetched += 1
             if result.result_code == "03":  # No Data → 종료
+                try:
+                    response_total_count = int(str(result.total_count).strip())
+                    if (total_count is not None and response_total_count >= 0
+                            and response_total_count != total_count):
+                        paging_flags["total_count_changed"] = True
+                except ValueError:
+                    pass  # 입찰과 동일하게 03은 totalCount 없이도 정상 종료한다.
+                if total_count is None:
+                    total_count = 0
                 break
             items.extend(result.items)
 
+            try:
+                response_total_count = int(str(result.total_count).strip())
+                if response_total_count < 0:
+                    raise ValueError
+            except ValueError:
+                return summary("failed", "totalCount 누락/오류")
             if max_page is None:
-                max_page = total_pages(result.total_count, snapshot.num_of_rows)
+                total_count = response_total_count
+                max_page = total_pages(total_count, page_size)
+            elif response_total_count != total_count:
+                paging_flags["total_count_changed"] = True
 
             if page >= max_page:
                 break
@@ -166,29 +190,19 @@ def _fetch_pre_spec(
                     _MAX_PAGES_SAFETY,
                     result.total_count,
                 )
-                break
+                return summary("failed", f"안전 상한({_MAX_PAGES_SAFETY}페이지) 도달 — 잘린 수집",
+                               truncated=True)
             page += 1
     except api_client.ApiClientError as exc:
-        # 파라미터/키 등 클라이언트 측 오류 — 일시 장애로 보지 않고 실패 처리.
-        return {
-            "items": items,
-            "pages": pages_fetched,
-            "last_code": last_code,
-            "retry_count": retry_count,
-            "outcome": "failed",
-            "halt_code": None,
-            "error_msg": f"ApiClientError: {exc}",
-        }
+        return summary("failed", f"ApiClientError: {exc}")
 
-    return {
-        "items": items,
-        "pages": pages_fetched,
-        "last_code": last_code,
-        "retry_count": retry_count,
-        "outcome": "ok",
-        "halt_code": None,
-        "error_msg": None,
-    }
+    unique = _count_unique_items(items)
+    shortfall = unique < total_count
+    message = f"건수 미달: 고유 {unique} / 전체 {total_count}" if shortfall else None
+    duplicates = len(items) - unique
+    if shortfall and duplicates:
+        message += f" (중복 {duplicates})"
+    return summary("failed" if shortfall else "ok", message)
 
 
 def _detach_run(session, run: CollectionRun) -> CollectionRun:
@@ -210,6 +224,12 @@ def _build_detail_json(r: dict[str, Any]) -> str:
         "last_result_code": r["last_code"],
         "items": len(r["items"]),
         "retry_count": r["retry_count"],
+        "error_msg": r.get("error_msg"),
+        "total_count": r.get("total_count"),
+        "unique_items": r.get("unique_items"),
+        "page_size": r.get("page_size"),
+        **({"truncated": True} if r.get("truncated") else {}),
+        **({"total_count_changed": True} if r.get("total_count_changed") else {}),
     }
     return json.dumps(detail, ensure_ascii=False)
 
@@ -295,7 +315,7 @@ def collect_pre_spec_window(
         # --- 상태 판정: failed(재시도 소진) → partial, 그 외 → success ---
         if r["outcome"] == "failed":
             status = "partial"  # 일시 장애로 일부만 수집 → last_success_dt 미갱신(5.4)
-            error_code = r["last_code"]
+            error_code = r["last_code"] if r["last_code"] not in _OK_CODES else None
             error_msg = r["error_msg"]
         else:
             status = "success"
@@ -331,19 +351,9 @@ def collect_pre_spec_window(
         )
         return _detach_run(session, run)
     except Exception as exc:
-        try:
-            session.rollback()
-            if run_id is not None:
-                failed_run = session.get(CollectionRun, run_id)
-                if failed_run is not None and failed_run.status == "running":
-                    repository.finish_run(
-                        session, failed_run, status="failed", total_fetched=0,
-                        total_new=0, total_updated=0, retry_count=retry_count,
-                        error_code=None,
-                        error_msg=f"처리 중 예외로 중단: {type(exc).__name__}: {exc}"[:500],
-                    )
-        except Exception:
-            logger.exception("예외로 중단된 사전규격 실행 기록 정리 실패(run_id=%s)", run_id)
+        repository.fail_running_run(
+            session, run_id, exc, retry_count=retry_count, label="사전규격",
+        )
         raise
     finally:
         session.close()
