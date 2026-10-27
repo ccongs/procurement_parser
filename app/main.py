@@ -33,7 +33,6 @@ from urllib.parse import quote, urlencode
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from app import __version__, api_client, classifier, industry_codes, region_codes, repository, rule_test, scheduler
@@ -58,13 +57,6 @@ from app.analysis.analyzer_service import (
 from app.analysis.provider import analysis_enabled
 
 logger = logging.getLogger(__name__)
-
-
-# --- 분석 API 응답 모델 (Phase 6.2a) ---
-class AnalysisResponse(BaseModel):
-    status: str  # "ok" | "no_file" | "unsupported" | "error"
-    analysis: dict | None = None
-    message: str = ""
 
 
 @asynccontextmanager
@@ -669,6 +661,8 @@ BASE_CSS = """
   table.listtable > tbody > tr > td.file-col,
   table.listtable > tbody > tr > td.analysis-col { padding: 6px 4px; text-align: center; vertical-align: middle; }
   table.listtable button.filebtn { padding-left: 4px; padding-right: 4px; }
+  table:not(.listtable):has(td.analysis-col) > thead > tr > th:last-child,
+  table:not(.listtable) > tbody > tr > td.analysis-col { text-align: center; vertical-align: middle; }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
   td.kindcell { text-align: center; vertical-align: middle; }
   td.kindcell .bidmethd { display: block; margin-top: 4px; color: #8a93a2;
@@ -789,6 +783,23 @@ BASE_CSS = """
     .list-filter .list-summary-main .query-field,
     .list-filter .list-summary-main .price-max-field { min-width: 0; width: 100%; }
   }
+  .filter-card form[action="/pre-spec"] .query-field { min-width: 260px; }
+  .filter-card form[action="/pre-spec"] .instt-field { min-width: 220px; }
+  @media (max-width: 700px) {
+    .filter-card form[action="/pre-spec"] .field,
+    .filter-card form[action="/pre-spec"] .kw-field { min-width: 0; width: 100%; max-width: 100%; }
+    .filter-card form[action="/pre-spec"] .field input,
+    .filter-card form[action="/pre-spec"] .field select,
+    .filter-card form[action="/pre-spec"] .kw-wrap,
+    .filter-card form[action="/pre-spec"] .kw-box { width: 100%; min-width: 0; box-sizing: border-box; }
+    .filter-card form[action="/pre-spec"] .kw-input { min-width: 0; }
+    .filter-card form[action="/pre-spec"] .quick { flex-wrap: wrap; min-width: 0; }
+    .filter-card form[action="/pre-spec"] .kw-chip { box-sizing: border-box; }
+  }
+  @media (max-width: 480px) {
+    .filter-card form[action="/pre-spec"] .field,
+    .filter-card form[action="/pre-spec"] .kw-field { min-width: 0; width: 100%; }
+  }
   .list-card-heading { display: flex; justify-content: space-between; align-items: center;
                         flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
   .list-card-heading h2 { margin: 0; }
@@ -827,7 +838,6 @@ BASE_CSS = """
                        border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
   button.btn-analyze:hover { background: #e8dcff; }
   button.btn-analyze:disabled { opacity: .6; cursor: default; }
-  button.btn-analyze.open { background: #5a3e8a; color: #fff; border-color: #5a3e8a; }
   button.btn-analyze.is-analyzing { border-color: #e0a050; background: #fff4e0; color: #9a5b00; }
   button.btn-analyze.is-analyzing:disabled { opacity: .85; }
   button.btn-analyze.is-done { border-color: #4a9d68; background: #e7f6ec; color: #2f7d4f; }
@@ -1433,14 +1443,12 @@ def _analysis_data_attrs(
     source_type: str,
     source_id: str,
     source_name: str,
-    total_cols: int,
     status: str,
 ) -> str:
     return (
         f'data-status="{_e(status)}" '
         f'data-type="{_e(source_type)}" '
         f'data-id="{_e(source_id)}" '
-        f'data-colspan="{_e(total_cols)}" '
         f'data-name="{_e(source_name)}"'
     )
 
@@ -1460,7 +1468,6 @@ def _render_analysis_cell(
         source_type=source_type,
         source_id=source_id,
         source_name=source_name,
-        total_cols=total_cols,
         status=safe_status,
     )
     td_open = f'<td class="{_e(cell_class)}">' if cell_class else "<td>"
@@ -1548,8 +1555,6 @@ def _render_list_rows(
                 cells.append(_render_list_time_cell(r, _LIST_TIME_FIELDS[kind], col))
             elif kind == "amt":
                 cells.append(f'<td class="budgetcell">{_e(_fmt_amt(val))}</td>')
-            elif kind == "dt":
-                cells.append(f"<td>{_e(_fmt_dt(val))}</td>")
             elif kind == "matchind":
                 cells.append(_render_list_match(r, match_codes))
             elif kind == "ntcekind":
@@ -2323,6 +2328,7 @@ _ANALYSIS_SCRIPT = """
       return type + ':' + id;
     }
 
+    // 메뉴 항목의 동작 정보는 감싸는 .analysis-actions에서 읽는다.
     function getRoot(el) {
       if (!el) return null;
       return el.closest('.analysis-actions') || el.closest('.btn-analyze');
@@ -2336,7 +2342,6 @@ _ANALYSIS_SCRIPT = """
         type: root.getAttribute('data-type') || '',
         id: root.getAttribute('data-id') || '',
         name: root.getAttribute('data-name') || '',
-        colspan: root.getAttribute('data-colspan') || '',
         status: root.getAttribute('data-status') || ''
       };
     }
@@ -2345,7 +2350,6 @@ _ANALYSIS_SCRIPT = """
       return 'data-status="' + esc(status) + '" '
         + 'data-type="' + esc(meta.type) + '" '
         + 'data-id="' + esc(meta.id) + '" '
-        + 'data-colspan="' + esc(meta.colspan || '') + '" '
         + 'data-name="' + esc(meta.name || '') + '"';
     }
 
@@ -2535,8 +2539,7 @@ _ANALYSIS_SCRIPT = """
       _uploadMeta = {
         type: meta.type,
         id: meta.id,
-        name: meta.name,
-        colspan: meta.colspan
+        name: meta.name
       };
       _uploadRoot = getRoot(root);
       _uploadFiles = [];
@@ -2586,6 +2589,8 @@ _ANALYSIS_SCRIPT = """
           root.classList.add('open');
           toggle.setAttribute('aria-expanded', 'true');
           positionMenu(root);
+          var firstItem = root.querySelector('[role="menuitem"]');
+          if (firstItem) firstItem.focus();
         } else {
           closeMenu(root);
         }
@@ -2603,15 +2608,6 @@ _ANALYSIS_SCRIPT = """
           runAnalysis(actionMeta, action);
         } else if (actionName === 'upload') {
           openUploadModal('분석할 파일을 업로드하세요. 여러 개 선택할 수 있습니다.', actionMeta, action);
-        }
-        return;
-      }
-
-      var btn = e.target.closest('.btn-analyze[data-status]');
-      if (btn) {
-        var meta = getMeta(btn);
-        if (meta && (meta.status === 'none' || meta.status === 'error')) {
-          runAnalysis(meta, btn);
         }
         return;
       }
@@ -2730,6 +2726,27 @@ _ANALYSIS_SCRIPT = """
     }
 
     document.addEventListener('keydown', function (e) {
+      var root = e.target.closest('.analysis-actions.open');
+      if (root) {
+        var items = Array.prototype.slice.call(root.querySelectorAll('[role="menuitem"]'));
+        var index = items.indexOf(e.target);
+        if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1 && items.length) {
+          e.preventDefault();
+          if (e.key === 'Home') index = 0;
+          else if (e.key === 'End') index = items.length - 1;
+          else if (e.key === 'ArrowDown') index = (index + 1) % items.length;
+          else index = (index - 1 + items.length) % items.length;
+          items[index].focus();
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          closeMenu(root);
+          root.querySelector('.analysis-menu-toggle').focus();
+          return;
+        }
+        if (e.key === 'Tab') closeMenu(root);
+      }
       if (e.key === 'Escape') {
         var modal = document.getElementById('analysisUploadModal');
         if (modal && modal.classList.contains('open')) closeUploadModal();
@@ -3122,6 +3139,7 @@ def _render_pre_spec_rows(
                 source_name=r.get("prdct_clsfc_no_nm") or "",
                 total_cols=total_cols,
                 status=status,
+                cell_class="analysis-col",
             ))
         body_rows.append(f"<tr data-row-id=\"{row_id}\">{''.join(cells)}</tr>")
     return f"""
@@ -3238,6 +3256,7 @@ def pre_spec_page(
     instt: str | None = None,
     price_min: str | None = None,    # 배정예산액 최소(Phase 4.9-R2-D)
     price_max: str | None = None,    # 배정예산액 최대(Phase 4.9-R2-D)
+    price_set: str | None = None,    # 참이면 빈 가격도 한도 없음으로 명시
     include_past: str | None = None,   # 체크 시 의견마감 지난 항목 포함
     excl_kw: str | None = None,        # 품명/사업명 제외 키워드 CSV(Phase 10)
     excl_kw_set: str | None = None,    # 폼 제출 표식(없으면 설정 기본값 적용)
@@ -3278,9 +3297,13 @@ def pre_spec_page(
 
         price_min_in = price_min if (price_min is not None and str(price_min).strip()) else None
         price_max_in = price_max if (price_max is not None and str(price_max).strip()) else None
-        # 입력칸에 표시할 값(숫자 정규화). 입력이 없으면 설정 기본값.
-        price_min_disp = _parse_price(price_min_in) if price_min_in is not None else _parse_price(cfg_amt_bgn)
-        price_max_disp = _parse_price(price_max_in) if price_max_in is not None else _parse_price(cfg_amt_end)
+        # 명시한 검색은 빈칸을 한도 없음으로, 첫 진입은 설정 기본값으로 해석한다.
+        price_min_disp = (_parse_price(price_min_in)
+                          if price_set in _EXCL_KW_SET_TRUE or price_min_in is not None
+                          else _parse_price(cfg_amt_bgn))
+        price_max_disp = (_parse_price(price_max_in)
+                          if price_set in _EXCL_KW_SET_TRUE or price_max_in is not None
+                          else _parse_price(cfg_amt_end))
 
         # 제외 키워드(Phase 10): /list 와 동일 규칙(폼 제출이면 입력값, 아니면 설정 기본값).
         kw_options = repository.list_exclude_keywords(session)
@@ -3339,6 +3362,7 @@ def pre_spec_page(
         # 원문 CSV를 보존하고 링크를 만들 때 한 번만 URL 인코딩한다.
         "excl_kw": ",".join(excl_kws),
         "excl_kw_set": "1",
+        "price_set": "1",
         "sort": sort,
         "page_size": str(page_size),
     }
@@ -3351,7 +3375,8 @@ def pre_spec_page(
 
     # _filter_card summary: 품명/사업명 검색어 + 검색 버튼.
     summary_html = f"""
-      <label class="field" style="min-width:260px;">
+      <input type="hidden" name="price_set" value="1">
+      <label class="field query-field">
         <span class="flabel">품명/사업명 부분검색</span>
         <input type="text" name="q" value="{_e(q or '')}" placeholder="예: 소프트웨어 유지보수">
       </label>
@@ -3364,7 +3389,7 @@ def pre_spec_page(
         {_excl_kw_field(excl_kws, kw_options, "품명/사업명 제외 키워드")}
       </div>
       <div class="row" style="margin-bottom:10px;">
-        <label class="field" style="min-width:220px;">
+        <label class="field instt-field">
           <span class="flabel">발주/실수요기관 부분검색</span>
           <input type="text" name="instt" value="{_e(instt or '')}" placeholder="예: 행정안전부">
         </label>
@@ -3493,6 +3518,7 @@ def list_page(
     kind: list[str] | None = Query(None),
     price_min: str | None = None,
     price_max: str | None = None,
+    price_set: str | None = None,    # 참이면 빈 가격도 한도 없음으로 명시
     include_past: str | None = None,
     excl_privt: list[str] | None = Query(None),
     excl_kw: str | None = None,
@@ -3553,9 +3579,13 @@ def list_page(
 
         price_min_in = price_min if (price_min is not None and str(price_min).strip()) else None
         price_max_in = price_max if (price_max is not None and str(price_max).strip()) else None
-        # 입력칸에 표시할 값(숫자 정규화). 입력이 없으면 설정 기본값.
-        price_min_disp = _parse_price(price_min_in) if price_min_in is not None else _parse_price(cfg_price_bgn)
-        price_max_disp = _parse_price(price_max_in) if price_max_in is not None else _parse_price(cfg_price_end)
+        # 명시한 검색은 빈칸을 한도 없음으로, 첫 진입은 설정 기본값으로 해석한다.
+        price_min_disp = (_parse_price(price_min_in)
+                          if price_set in _EXCL_KW_SET_TRUE or price_min_in is not None
+                          else _parse_price(cfg_price_bgn))
+        price_max_disp = (_parse_price(price_max_in)
+                          if price_set in _EXCL_KW_SET_TRUE or price_max_in is not None
+                          else _parse_price(cfg_price_end))
 
         # 제외 키워드(Phase 10): 폼 제출(excl_kw_set)이면 입력값 그대로, 아니면 설정 기본값.
         kw_options = repository.list_exclude_keywords(session)
@@ -3626,6 +3656,7 @@ def list_page(
         # 원문 CSV를 보존하고 링크를 만들 때 한 번만 URL 인코딩한다.
         "excl_kw": ",".join(excl_kws),
         "excl_kw_set": "1",
+        "price_set": "1",
         "sort": sort,
         "page_size": str(page_size),
     }
@@ -3651,6 +3682,7 @@ def list_page(
 
     # 접힌 상태에는 상단 입력 한 줄과 날짜 기준·입력·프리셋 행을 항상 표시한다.
     summary_html = f"""
+      <input type="hidden" name="price_set" value="1">
       <div class="list-summary-main">
         <label class="field query-field">
           <span class="flabel">공고명</span>
@@ -3862,6 +3894,28 @@ async def list_file_single(bid_ntce_no: str):
     return await _single_file_response(bid_ntce_no, files[0])
 
 
+async def _zip_file_content(
+    client: httpx.AsyncClient, url: str, total_bytes: int,
+) -> tuple[bytes, httpx.Response] | None:
+    """남은 ZIP 한도 안의 완전한 파일만 반환한다. 초과하면 이후 파일도 중단한다."""
+    async with client.stream("GET", url) as resp:
+        resp.raise_for_status()
+        try:
+            declared_size = int(resp.headers.get("content-length", ""))
+        except (TypeError, ValueError):
+            declared_size = None
+        if declared_size is not None and total_bytes + declared_size > _ZIP_TOTAL_LIMIT_BYTES:
+            return None
+        chunks = []
+        file_bytes = 0
+        async for chunk in resp.aiter_bytes():
+            file_bytes += len(chunk)
+            if total_bytes + file_bytes > _ZIP_TOTAL_LIMIT_BYTES:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks), resp
+
+
 @app.get("/list/{bid_ntce_no}/files.zip")
 async def list_files_zip(bid_ntce_no: str):
     """공고 첨부를 서버가 받아 zip 으로 묶어 반환.
@@ -3892,9 +3946,10 @@ async def list_files_zip(bid_ntce_no: str):
                     )
                     break
                 try:
-                    resp = await client.get(f["url"])
-                    resp.raise_for_status()
-                    content = resp.content
+                    downloaded = await _zip_file_content(client, f["url"], total_bytes)
+                    if downloaded is None:
+                        break
+                    content, resp = downloaded
                 except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
                     logger.warning(
                         "첨부 다운로드 실패 skip: no=%s idx=%s", bid_ntce_no, f["idx"]
@@ -3980,9 +4035,10 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
                     )
                     break
                 try:
-                    resp = await client.get(f["url"])
-                    resp.raise_for_status()
-                    content = resp.content
+                    downloaded = await _zip_file_content(client, f["url"], total_bytes)
+                    if downloaded is None:
+                        break
+                    content, resp = downloaded
                 except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
                     logger.warning(
                         "첨부 다운로드 실패 skip: no=%s idx=%s", bf_spec_rgst_no, f["idx"]
@@ -4110,7 +4166,7 @@ async def _run_analysis_bg(
     filename: str | None = None,
 ) -> None:
     """BackgroundTasks 실행 함수. 요청 세션 대신 자체 SessionLocal을 사용한다."""
-    source_type = _normalize_source_type(source_type)
+    # 두 호출부에서 이미 정규화한 source_type을 넘긴다.
     try:
         if items is None:
             if url:
@@ -4193,6 +4249,10 @@ async def analysis_upload(
     items: list[dict[str, Any]] = []
     total_bytes = 0
     for upload_file in upload_files:
+        declared_size = getattr(upload_file, "size", None)
+        if declared_size is not None and declared_size > _ANALYSIS_MAX_BYTES:
+            response.status_code = 413
+            return {"status": "error", "message": "파일 크기가 50MB를 초과합니다."}
         file_bytes = await upload_file.read()
         filename = upload_file.filename or "upload"
         if len(file_bytes) > _ANALYSIS_MAX_BYTES:
@@ -5122,7 +5182,7 @@ async def config_save(request: Request):
     codes = [c.strip() for c in csv_raw.split(",") if c.strip()]
     if not codes:
         errors.append("업종코드(indstryty_cds)는 최소 1개가 필요합니다.")
-    elif not all(c.isdigit() for c in codes):
+    elif not all(re.fullmatch(r"[0-9]+", c) for c in codes):
         errors.append("업종코드(indstryty_cds)는 숫자 코드의 콤마 구분이어야 합니다.")
     else:
         updates["indstryty_cds"] = ",".join(codes)
@@ -5530,7 +5590,8 @@ async def config_keywords_save(request: Request):
     action = str(form.get("action") or "")
     delete_raw = str(form.get("delete_id") or "").strip()
     default_ids = [
-        int(v) for v in form.getlist("default_ids") if str(v).strip().isdigit()
+        int(str(v).strip()) for v in form.getlist("default_ids")
+        if re.fullmatch(r"[0-9]{1,12}", str(v).strip())
     ]
 
     err: str | None = None
@@ -5538,7 +5599,7 @@ async def config_keywords_save(request: Request):
         # 체크 상태는 항상 먼저 저장(추가·삭제와 함께 제출돼도 편집분 유지).
         repository.set_default_exclude_keywords(session, default_ids)
 
-        if delete_raw.isdigit():
+        if re.fullmatch(r"[0-9]{1,12}", delete_raw):
             repository.delete_exclude_keyword(session, int(delete_raw))
         elif action == "add":
             raw = str(form.get("new_keyword") or "")
@@ -5601,6 +5662,7 @@ def _cart_search_url(item_type: str, title: str) -> str:
             ("excl_privt", "0"),
             ("excl_kw", ""),
             ("excl_kw_set", "1"),
+            ("price_set", "1"),
         ]
     else:
         path = "/pre-spec"
@@ -5611,8 +5673,9 @@ def _cart_search_url(item_type: str, title: str) -> str:
             ("include_past", "1"),
             ("excl_kw", ""),
             ("excl_kw_set", "1"),
+            ("price_set", "1"),
         ]
-    # 가격/예산 필터는 넘기지 않음 — NULL 가격 공고가 SQL 비교에서 탈락하지 않게 한다.
+    # 빈 가격을 명시해 설정 기본 한도를 해제하고 가격 없는 공고도 표시한다.
     return f"{path}?{urlencode(params)}"
 
 @app.get("/api/export-cart")

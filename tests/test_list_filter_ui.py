@@ -185,7 +185,7 @@ def test_cart_search_url_includes_cancelled_notices(client):
 def test_pre_spec_cart_search_url_unchanged():
     assert main._cart_search_url("pre_spec", "test") == (
         "/pre-spec?q=test&dt_from=2000-01-01&dt_to=2099-12-31"
-        "&include_past=1&excl_kw=&excl_kw_set=1"
+        "&include_past=1&excl_kw=&excl_kw_set=1&price_set=1"
     )
 
 
