@@ -516,3 +516,64 @@ def test_collect_window_does_not_call_update_last_success(monkeypatch, db_engine
         assert s.get(AppConfig, 1).last_success_dt is None
     finally:
         s.close()
+
+
+@pytest.mark.parametrize("size, expected", [(1000, 999), (5000, 999), (0, 1), (-1, 1)])
+def test_page_size_is_clamped_for_request_and_page_count(monkeypatch, size, expected):
+    calls = []
+
+    def call(op, params, **kwargs):
+        calls.append(params.copy())
+        page = int(params["pageNo"])
+        start = (page - 1) * expected
+        rows = [_item(str(i)) for i in range(start, min(start + expected, expected + 1))]
+        return _result("00", rows, str(expected + 1))
+
+    monkeypatch.setattr(api_client, "call_endpoint", call)
+    result = _fetch_pre_spec(WIN_BGN, WIN_END, _PreSpecConfigSnapshot(size, 0))
+    assert [p["numOfRows"] for p in calls] == [str(expected), str(expected)]
+    assert [p["pageNo"] for p in calls] == ["1", "2"]
+    assert result["outcome"] == "ok" and result["unique_items"] == expected + 1
+
+
+@pytest.mark.parametrize("case", ["shortfall", "duplicates", "truncated", "invalid"])
+def test_incomplete_pre_spec_is_partial_with_no_ok_error_code(monkeypatch, db_engine, case):
+    monkeypatch.setattr(pre_spec_collector, "_MAX_PAGES_SAFETY", 1 if case == "truncated" else 1000)
+
+    def call(op, params, **kwargs):
+        if case == "invalid":
+            return _result("00", [_item("A")], "abc")
+        rows = [_item("A"), _item("A")] if case == "duplicates" else [_item("A")]
+        return _result("00", rows, "3" if case == "truncated" else "2")
+
+    monkeypatch.setattr(api_client, "call_endpoint", call)
+    run = pre_spec_collector.collect_pre_spec_window(WIN_BGN, WIN_END)
+    detail = json.loads(run.detail_json)
+    assert run.status == "partial" and run.error_code is None
+    assert detail["error_msg"] == run.error_msg
+    if case in ("shortfall", "duplicates"):
+        assert "건수 미달: 고유 1 / 전체 2" in run.error_msg
+    elif case == "truncated":
+        assert detail["truncated"] is True and "안전 상한" in run.error_msg
+    else:
+        assert run.error_msg == "totalCount 누락/오류"
+    with db_engine() as session:
+        assert session.get(AppConfig, 1).pre_spec_last_success_dt is None
+        assert session.scalar(select(func.count()).select_from(PreSpec)) == 1
+
+
+@pytest.mark.parametrize("count", [None, "", "1.5", "-1"])
+def test_invalid_pre_spec_total_count_is_failed(monkeypatch, count):
+    monkeypatch.setattr(api_client, "call_endpoint", lambda *a, **k: _result("00", [_item("A")], count))
+    result = _fetch_pre_spec(WIN_BGN, WIN_END, _PreSpecConfigSnapshot(20, 0))
+    assert result["outcome"] == "failed" and result["error_msg"] == "totalCount 누락/오류"
+
+
+def test_pre_spec_unique_count_includes_unkeyed_rows():
+    assert pre_spec_collector._count_unique_items([_item("A"), _item(" A "), {}, {}, {"bfSpecRgstNo": None}]) == 4
+
+
+def test_pre_spec_detail_has_error_key_when_successful(monkeypatch, db_engine):
+    monkeypatch.setattr(api_client, "call_endpoint", lambda *a, **k: _result("03"))
+    run = pre_spec_collector.collect_pre_spec_window(WIN_BGN, WIN_END)
+    assert run.status == "success" and json.loads(run.detail_json)["error_msg"] is None

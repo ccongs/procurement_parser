@@ -13,3 +13,12 @@ def normalize_order(value: str) -> int | str:
 def stored_order(value: str) -> str:
     """비교와 같은 규칙으로 정규화한 차수를 3자리 0채움해 저장한다."""
     return str(normalize_order(value)).zfill(3)
+
+
+def is_higher_order(left: str, right: str) -> bool:
+    """정규화 차수를 비교하며 숫자·문자가 섞이면 3자리 문자열로 비교한다."""
+    left_ord, right_ord = normalize_order(str(left)), normalize_order(str(right))
+    try:
+        return left_ord > right_ord
+    except TypeError:
+        return str(left_ord).zfill(3) > str(right_ord).zfill(3)

@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -32,7 +33,7 @@ from app.models import (
     ListRule,
     PreSpec,
 )
-from app.ordering import normalize_order, stored_order
+from app.ordering import is_higher_order, normalize_order, stored_order
 
 # bid_notice 저장 컬럼 — 원문은 별도 테이블로 보내고 컬럼이 아닌 키는 무시한다.
 _BID_NOTICE_COLUMNS: frozenset[str] = frozenset(
@@ -127,6 +128,25 @@ def finish_run(
     session.commit()
 
 
+def fail_running_run(session: Session, run_id: int | None, exc: Exception, *,
+                     retry_count: int, label: str) -> None:
+    """예외의 미완료 실행을 실패로 닫되, 정리 실패는 로그로 남기고 원래 예외를 보존한다."""
+    try:
+        session.rollback()
+        if run_id is not None:
+            run = session.get(CollectionRun, run_id)
+            if run is not None and run.status == "running":
+                finish_run(
+                    session, run, status="failed", total_fetched=0, total_new=0,
+                    total_updated=0, retry_count=retry_count, error_code=None,
+                    error_msg=f"처리 중 예외로 중단: {type(exc).__name__}: {exc}"[:500],
+                )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "예외로 중단된 %s 실행 기록 정리 실패(run_id=%s)", label, run_id,
+        )
+
+
 # --- bid_notice upsert ---------------------------------------------------
 def _normalize_ord(value: Any) -> tuple[Any, bool]:
     """차수값을 정규화해 비교 가능한 형태로 변환.
@@ -148,6 +168,7 @@ def _normalize_ord(value: Any) -> tuple[Any, bool]:
 def upsert_bid_notices(
     session: Session,
     values_list: list[dict[str, Any]],
+    skipped: list[dict[str, Any]] | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """bid_ntce_no(PK) 기준 upsert. (new_count, updated_count, ord_changes) 반환.
 
@@ -157,7 +178,8 @@ def upsert_bid_notices(
       raw_json 은 같은 세션의 bid_notice_raw 에만 저장한다.
     - 신규 행은 list_visible 이 없으면 False 로 시작하며, 기존 분류값은 없는 키로 덮지 않는다.
     - **collected_at(최초 수집 시각)은 insert 시에만 설정하고 update 시 보존**한다.
-      updated_at 등 나머지 컬럼은 항상 갱신.
+      저장 차수보다 낮으면 공고·원문을 보존하고 skipped에 기록하며 갱신 건수에서 제외.
+      같은 차수·높은 차수의 updated_at 등 나머지 컬럼은 갱신.
     - ord_changes: update 경로에서 bid_ntce_ord 가 바뀐 공고 목록. 각 원소
       {"no": <bid_ntce_no>, "old": <저장차수 원본 str>, "new": <들어온차수 원본 str>}.
       비교는 정규화(int 파싱 가능이면 int, 아니면 strip 문자열) 후 수행해 오탐을 방지한다
@@ -170,8 +192,14 @@ def upsert_bid_notices(
     existing: dict[str, BidNotice] = {}
     existing_raw: dict[str, BidNoticeRaw] = {}
     if pks:
+        # 저장 직전 쓰기 잠금을 확보한 뒤 최신 차수를 읽는다. SQLite에서도 무효 갱신으로
+        # 경쟁자의 쓰기를 직렬화하며 PostgreSQL에서는 해당 행을 잠근다(스키마 변경 없음).
+        session.execute(update(BidNotice).where(BidNotice.bid_ntce_no.in_(pks)).values(
+            bid_ntce_no=BidNotice.bid_ntce_no,
+        ).execution_options(synchronize_session=False))
         rows = (
-            session.execute(select(BidNotice).where(BidNotice.bid_ntce_no.in_(pks)))
+            session.execute(select(BidNotice).where(BidNotice.bid_ntce_no.in_(pks))
+                            .execution_options(populate_existing=True))
             .scalars()
             .all()
         )
@@ -200,6 +228,13 @@ def upsert_bid_notices(
             existing[pk] = obj  # 같은 배치 내 PK 중복 방어(이후 update 로 흡수)
             new_count += 1
         else:
+            incoming_ord = values.get("bid_ntce_ord")
+            if (incoming_ord is not None and str(incoming_ord).strip() and row.bid_ntce_ord
+                    and is_higher_order(row.bid_ntce_ord, incoming_ord)):
+                if skipped is not None:
+                    skipped.append({"bid_ntce_no": pk, "stored_ord": row.bid_ntce_ord,
+                                    "incoming_ord": incoming_ord})
+                continue
             # --- 차수변경 감지: update 경로에서만, 덮어쓰기 전에 캡처 ---
             incoming_ord_raw = values.get("bid_ntce_ord")
             new_norm, new_valid = _normalize_ord(incoming_ord_raw)

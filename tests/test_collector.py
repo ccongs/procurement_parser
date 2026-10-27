@@ -442,7 +442,8 @@ def test_build_detail_json_structure():
     stats = {"visible": 1}
     data = json.loads(_build_detail_json(calls, changes, stats))
     assert data == {"by_call": calls, "classify": stats,
-                    "ord_changes": changes, "ord_changed_count": 1}
+                    "ord_changes": changes, "ord_changed_count": 1,
+                    "ord_regress_skipped": [], "ord_regress_skipped_count": 0}
 
 
 def test_build_detail_json_empty_ord_changes():
