@@ -27,6 +27,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app import collector, pre_spec_collector, repository
 from app.db import SessionLocal, init_db
+from app.window_split import collect_in_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ def tick(now: datetime | None = None) -> None:
         collector.fmt_dt(window_end),
     )
     try:
-        collector.collect_window(window_bgn, window_end, trigger="scheduled")
+        collect_in_chunks(collector.collect_window, window_bgn, window_end, trigger="scheduled")
     except Exception:  # noqa: BLE001 — 잡 1회 실패가 스케줄러 자체를 죽이지 않게.
         logger.exception("collect_window 실행 중 예외 — 이번 tick 실패(스케줄러는 계속).")
 
@@ -160,8 +161,8 @@ def tick_pre_spec(now: datetime | None = None) -> None:
         collector.fmt_dt(window_end),
     )
     try:
-        pre_spec_collector.collect_pre_spec_window(
-            window_bgn, window_end, trigger="scheduled"
+        collect_in_chunks(
+            pre_spec_collector.collect_pre_spec_window, window_bgn, window_end, trigger="scheduled"
         )
     except Exception:  # noqa: BLE001 — 잡 1회 실패가 스케줄러 자체를 죽이지 않게.
         logger.exception(

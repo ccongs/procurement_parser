@@ -22,6 +22,7 @@ from app.db import SessionLocal, init_db
 from app.models import BidLicenseLimit, BidNotice, CollectionRun, LicenseVerification
 from app.ordering import stored_order
 from app.transform import item_to_bid_notice_values, parse_datetime
+from app.window_split import collect_in_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -426,7 +427,7 @@ def _fetch_pages(operation: str, base_params: dict[str, str], config: _ConfigSna
                     "outcome": "halt",
                     "halt_code": halt_code,
                     "error_msg": f"resultCode={halt_code} "
-                    f"({api_client.ERROR_CODES.get(halt_code or '', '알 수 없는 코드')})",
+                    f"({result.result_msg or api_client.ERROR_CODES.get(halt_code or '', '알 수 없는 코드')})",
                 }
             if outcome == "failed":
                 return {
@@ -566,6 +567,8 @@ def collect_window(
 ) -> CollectionRun | None:
     """전체 용역·면허 일괄·누락 보정 후 저장·분류하고 최종 실행 이력을 반환한다."""
     session = SessionLocal()
+    run_id = None
+    by_call = {}
     try:
         config = repository.get_config(session)
         if config.auto_halted:
@@ -581,6 +584,7 @@ def collect_window(
         )
         meta_ts = datetime.now()
         run = repository.create_run(session, trigger, window_bgn, window_end)
+        run_id = run.id
         logger.info("수집 시작: trigger=%s window=%s~%s",
                     trigger, fmt_dt(window_bgn), fmt_dt(window_end))
         by_call = {
@@ -883,6 +887,22 @@ def collect_window(
                     fix["verify_pending"], fix["verified_count"],
                     fix["verify_failed_count"], fix["verify_gave_up_count"])
         return _detach_run(session, run)
+    except Exception as exc:
+        try:
+            session.rollback()
+            if run_id is not None:
+                failed_run = session.get(CollectionRun, run_id)
+                if failed_run is not None and failed_run.status == "running":
+                    repository.finish_run(
+                        session, failed_run, status="failed", total_fetched=0,
+                        total_new=0, total_updated=0,
+                        retry_count=sum(detail["retry_count"] for detail in by_call.values()),
+                        error_code=None,
+                        error_msg=f"처리 중 예외로 중단: {type(exc).__name__}: {exc}"[:500],
+                    )
+        except Exception:
+            logger.exception("예외로 중단된 수집 실행 기록 정리 실패(run_id=%s)", run_id)
+        raise
     finally:
         session.close()
 
@@ -898,7 +918,7 @@ def _run_backfill() -> None:
     window_end = datetime.now()
     window_bgn = window_end - timedelta(days=backfill_days)
 
-    run = collect_window(window_bgn, window_end, trigger="backfill")
+    run = collect_in_chunks(collect_window, window_bgn, window_end, trigger="backfill")
     if run is None:
         print("수집이 실행되지 않았습니다(auto_halted 등 — 로그 확인).")
         return
