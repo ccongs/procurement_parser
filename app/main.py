@@ -661,7 +661,6 @@ BASE_CSS = """
   table.listtable > tbody > tr > td.file-col,
   table.listtable > tbody > tr > td.analysis-col { padding: 6px 4px; text-align: center; vertical-align: middle; }
   table.listtable button.filebtn { padding-left: 4px; padding-right: 4px; }
-  table:not(.listtable):has(td.analysis-col) > thead > tr > th:last-child,
   table:not(.listtable) > tbody > tr > td.analysis-col { text-align: center; vertical-align: middle; }
   /* 구분 셀: 위=공고종류명 배지, 아래=입찰방식명(배지 아닌 옅은 회색 텍스트) */
   td.kindcell { text-align: center; vertical-align: middle; }
@@ -796,10 +795,6 @@ BASE_CSS = """
     .filter-card form[action="/pre-spec"] .quick { flex-wrap: wrap; min-width: 0; }
     .filter-card form[action="/pre-spec"] .kw-chip { box-sizing: border-box; }
   }
-  @media (max-width: 480px) {
-    .filter-card form[action="/pre-spec"] .field,
-    .filter-card form[action="/pre-spec"] .kw-field { min-width: 0; width: 100%; }
-  }
   .list-card-heading { display: flex; justify-content: space-between; align-items: center;
                         flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
   .list-card-heading h2 { margin: 0; }
@@ -852,6 +847,8 @@ BASE_CSS = """
   .analysis-menu button { display: block; width: 100%; border: 0; background: #fff; color: #1f2430;
                           padding: 7px 10px; text-align: left; font-size: 12px; cursor: pointer; white-space: nowrap; }
   .analysis-menu button:hover { background: #f3eeff; color: #5a3e8a; }
+  .analysis-menu button:focus-visible { background: #f3eeff; color: #5a3e8a;
+                                        outline: 2px solid #2767b1; outline-offset: -2px; }
   /* 업로드 모달 */
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; z-index: 60;
                    align-items: center; justify-content: center; }
@@ -1458,7 +1455,6 @@ def _render_analysis_cell(
     source_type: str,
     source_id: str,
     source_name: str,
-    total_cols: int,
     status: str,
     cell_class: str = "",
 ) -> str:
@@ -1536,8 +1532,6 @@ def _render_list_rows(
     head += '<th class="file-col">파일</th>'
     if analysis_on:
         head += '<th class="analysis-col">분석</th>'
-    # 전체 컬럼 수 = 체크박스 + # + _LIST_COLUMNS + 파일 + 분석(토글)
-    total_cols = 1 + 1 + len(_LIST_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
     for i, r in enumerate(rows, start=1):
         raw_id = str(r.get("bid_ntce_no") or "")
@@ -1596,7 +1590,6 @@ def _render_list_rows(
                 source_type="bid",
                 source_id=raw_id,
                 source_name=r.get("bid_ntce_nm") or "",
-                total_cols=total_cols,
                 status=status,
                 cell_class="analysis-col",
             ))
@@ -2590,7 +2583,7 @@ _ANALYSIS_SCRIPT = """
           toggle.setAttribute('aria-expanded', 'true');
           positionMenu(root);
           var firstItem = root.querySelector('[role="menuitem"]');
-          if (firstItem) firstItem.focus();
+          if (firstItem) firstItem.focus({ preventScroll: true });
         } else {
           closeMenu(root);
         }
@@ -2732,11 +2725,12 @@ _ANALYSIS_SCRIPT = """
         var index = items.indexOf(e.target);
         if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1 && items.length) {
           e.preventDefault();
+          if (index < 0) index = (e.key === 'ArrowUp') ? items.length : -1;
           if (e.key === 'Home') index = 0;
           else if (e.key === 'End') index = items.length - 1;
           else if (e.key === 'ArrowDown') index = (index + 1) % items.length;
           else index = (index - 1 + items.length) % items.length;
-          items[index].focus();
+          items[index].focus({ preventScroll: true });
           return;
         }
         if (e.key === 'Escape') {
@@ -3095,8 +3089,6 @@ def _render_pre_spec_rows(
     head += "<th>파일</th>"
     if analysis_on:
         head += "<th>분석</th>"
-    # 전체 컬럼 수 = 체크박스 + # + _PRE_SPEC_COLUMNS + 파일 + 분석(토글)
-    total_cols = 1 + 1 + len(_PRE_SPEC_COLUMNS) + 1 + (1 if analysis_on else 0)
     body_rows = []
     for i, r in enumerate(rows, start=1):
         raw_id = str(r.get("bf_spec_rgst_no") or "")
@@ -3137,7 +3129,6 @@ def _render_pre_spec_rows(
                 source_type="pre-spec",
                 source_id=raw_id,
                 source_name=r.get("prdct_clsfc_no_nm") or "",
-                total_cols=total_cols,
                 status=status,
                 cell_class="analysis-col",
             ))
@@ -3288,7 +3279,7 @@ def pre_spec_page(
 
     analysis_on = analysis_enabled()
     status_map: dict[str, str] = {}
-    # 가격: 화면 입력값 우선, 비었으면 설정 기본값(cfg.pre_spec_amt_bgn/end).
+    # 가격: 화면 입력값 우선. 빈칸은 price_set 표식이 있으면 한도 없음, 없으면(첫 진입) 설정 기본값.
     # list_page 의 cfg 기본값 로직과 동형.
     with SessionLocal() as session:
         cfg = repository.get_config(session)
@@ -3570,7 +3561,7 @@ def list_page(
 
     analysis_on = analysis_enabled()
     status_map: dict[str, str] = {}
-    # 배정예산: 화면 입력값 우선, 비었으면 입찰공고 설정 기본값(presmpt_prce_bgn/end).
+    # 배정예산: 화면 입력값 우선. 빈칸은 price_set 표식이 있으면 한도 없음, 없으면(첫 진입) 설정 기본값.
     with SessionLocal() as session:
         cfg = repository.get_config(session)
         cfg_price_bgn = cfg.presmpt_prce_bgn
@@ -3936,6 +3927,7 @@ async def list_files_zip(bid_ntce_no: str):
     buf = io.BytesIO()
     ok = 0
     total_bytes = 0
+    limit_hit = False
     used_names: set[str] = set()
     async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -3948,6 +3940,11 @@ async def list_files_zip(bid_ntce_no: str):
                 try:
                     downloaded = await _zip_file_content(client, f["url"], total_bytes)
                     if downloaded is None:
+                        logger.warning(
+                            "zip 누적 총량 상한 초과 — 이후 첨부 skip: no=%s idx=%s total_bytes=%s",
+                            bid_ntce_no, f["idx"], total_bytes,
+                        )
+                        limit_hit = True
                         break
                     content, resp = downloaded
                 except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
@@ -3966,6 +3963,8 @@ async def list_files_zip(bid_ntce_no: str):
                 ok += 1
 
     if ok == 0:
+        if limit_hit:
+            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
         return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
 
     filename = quote(f"{zip_label}.zip")
@@ -4025,6 +4024,7 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     buf = io.BytesIO()
     ok = 0
     total_bytes = 0
+    limit_hit = False
     used_names: set[str] = set()
     async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -4037,6 +4037,11 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
                 try:
                     downloaded = await _zip_file_content(client, f["url"], total_bytes)
                     if downloaded is None:
+                        logger.warning(
+                            "zip 누적 총량 상한 초과 — 이후 첨부 skip: no=%s idx=%s total_bytes=%s",
+                            bf_spec_rgst_no, f["idx"], total_bytes,
+                        )
+                        limit_hit = True
                         break
                     content, resp = downloaded
                 except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
@@ -4055,6 +4060,8 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
                 ok += 1
 
     if ok == 0:
+        if limit_hit:
+            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502)
         return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502)
 
     filename = quote(f"{zip_label}.zip")
@@ -5399,10 +5406,11 @@ def _render_rule_test_page(view: RuleTestView) -> str:
     warning = ""
     if view.stale:
         reload_url = "/config/rules/test?" + urlencode(_rule_test_filter_params(data))
-        warning = '<div class="msg err">다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌었습니다.'
-        if result is not None:
-            warning += ' 현재 상태로 계산한 미리보기입니다.'
-        warning += '</div>'
+        if view.err != rule_test.STALE_MESSAGE:
+            warning = '<div class="msg err">다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌었습니다.'
+            if result is not None:
+                warning += ' 현재 상태로 계산한 미리보기입니다.'
+            warning += '</div>'
         warning += f'<a href="{_e(reload_url)}">현재 규칙 다시 불러오기(초안 버림)</a>'
     if result is not None:
         def basis_counts(key):
@@ -5500,9 +5508,7 @@ async def config_rules_test(request: Request):
             msg += f" — 표시 {vis}건(업종 {u} · 분류 {c} · 키워드 {k})"
         msg += " (저장된 전체 공고 기준)"
     view.msg = msg
-    if request.query_params.get("err") == "stale":
-        view.err = rule_test.STALE_MESSAGE
-    elif request.query_params.get("err") == "form":
+    if request.query_params.get("err") == "form":
         view.err = rule_test.FORM_MESSAGE
     return HTMLResponse(_render_rule_test_page(view))
 

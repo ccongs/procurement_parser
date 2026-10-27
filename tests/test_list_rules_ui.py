@@ -1173,7 +1173,10 @@ def test_rule_test_stale_whole_set_fingerprint_refuses_changes(client, monkeypat
     response = _apply(client, {**data, "fingerprint": fingerprint})
     assert response.status_code == 409
     assert "location" not in response.headers
-    assert rule_test.STALE_MESSAGE in response.text
+    assert response.text.count(f'<div class="msg err">{rule_test.STALE_MESSAGE}</div>') == 1
+    assert response.text.count('<div class="msg err">') == 1
+    assert "다른 곳에서 규칙(또는 매칭 업종코드)이 바뀌었습니다." not in response.text
+    assert response.text.count('>현재 규칙 다시 불러오기(초안 버림)</a>') == 1
     assert 'id="preview"' not in response.text
     assert 'window.location.hash' not in response.text
     assert response.text.index("초안 편집") < response.text.index(rule_test.STALE_MESSAGE) < response.text.index('<textarea')
@@ -1453,6 +1456,15 @@ def test_rule_test_fingerprint_ignores_match_code_order_and_duplicates(client):
         repository.update_config(session, indstryty_cds=" 1468,1426,1468 ")
     assert _test_form(client)["fingerprint"] == data["fingerprint"]
     assert _apply(client, data).status_code == 303
+
+
+def test_rule_test_get_old_stale_query_has_no_draft_message(client):
+    params = {"dt_from": "2026-10-01", "dt_to": "2026-10-07"}
+    current = client.get("/config/rules/test", params=params)
+    response = client.get("/config/rules/test", params={**params, "err": "stale"})
+    assert response.status_code == 200
+    assert rule_test.STALE_MESSAGE not in response.text
+    assert response.text == current.text
 
 
 def test_rule_test_stale_invalid_preview_warns_without_claiming_a_result(client, monkeypatch):
