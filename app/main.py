@@ -3882,16 +3882,24 @@ def list_page(
 
 
 # --- /list 파일 다운로드 (Phase 4.1) ---------------------------------
-# zip 스트리밍 가드: 외부 다운로드 타임아웃·누적 총량 상한(메모리 보호).
+# 외부 첨부를 서버 메모리에 모아 응답: 파일별 타임아웃·누적 크기 상한(메모리 보호)·동시 실행 수 제한.
 _FILE_HTTP_TIMEOUT = 30.0
 _ZIP_TOTAL_LIMIT_BYTES = 300 * 1024 * 1024  # 300MB 누적 상한
+# 네 라우트 공용: 첨부를 메모리에 모으는 다운로드의 최대 동시 실행 수.
 _FILE_BUFFER_CONCURRENCY = 2
+# 자리를 기다리는 최대 초. 넘으면 503 응답.
 _FILE_BUFFER_WAIT_SECONDS = 600
+# 이벤트 루프와 그 루프의 세마포어 한 쌍.
 _file_buffer_state: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 
 
 def _file_buffer_semaphore() -> asyncio.Semaphore:
-    """실행 중인 이벤트 루프의 공용 첨부 버퍼 자리를 반환한다."""
+    """실행 중인 이벤트 루프의 공용 첨부 버퍼 자리를 반환한다.
+
+    asyncio.Semaphore는 처음 기다린 루프에 묶여 다른 루프에서 기다리면 RuntimeError를 낸다.
+    시험마다 TestClient 루프가 다를 수 있으므로 모듈 수준 세마포어 하나로 바꾸지 말 것.
+    운영은 uvicorn 프로세스 하나로 실행하므로 실제로는 루프가 하나다.
+    """
     global _file_buffer_state
     loop = asyncio.get_running_loop()
     if _file_buffer_state is None or _file_buffer_state[0] is not loop:
@@ -3901,6 +3909,11 @@ def _file_buffer_semaphore() -> asyncio.Semaphore:
 
 @asynccontextmanager
 async def _file_buffer_slot(label: str):
+    """자리를 최대 _FILE_BUFFER_WAIT_SECONDS초 기다려 얻으면 True를 내준다.
+
+    시간 초과 시 경고 로그 뒤 False를 내주며, 얻은 자리는 finally에서 반드시 반환한다.
+    자리는 라우트가 응답 객체를 돌려줄 때 풀려 본문 전송 중 메모리는 제한에 들어가지 않는다.
+    """
     semaphore = _file_buffer_semaphore()
     try:
         await asyncio.wait_for(semaphore.acquire(), timeout=_FILE_BUFFER_WAIT_SECONDS)
@@ -3915,6 +3928,7 @@ async def _file_buffer_slot(label: str):
 
 
 def _file_buffer_busy_response() -> Response:
+    """자리를 얻지 못했을 때의 503 평문 응답. 클라이언트는 문구를 오류로 보여 준다."""
     return Response(
         "다른 첨부 다운로드가 많아 지금은 받을 수 없습니다. 잠시 뒤 다시 시도해 주세요.",
         status_code=503, media_type="text/plain; charset=utf-8",
