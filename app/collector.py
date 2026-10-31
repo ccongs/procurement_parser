@@ -171,6 +171,13 @@ def _regressed_pair(no, ord_, stored_by_no) -> bool:
     return bool(stored and _text(ord_) and is_higher_order(stored, ord_))
 
 
+def _record_fix_failed(fix, no: str) -> None:
+    fix["failed_count"] += 1
+    failed = fix["failed"]
+    if len(failed) < 50:
+        failed.append(no)
+
+
 def _record_fix_failure(fix, label: str, reason: str) -> None:
     fix["failure_details_count"] += 1
     if len(fix["failure_details"]) < 50:
@@ -662,7 +669,7 @@ def collect_window(
                         "items": 0, "unique_items": 0, "kept": 0, "retry_count": 0,
                         "page_size": _BULK_PAGE_SIZE, "total_count": None, "error_msg": None},
             "license_fix": {"outcome": "skipped", "targets": 0, "called": 0,
-                            "found": 0, "failed": [], "retry_count": 0, "total_count": None,
+                            "found": 0, "failed": [], "failed_count": 0, "retry_count": 0, "total_count": None,
                             "unique_items": 0, "verify_targets": 0, "error_msg": None,
                             "failure_details": [], "failure_details_count": 0, "verify_pending_after": 0,
                             "verify_reregistered": [], "verify_reregistered_count": 0,
@@ -828,7 +835,7 @@ def collect_window(
                     _warn_unkeyed_licenses("보정", fix_unkeyed_items)
                     fix["outcome"] = "failed"
                     fix["error_msg"] = result["error_msg"]
-                    fix["failed"].append(no)
+                    _record_fix_failed(fix, no)
                     verification_responses.append((no, ord_, received_at, None, result["error_msg"]))
                     # halt 시 공고·면허 저장은 중단하되 확인 대기와 실패 시도는 보존한다.
                     with classifier.CLASSIFY_WRITE_LOCK:
@@ -916,7 +923,7 @@ def collect_window(
                     _record_fix_failure(fix, f"{no}-{stored_order(ord_)}", reason)
                     if result.get("truncated"):
                         fix["truncated"] = True
-                    fix["failed"].append(no)
+                    _record_fix_failed(fix, no)
                     fix_failure_codes.append(result["last_code"])
 
         _warn_unkeyed_licenses("보정", fix_unkeyed_items)
@@ -958,7 +965,7 @@ def collect_window(
                 # 동시 수집 등으로 누락 보정 대상에 유효 행이 생긴 경우에도 partial을 유지한다.
                 if (no, classifier.normalize_order(ord_)) in missing_pairs:
                     fix["outcome"] = "failed"
-                    fix["failed"].append(no)
+                    _record_fix_failed(fix, no)
                     fix_failures.append((f"{no}-{stored_order(ord_)}", error))
                     _record_fix_failure(fix, f"{no}-{stored_order(ord_)}", error)
             # 전체 조회를 하지 않은 공고·차수도 더 새 검증이 있으면 일괄 행을 제외한다.
