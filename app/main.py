@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import html
 import io
@@ -888,6 +889,7 @@ BASE_CSS = """
   #cartToast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
                background: #2E7D32; color: #fff; padding: 10px 20px; border-radius: 8px;
                font-size: 13px; display: none; z-index: 70; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+  #cartToast.error { background: #b02a25; }
   /* 장바구니 체크박스 컬럼 */
   .col-chk { text-align: center; }
   .col-chk input[type=checkbox] { cursor: pointer; width: 16px; height: 16px; }
@@ -2229,10 +2231,15 @@ _LIST_SCRIPT = """
       event.preventDefault();
       var url = zipAll.getAttribute('href');
       if (!url || url === '#') return;
+      if (zipDownloads[url]) {
+        zipAllMsg.textContent = '이미 요청한 다운로드입니다. 잠시 뒤(최대 1분) 다시 시도해 주세요.';
+        zipAllMsg.classList.add('info');
+        zipAllMsg.hidden = false;
+        return;
+      }
       zipAllMsg.textContent = '다운로드를 요청했습니다. 첨부가 많으면 시작까지 시간이 걸릴 수 있습니다.';
       zipAllMsg.classList.add('info');
       zipAllMsg.hidden = false;
-      if (zipDownloads[url]) return;
       var timer = setTimeout(function () { delete zipDownloads[url]; }, 60 * 1000);
       zipDownloads[url] = timer;
       downloadInFrame(url, function (message) {
@@ -2880,10 +2887,11 @@ _CART_SCRIPT = """
     return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  function showCartToast(msg, ms) {
+  function showCartToast(msg, ms, kind) {
     var t = document.getElementById('cartToast');
     if (!t) return;
     clearTimeout(cartToastTimer);
+    t.classList.toggle('error', kind === 'error');
     t.textContent = msg;
     t.style.display = 'block';
     cartToastTimer = setTimeout(function () { t.style.display = 'none'; }, ms === undefined ? 3000 : ms);
@@ -3004,7 +3012,7 @@ _CART_SCRIPT = """
         (function (itemId) {
           downloadInFrame(url, function (message) {
             failures++;
-            showCartToast('다운로드 실패 ' + failures + '건 — ' + itemId + ': ' + message, 6000);
+            showCartToast('다운로드 실패 ' + failures + '건 — ' + itemId + ': ' + message, 6000, 'error');
           });
         })(item.itemId);
         if (i < targets.length - 1) {
@@ -3232,10 +3240,15 @@ _PRE_SPEC_SCRIPT = """
       event.preventDefault();
       var url = zipAll.getAttribute('href');
       if (!url || url === '#') return;
+      if (zipDownloads[url]) {
+        zipAllMsg.textContent = '이미 요청한 다운로드입니다. 잠시 뒤(최대 1분) 다시 시도해 주세요.';
+        zipAllMsg.classList.add('info');
+        zipAllMsg.hidden = false;
+        return;
+      }
       zipAllMsg.textContent = '다운로드를 요청했습니다. 첨부가 많으면 시작까지 시간이 걸릴 수 있습니다.';
       zipAllMsg.classList.add('info');
       zipAllMsg.hidden = false;
-      if (zipDownloads[url]) return;
       var timer = setTimeout(function () { delete zipDownloads[url]; }, 60 * 1000);
       zipDownloads[url] = timer;
       downloadInFrame(url, function (message) {
@@ -3872,6 +3885,40 @@ def list_page(
 # zip 스트리밍 가드: 외부 다운로드 타임아웃·누적 총량 상한(메모리 보호).
 _FILE_HTTP_TIMEOUT = 30.0
 _ZIP_TOTAL_LIMIT_BYTES = 300 * 1024 * 1024  # 300MB 누적 상한
+_FILE_BUFFER_CONCURRENCY = 2
+_FILE_BUFFER_WAIT_SECONDS = 600
+_file_buffer_state: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+
+
+def _file_buffer_semaphore() -> asyncio.Semaphore:
+    """실행 중인 이벤트 루프의 공용 첨부 버퍼 자리를 반환한다."""
+    global _file_buffer_state
+    loop = asyncio.get_running_loop()
+    if _file_buffer_state is None or _file_buffer_state[0] is not loop:
+        _file_buffer_state = (loop, asyncio.Semaphore(_FILE_BUFFER_CONCURRENCY))
+    return _file_buffer_state[1]
+
+
+@asynccontextmanager
+async def _file_buffer_slot(label: str):
+    semaphore = _file_buffer_semaphore()
+    try:
+        await asyncio.wait_for(semaphore.acquire(), timeout=_FILE_BUFFER_WAIT_SECONDS)
+    except TimeoutError:
+        logger.warning("첨부 다운로드 자리 대기 시간 초과: %s", label)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        semaphore.release()
+
+
+def _file_buffer_busy_response() -> Response:
+    return Response(
+        "다른 첨부 다운로드가 많아 지금은 받을 수 없습니다. 잠시 뒤 다시 시도해 주세요.",
+        status_code=503, media_type="text/plain; charset=utf-8",
+    )
 
 
 def _filename_from_cd(resp: httpx.Response, fallback: str) -> str:
@@ -3963,7 +4010,10 @@ async def list_file_single(bid_ntce_no: str):
         files = repository.get_notice_files(session, bid_ntce_no)
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
-    return await _single_file_response(bid_ntce_no, files[0])
+    async with _file_buffer_slot(f"/list/{bid_ntce_no}/files/single") as acquired:
+        if not acquired:
+            return _file_buffer_busy_response()
+        return await _single_file_response(bid_ntce_no, files[0])
 
 
 async def _zip_file_content(
@@ -4005,52 +4055,55 @@ async def list_files_zip(bid_ntce_no: str):
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
 
-    buf = io.BytesIO()
-    ok = 0
-    total_bytes = 0
-    limit_hit = False
-    used_names: set[str] = set()
-    async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in files:
-                if total_bytes >= _ZIP_TOTAL_LIMIT_BYTES:
-                    logger.warning(
-                        "zip 누적 총량 상한 도달 — 이후 첨부 skip: no=%s", bid_ntce_no
-                    )
-                    break
-                try:
-                    downloaded = await _zip_file_content(client, f["url"], total_bytes)
-                    if downloaded is None:
+    async with _file_buffer_slot(f"/list/{bid_ntce_no}/files.zip") as acquired:
+        if not acquired:
+            return _file_buffer_busy_response()
+        buf = io.BytesIO()
+        ok = 0
+        total_bytes = 0
+        limit_hit = False
+        used_names: set[str] = set()
+        async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    if total_bytes >= _ZIP_TOTAL_LIMIT_BYTES:
                         logger.warning(
-                            "zip 누적 총량 상한 초과 — 이후 첨부 skip: no=%s idx=%s total_bytes=%s",
-                            bid_ntce_no, f["idx"], total_bytes,
+                            "zip 누적 총량 상한 도달 — 이후 첨부 skip: no=%s", bid_ntce_no
                         )
-                        limit_hit = True
                         break
-                    content, resp = downloaded
-                except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
-                    logger.warning(
-                        "첨부 다운로드 실패 skip: no=%s idx=%s", bid_ntce_no, f["idx"]
-                    )
-                    continue
-                # 파일명 충돌·빈값 방지: 인덱스 접두.
-                base = f["name"] or f"첨부{f['idx']}"
-                arc = f"{f['idx']}_{base}"
-                if arc in used_names:
-                    arc = f"{f['idx']}_{ok}_{base}"
-                used_names.add(arc)
-                zf.writestr(arc, content)
-                total_bytes += len(content)
-                ok += 1
+                    try:
+                        downloaded = await _zip_file_content(client, f["url"], total_bytes)
+                        if downloaded is None:
+                            logger.warning(
+                                "zip 누적 총량 상한 초과 — 이후 첨부 skip: no=%s idx=%s total_bytes=%s",
+                                bid_ntce_no, f["idx"], total_bytes,
+                            )
+                            limit_hit = True
+                            break
+                        content, resp = downloaded
+                    except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
+                        logger.warning(
+                            "첨부 다운로드 실패 skip: no=%s idx=%s", bid_ntce_no, f["idx"]
+                        )
+                        continue
+                    # 파일명 충돌·빈값 방지: 인덱스 접두.
+                    base = f["name"] or f"첨부{f['idx']}"
+                    arc = f"{f['idx']}_{base}"
+                    if arc in used_names:
+                        arc = f"{f['idx']}_{ok}_{base}"
+                    used_names.add(arc)
+                    zf.writestr(arc, content)
+                    total_bytes += len(content)
+                    ok += 1
 
-    if ok == 0:
-        if limit_hit:
-            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
-        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
+        if ok == 0:
+            if limit_hit:
+                return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
+            return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
-    filename = quote(f"{zip_label}.zip")
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
-    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+        filename = quote(f"{zip_label}.zip")
+        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+        return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
 
 # --- /pre-spec 파일 다운로드 (Phase 4.9-B2) --------------------------
@@ -4082,7 +4135,10 @@ async def pre_spec_file_single(bf_spec_rgst_no: str):
         files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
-    return await _single_file_response(bf_spec_rgst_no, files[0])
+    async with _file_buffer_slot(f"/pre-spec/{bf_spec_rgst_no}/files/single") as acquired:
+        if not acquired:
+            return _file_buffer_busy_response()
+        return await _single_file_response(bf_spec_rgst_no, files[0])
 
 
 @app.get("/pre-spec/{bf_spec_rgst_no}/files.zip")
@@ -4102,52 +4158,55 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
 
-    buf = io.BytesIO()
-    ok = 0
-    total_bytes = 0
-    limit_hit = False
-    used_names: set[str] = set()
-    async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in files:
-                if total_bytes >= _ZIP_TOTAL_LIMIT_BYTES:
-                    logger.warning(
-                        "zip 누적 총량 상한 도달 — 이후 첨부 skip: no=%s", bf_spec_rgst_no
-                    )
-                    break
-                try:
-                    downloaded = await _zip_file_content(client, f["url"], total_bytes)
-                    if downloaded is None:
+    async with _file_buffer_slot(f"/pre-spec/{bf_spec_rgst_no}/files.zip") as acquired:
+        if not acquired:
+            return _file_buffer_busy_response()
+        buf = io.BytesIO()
+        ok = 0
+        total_bytes = 0
+        limit_hit = False
+        used_names: set[str] = set()
+        async with httpx.AsyncClient(follow_redirects=True, timeout=_FILE_HTTP_TIMEOUT) as client:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    if total_bytes >= _ZIP_TOTAL_LIMIT_BYTES:
                         logger.warning(
-                            "zip 누적 총량 상한 초과 — 이후 첨부 skip: no=%s idx=%s total_bytes=%s",
-                            bf_spec_rgst_no, f["idx"], total_bytes,
+                            "zip 누적 총량 상한 도달 — 이후 첨부 skip: no=%s", bf_spec_rgst_no
                         )
-                        limit_hit = True
                         break
-                    content, resp = downloaded
-                except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
-                    logger.warning(
-                        "첨부 다운로드 실패 skip: no=%s idx=%s", bf_spec_rgst_no, f["idx"]
-                    )
-                    continue
-                # 실제 파일명은 Content-Disposition 헤더에서 추출 (URL에는 확장자 없음)
-                base = _filename_from_cd(resp, f["name"] or f"첨부{f['idx']}")
-                arc = f"{f['idx']}_{base}"
-                if arc in used_names:
-                    arc = f"{f['idx']}_{ok}_{base}"
-                used_names.add(arc)
-                zf.writestr(arc, content)
-                total_bytes += len(content)
-                ok += 1
+                    try:
+                        downloaded = await _zip_file_content(client, f["url"], total_bytes)
+                        if downloaded is None:
+                            logger.warning(
+                                "zip 누적 총량 상한 초과 — 이후 첨부 skip: no=%s idx=%s total_bytes=%s",
+                                bf_spec_rgst_no, f["idx"], total_bytes,
+                            )
+                            limit_hit = True
+                            break
+                        content, resp = downloaded
+                    except Exception:  # noqa: BLE001 — 실패 파일은 건너뛰고 부분 성공.
+                        logger.warning(
+                            "첨부 다운로드 실패 skip: no=%s idx=%s", bf_spec_rgst_no, f["idx"]
+                        )
+                        continue
+                    # 실제 파일명은 Content-Disposition 헤더에서 추출 (URL에는 확장자 없음)
+                    base = _filename_from_cd(resp, f["name"] or f"첨부{f['idx']}")
+                    arc = f"{f['idx']}_{base}"
+                    if arc in used_names:
+                        arc = f"{f['idx']}_{ok}_{base}"
+                    used_names.add(arc)
+                    zf.writestr(arc, content)
+                    total_bytes += len(content)
+                    ok += 1
 
-    if ok == 0:
-        if limit_hit:
-            return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
-        return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
+        if ok == 0:
+            if limit_hit:
+                return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
+            return Response("첨부 다운로드에 모두 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
-    filename = quote(f"{zip_label}.zip")
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
-    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+        filename = quote(f"{zip_label}.zip")
+        headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+        return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
 
 # --- 분석 API (Phase 8.1) -------------------------------------------

@@ -462,7 +462,7 @@ def test_missing_license_only_current_limited_notices_are_called(monkeypatch, db
     assert run.status == "success"
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": 2, "called": 2, "found": 1,
-                   "failed": [], "retry_count": 0, "total_count": 1, "unique_items": 1,
+                   "failed": [], "failed_count": 0, "retry_count": 0, "total_count": 1, "unique_items": 1,
                    "verify_targets": 0, "superseded": 0, "restored": 0,
                    "superseded_notices": [], "superseded_notices_count": 0,
                    "verify_pending": 0, "verified": ["FIX-001"], "verified_count": 1,
@@ -519,7 +519,7 @@ def test_missing_license_fix_queries_all_targets(monkeypatch, db_engine, count):
     run = collector.collect_window(WIN_BGN, WIN_END)
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert fix == {"outcome": "ok", "targets": count, "called": count,
-                   "found": (count + 1) // 2, "failed": [], "retry_count": 0,
+                   "found": (count + 1) // 2, "failed": [], "failed_count": 0, "retry_count": 0,
                    "total_count": (count + 1) // 2, "unique_items": (count + 1) // 2,
                    "verify_targets": 0, "superseded": 0, "restored": 0,
                    "superseded_notices": [], "superseded_notices_count": 0,
@@ -596,7 +596,7 @@ def test_missing_license_fix_no_rows_advances_successive_windows(monkeypatch, db
         assert run.status == "success" and run.error_msg is None
         fix = json.loads(run.detail_json)["by_call"]["license_fix"]
         assert fix == {"outcome": "ok", "targets": 205, "called": 205,
-                       "found": 0, "failed": [], "retry_count": 0, "total_count": 0,
+                       "found": 0, "failed": [], "failed_count": 0, "retry_count": 0, "total_count": 0,
                        "unique_items": 0, "verify_targets": 0, "superseded": 0, "restored": 0,
                        "superseded_notices": [], "superseded_notices_count": 0,
                        "verify_pending": 0, "verified": [], "verified_count": 0,
@@ -2883,6 +2883,8 @@ def test_single_page_shortfall_rechecks_active_rows_under_save_lock(monkeypatch,
     fix = json.loads(run.detail_json)["by_call"]["license_fix"]
     assert run.status == ("partial" if missing_role else "success")
     assert fix["verified"] == [] and fix["verify_failed"] == [f"{no}-000"]
+    assert fix["failed"] == ([no] if missing_role else [])
+    assert fix["failed_count"] == (1 if missing_role else 0)
     assert fix["superseded"] == fix["restored"] == 0
     with Local() as session:
         assert session.get(BidLicenseLimit, collector._license_key(collector.license_values(new))).superseded_at == WIN_BGN
@@ -3214,6 +3216,7 @@ def test_fix_failures_are_summarized_by_reason(monkeypatch, db_engine):
     assert run.error_msg == f"license_fix: {expected}"
     assert len(fix["failure_details"]) == 12
     assert fix["failed"] == [f"FAIL-{i}" for i in range(12)]
+    assert fix["failed_count"] == 12
 
 
 @pytest.mark.parametrize("count", [6, 51])
@@ -3243,6 +3246,8 @@ def test_fix_shortfall_summary_omits_per_notice_counts(monkeypatch, db_engine, c
     assert "고유 1 / 전체" not in fix["error_msg"]
     assert len(fix["failure_details"]) == min(count, 50)
     assert fix["failure_details_count"] == count
+    assert fix["failed"] == [f"SF-{i}" for i in range(min(count, 50))]
+    assert fix["failed_count"] == count
     assert fix["failure_details"] == [
         {"notice": f"SF-{i}-000", "reason": f"건수 미달: 고유 1 / 전체 {i + 2}"}
         for i in range(min(count, 50))]
@@ -3459,3 +3464,42 @@ def test_partial_error_code_ignores_ok_code_before_actual_failure(monkeypatch, d
     _fake_api(monkeypatch, responder)
     run = collector.collect_window(WIN_BGN, WIN_END)
     assert run.status == "partial" and run.error_code == "01"
+
+
+@pytest.mark.parametrize("count", [6, 51])
+@pytest.mark.parametrize("halt_last", [False, True])
+def test_fix_failed_list_is_capped_and_counts_all_failures(monkeypatch, db_engine, count, halt_last):
+    _, Local = db_engine
+    with Local() as session:
+        session.get(AppConfig, 1).num_of_rows = 999
+        session.commit()
+    notices = [_notice(f"CAP-{i}") for i in range(count)]
+
+    def responder(op, params):
+        if op == collector.OPERATION:
+            return _ok_result(notices, count)
+        if params["inqryDiv"] == "1":
+            return _ok_result()
+        if halt_last and params["bidNtceNo"] == f"CAP-{count - 1}":
+            result = _failed_result()
+            result.result_code = "22"
+            return result
+        result = _ok_result([_license(params["bidNtceNo"])], 1)
+        result.total_count = "잘못된 값"
+        return result
+
+    _fake_api(monkeypatch, responder)
+    run = collector.collect_window(WIN_BGN, WIN_END)
+    fix = json.loads(run.detail_json)["by_call"]["license_fix"]
+    assert run.status == ("failed" if halt_last else "partial")
+    assert fix["failed"] == [f"CAP-{i}" for i in range(min(count, 50))]
+    assert fix["failed_count"] == count
+
+
+def test_record_fix_failed_preserves_duplicate_notices_and_order():
+    fix = {"failed": [], "failed_count": 0}
+    notices = ["A", "B", "A"] * 18
+    for no in notices:
+        collector._record_fix_failed(fix, no)
+    assert fix["failed"] == notices[:50]
+    assert fix["failed_count"] == len(notices)
