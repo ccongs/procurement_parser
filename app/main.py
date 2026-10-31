@@ -23,7 +23,7 @@ import logging
 import math
 import re
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -35,6 +35,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
+from starlette.types import Message, Receive, Scope, Send
 
 from app import __version__, api_client, classifier, industry_codes, region_codes, repository, rule_test, scheduler
 from app.db import SessionLocal, init_db
@@ -3882,13 +3883,18 @@ def list_page(
 
 
 # --- /list 파일 다운로드 (Phase 4.1) ---------------------------------
-# 외부 첨부를 서버 메모리에 모아 응답: 파일별 타임아웃·누적 크기 상한(메모리 보호)·동시 실행 수 제한.
-_FILE_HTTP_TIMEOUT = 30.0
+# 외부 첨부를 서버 메모리에 모아 응답: 외부 요청 동작마다 30초(파일 하나의 총시간 상한은 아님)·누적 크기 상한(메모리 보호)·동시 실행 수 제한.
+_FILE_HTTP_TIMEOUT = 30.0  # 외부 요청 동작마다 30초, 파일 총시간 상한은 아님.
 _ZIP_TOTAL_LIMIT_BYTES = 300 * 1024 * 1024  # 300MB 누적 상한
-# 네 라우트 공용: 첨부를 메모리에 모으는 다운로드의 최대 동시 실행 수.
+# 네 라우트 공용: 첨부를 메모리에 모으는 다운로드의 최대 동시 실행 수. 성공 응답은 전송이 끝날 때까지 자리를 쥐고,
+# 응답 머리·1MB 사본 조각 전송 각각이 _FILE_SEND_STALL_SECONDS 넘게 막히면 전송을 멈추고 놓는다.
 _FILE_BUFFER_CONCURRENCY = 2
-# 자리를 기다리는 최대 초. 넘으면 503 응답.
-_FILE_BUFFER_WAIT_SECONDS = 600
+# 드로어의 같은 URL 재요청 차단(60초) 전에 자리 대기를 끝내도록 55초 뒤 503 응답.
+_FILE_BUFFER_WAIT_SECONDS = 55
+# 전체 본문 사본 없이, 보낼 때마다 bytes 사본으로 만드는 조각의 크기(1MB).
+_FILE_SEND_CHUNK_BYTES = 1024 * 1024
+# 응답 머리 또는 본문 조각 하나의 전송이 막혀 기다릴 수 있는 최대 초(전체 전송 시간 상한은 아님).
+_FILE_SEND_STALL_SECONDS = 60
 # 이벤트 루프와 그 루프의 세마포어 한 쌍.
 _file_buffer_state: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 
@@ -3907,24 +3913,109 @@ def _file_buffer_semaphore() -> asyncio.Semaphore:
     return _file_buffer_state[1]
 
 
-@asynccontextmanager
-async def _file_buffer_slot(label: str):
-    """자리를 최대 _FILE_BUFFER_WAIT_SECONDS초 기다려 얻으면 True를 내준다.
-
-    시간 초과 시 경고 로그 뒤 False를 내주며, 얻은 자리는 finally에서 반드시 반환한다.
-    자리는 라우트가 응답 객체를 돌려줄 때 풀려 본문 전송 중 메모리는 제한에 들어가지 않는다.
-    """
+async def _acquire_file_buffer_slot(label: str) -> Callable[[], None] | None:
+    """시간 초과 시 None, 자리 획득 시 한 번만 동작하는 반환 함수를 내준다."""
     semaphore = _file_buffer_semaphore()
     try:
         await asyncio.wait_for(semaphore.acquire(), timeout=_FILE_BUFFER_WAIT_SECONDS)
     except TimeoutError:
         logger.warning("첨부 다운로드 자리 대기 시간 초과: %s", label)
-        yield False
-        return
+        return None
+    released = False
+
+    def release() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            semaphore.release()
+
+    return release
+
+
+@asynccontextmanager
+async def _file_buffer_slot(label: str):
+    """획득 시 True, 시간 초과 시 False를 내주고 블록 종료 시 자리를 반환한다.
+
+    다운로드 라우트는 아래 전용 도우미로 성공 응답의 전송 종료까지 자리를 유지한다.
+    """
+    release = await _acquire_file_buffer_slot(label)
     try:
-        yield True
+        yield release is not None
     finally:
-        semaphore.release()
+        if release is not None:
+            release()
+
+
+class _SlotReleasingResponse(Response):
+    """본문을 1MB 사본 조각으로 보내 전송 종료까지 자리를 유지한다.
+
+    응답 머리와 본문 조각 전송 각각이 _FILE_SEND_STALL_SECONDS 넘게 막히면 전송을 멈추고,
+    완료·실패·취소 시 finally에서 첨부 버퍼 자리를 반환한다.
+    조각 사본으로 보내고 완료·실패·취소 시 원본 본문 참조를 비워,
+    예외 traceback이 남아도 원본 본문을 붙잡지 않는다.
+    """
+
+    def __init__(self, response: Response, release: Callable[[], None]):
+        super().__init__(content=response.body, status_code=response.status_code,
+                         media_type=response.media_type, background=response.background)
+        self.raw_headers = response.raw_headers
+        self._release = release
+
+    async def _send_with_stall_timeout(self, send: Send, message: Message,
+                                       scope: Scope, sent: int, total: int) -> None:
+        try:
+            async with asyncio.timeout(_FILE_SEND_STALL_SECONDS) as stall:
+                await send(message)
+        except TimeoutError:
+            if stall.expired():
+                logger.warning("첨부 본문 전송 대기 시간 초과: 경로=%s, 보낸 바이트=%d, 전체 바이트=%d",
+                               scope.get("path"), sent, total)
+            raise
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        body = chunk = None
+        try:
+            body = memoryview(self.body)
+            total = len(body)
+            sent = 0
+            await self._send_with_stall_timeout(
+                send, {"type": "http.response.start", "status": self.status_code,
+                       "headers": self.raw_headers}, scope, sent, total)
+            for offset in range(0, total or 1, _FILE_SEND_CHUNK_BYTES):
+                chunk = body[offset:offset + _FILE_SEND_CHUNK_BYTES] if total else b""
+                await self._send_with_stall_timeout(
+                    send, {"type": "http.response.body", "body": bytes(chunk),
+                           "more_body": offset + len(chunk) < total}, scope, sent, total)
+                sent += len(chunk)
+            if self.background is not None:
+                await self.background()
+        finally:
+            self._release()
+            self.body = b""
+            body = chunk = None
+
+
+@asynccontextmanager
+async def _file_buffer_response_slot(label: str):
+    """200 응답에만 자리를 넘긴다. 오류·예외·생성 중 취소는 블록 종료 시 반환한다."""
+    release = await _acquire_file_buffer_slot(label)
+    if release is None:
+        yield None
+        return
+    transferred = False
+
+    def attach(response: Response) -> Response:
+        nonlocal transferred
+        if response.status_code == 200:
+            response = _SlotReleasingResponse(response, release)
+            transferred = True
+        return response
+
+    try:
+        yield attach
+    finally:
+        if not transferred:
+            release()
 
 
 def _file_buffer_busy_response() -> Response:
@@ -3974,7 +4065,7 @@ async def _single_file_response(item_id: str, file: dict[str, Any]) -> Response:
                     )
                     return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
-                chunks = []
+                content = bytearray()
                 total_bytes = 0
                 async for chunk in resp.aiter_bytes():
                     total_bytes += len(chunk)
@@ -3984,8 +4075,7 @@ async def _single_file_response(item_id: str, file: dict[str, Any]) -> Response:
                             item_id, file["idx"], total_bytes,
                         )
                         return Response("첨부 크기가 제한을 초과했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
-                    chunks.append(chunk)
-                content = b"".join(chunks)
+                    content.extend(chunk)
                 filename = _filename_from_cd(resp, file["name"] or f"첨부{file['idx']}")
                 media_type = resp.headers.get("content-type") or "application/octet-stream"
     except Exception:  # noqa: BLE001 — 외부 첨부 다운로드 실패를 502로 변환.
@@ -3993,7 +4083,7 @@ async def _single_file_response(item_id: str, file: dict[str, Any]) -> Response:
         return Response("첨부 다운로드에 실패했습니다.", status_code=502, media_type="text/plain; charset=utf-8")
 
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
-    return Response(content=content, media_type=media_type, headers=headers)
+    return Response(content=memoryview(content), media_type=media_type, headers=headers)
 
 
 @app.get("/list/{bid_ntce_no}/files")
@@ -4024,10 +4114,10 @@ async def list_file_single(bid_ntce_no: str):
         files = repository.get_notice_files(session, bid_ntce_no)
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
-    async with _file_buffer_slot(f"/list/{bid_ntce_no}/files/single") as acquired:
-        if not acquired:
+    async with _file_buffer_response_slot(f"/list/{bid_ntce_no}/files/single") as attach:
+        if attach is None:
             return _file_buffer_busy_response()
-        return await _single_file_response(bid_ntce_no, files[0])
+        return attach(await _single_file_response(bid_ntce_no, files[0]))
 
 
 async def _zip_file_content(
@@ -4069,8 +4159,8 @@ async def list_files_zip(bid_ntce_no: str):
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
 
-    async with _file_buffer_slot(f"/list/{bid_ntce_no}/files.zip") as acquired:
-        if not acquired:
+    async with _file_buffer_response_slot(f"/list/{bid_ntce_no}/files.zip") as attach:
+        if attach is None:
             return _file_buffer_busy_response()
         buf = io.BytesIO()
         ok = 0
@@ -4117,7 +4207,9 @@ async def list_files_zip(bid_ntce_no: str):
 
         filename = quote(f"{zip_label}.zip")
         headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
-        return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+        content = buf.getvalue()
+        buf.close()
+        return attach(Response(content=content, media_type="application/zip", headers=headers))
 
 
 # --- /pre-spec 파일 다운로드 (Phase 4.9-B2) --------------------------
@@ -4149,10 +4241,10 @@ async def pre_spec_file_single(bf_spec_rgst_no: str):
         files = repository.get_pre_spec_files(session, bf_spec_rgst_no)
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
-    async with _file_buffer_slot(f"/pre-spec/{bf_spec_rgst_no}/files/single") as acquired:
-        if not acquired:
+    async with _file_buffer_response_slot(f"/pre-spec/{bf_spec_rgst_no}/files/single") as attach:
+        if attach is None:
             return _file_buffer_busy_response()
-        return await _single_file_response(bf_spec_rgst_no, files[0])
+        return attach(await _single_file_response(bf_spec_rgst_no, files[0]))
 
 
 @app.get("/pre-spec/{bf_spec_rgst_no}/files.zip")
@@ -4172,8 +4264,8 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
     if not files:
         return Response("첨부가 없습니다.", status_code=404, media_type="text/plain; charset=utf-8")
 
-    async with _file_buffer_slot(f"/pre-spec/{bf_spec_rgst_no}/files.zip") as acquired:
-        if not acquired:
+    async with _file_buffer_response_slot(f"/pre-spec/{bf_spec_rgst_no}/files.zip") as attach:
+        if attach is None:
             return _file_buffer_busy_response()
         buf = io.BytesIO()
         ok = 0
@@ -4220,7 +4312,9 @@ async def pre_spec_files_zip(bf_spec_rgst_no: str):
 
         filename = quote(f"{zip_label}.zip")
         headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
-        return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
+        content = buf.getvalue()
+        buf.close()
+        return attach(Response(content=content, media_type="application/zip", headers=headers))
 
 
 # --- 분석 API (Phase 8.1) -------------------------------------------
