@@ -180,6 +180,7 @@ def uvicorn_logging(monkeypatch):
     def preserve():
         loggers = [logging.getLogger(name) for name in
                    ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")]
+        handlers = [list(logger.handlers) for logger in loggers]
         try:
             with monkeypatch.context() as patch:
                 for logger in loggers:
@@ -188,7 +189,8 @@ def uvicorn_logging(monkeypatch):
                 yield patch
         finally:
             # 수준 복원 뒤에도 시험 중 계산한 수준 판단 캐시를 남기지 않는다.
-            for logger in loggers:
+            for logger, original_handlers in zip(loggers, handlers):
+                logger.handlers[:] = original_handlers
                 logger._cache.clear()
 
     return preserve
@@ -930,9 +932,7 @@ def test_attachment_stall_releases_original_body_with_uvicorn_socketpair(
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    with uvicorn_logging() as patch:
-        # 시험 로그의 exc_info가 traceback을 통해 원본 본문을 붙잡지 않게 한다.
-        patch.setattr(logging.getLogger("uvicorn.error"), "disabled", True)
+    with uvicorn_logging():
         asyncio.run(asyncio.wait_for(run(), 5))
 
 
@@ -1037,8 +1037,7 @@ def test_attachment_pipeline_start_stall_releases_original_body_with_uvicorn_soc
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    with uvicorn_logging() as patch:
-        patch.setattr(logging.getLogger("uvicorn.error"), "disabled", True)
+    with uvicorn_logging():
         asyncio.run(asyncio.wait_for(run(), 5))
 
 
@@ -1060,18 +1059,35 @@ def test_uvicorn_socketpair_restores_logger_state(
                 patch.setattr(logger, "handlers", [logging.NullHandler()])
                 patch.setattr(logger, "disabled", False)
                 logger._cache.clear()
-            before = [(logger.level, logger.propagate, logger.handlers, logger.disabled)
+            before = [(logger.level, logger.propagate, logger.disabled,
+                       list(logger.handlers), id(logger.handlers))
                       for logger in loggers]
             socketpair_test(file_buffer, patch, uvicorn_logging, http)
             for logger, expected in zip(loggers, before):
-                assert (logger.level, logger.propagate, logger.handlers, logger.disabled) == expected
-                assert logger.handlers is expected[2]
+                assert (logger.level, logger.propagate, logger.disabled) == expected[:3]
+                assert list(logger.handlers) == expected[3]
+                assert id(logger.handlers) == expected[4]
                 assert not logger._cache
                 assert logger.isEnabledFor(logging.INFO)
     finally:
         # 이 검증 시험이 설정한 수준도 복원한 뒤 캐시를 비운다.
         for logger in loggers:
             logger._cache.clear()
+
+
+def test_uvicorn_logging_restores_mutated_handler_contents(uvicorn_logging):
+    loggers = [logging.getLogger(name) for name in
+               ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")]
+    before = [(list(logger.handlers), id(logger.handlers)) for logger in loggers]
+    with uvicorn_logging():
+        for logger, (handlers, handlers_id) in zip(loggers, before):
+            handler = logging.NullHandler()
+            logger.handlers.append(handler)
+            assert list(logger.handlers) == handlers + [handler]
+            assert id(logger.handlers) == handlers_id
+    for logger, (handlers, handlers_id) in zip(loggers, before):
+        assert list(logger.handlers) == handlers
+        assert id(logger.handlers) == handlers_id
 
 
 @pytest.mark.parametrize("base,suffix,route", _BUFFER_ROUTES)
