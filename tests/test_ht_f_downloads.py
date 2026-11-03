@@ -188,12 +188,24 @@ def uvicorn_logging(monkeypatch):
                         patch.setattr(logger, attr, getattr(logger, attr))
                 yield patch
         finally:
+            # monkeypatch는 같은 목록 객체만 되돌리므로, 그 뒤 내용도 시험 전 사본으로 되돌린다.
             # 수준 복원 뒤에도 시험 중 계산한 수준 판단 캐시를 남기지 않는다.
             for logger, original_handlers in zip(loggers, handlers):
                 logger.handlers[:] = original_handlers
                 logger._cache.clear()
 
     return preserve
+
+
+def _record_uvicorn_errors():
+    records = []
+
+    class RecordHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logging.getLogger("uvicorn.error").addHandler(RecordHandler(logging.ERROR))
+    return records
 
 
 _BUFFER_ROUTES = [
@@ -875,6 +887,7 @@ def test_attachment_stall_releases_original_body_with_uvicorn_socketpair(
     content = bytearray(8 * 1024 * 1024)
 
     async def run():
+        records = _record_uvicorn_errors()
         completed = asyncio.Event()
         released = asyncio.Event()
         timed_out = asyncio.Event()
@@ -919,6 +932,9 @@ def test_attachment_stall_releases_original_body_with_uvicorn_socketpair(
             assert main._file_buffer_semaphore()._value == 1
             assert transport.is_closing()
             assert transport.get_write_buffer_size() > 0
+            assert any(record.getMessage().startswith("Exception in ASGI application")
+                       and record.exc_info and isinstance(record.exc_info[1], TimeoutError)
+                       for record in records)
             # 클라이언트는 읽지 않았고 버퍼가 남아 있어도 원본을 내보내는 참조는 없어야 한다.
             content.append(0)
             assert len(content) == 8 * 1024 * 1024 + 1
@@ -951,6 +967,7 @@ def test_attachment_pipeline_start_stall_releases_original_body_with_uvicorn_soc
     content = bytearray(8 * 1024 * 1024)
 
     async def run():
+        records = _record_uvicorn_errors()
         completed = asyncio.Event()
         timed_out = asyncio.Event()
         handling_500 = asyncio.Event()
@@ -1024,6 +1041,9 @@ def test_attachment_pipeline_start_stall_releases_original_body_with_uvicorn_soc
                 coroutine = coroutine.cr_await
             assert "send_500_response" in chain and "drain" in chain
             assert transport.get_write_buffer_size() > 0
+            assert any(record.getMessage().startswith("Exception in ASGI application")
+                       and record.exc_info and isinstance(record.exc_info[1], TimeoutError)
+                       for record in records)
             # 500 전송이 기다리는 동안 traceback이 남아도 원본 참조는 없어야 한다.
             content.append(0)
             assert len(content) == 8 * 1024 * 1024 + 1
@@ -1076,7 +1096,8 @@ def test_uvicorn_socketpair_restores_logger_state(
             logger._cache.clear()
 
 
-def test_uvicorn_logging_restores_mutated_handler_contents(uvicorn_logging):
+@pytest.mark.parametrize("replace_handlers", [False, True])
+def test_uvicorn_logging_restores_mutated_handler_contents(uvicorn_logging, replace_handlers):
     loggers = [logging.getLogger(name) for name in
                ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")]
     before = [(list(logger.handlers), id(logger.handlers)) for logger in loggers]
@@ -1086,6 +1107,8 @@ def test_uvicorn_logging_restores_mutated_handler_contents(uvicorn_logging):
             logger.handlers.append(handler)
             assert list(logger.handlers) == handlers + [handler]
             assert id(logger.handlers) == handlers_id
+            if replace_handlers:
+                logger.handlers = []
     for logger, (handlers, handlers_id) in zip(loggers, before):
         assert list(logger.handlers) == handlers
         assert id(logger.handlers) == handlers_id
