@@ -740,7 +740,8 @@ def test_attachment_stall_deadline_restarts_for_each_chunk(file_buffer, monkeypa
         release = await main._acquire_file_buffer_slot("느린 전송 시험")
         response = main._SlotReleasingResponse(main.Response(b"abcdefghijkl"), release)
         loop = asyncio.get_running_loop()
-        started = clock = loop.time()
+        # 실제 시각에서 시작하면 실수 오차로 정확 비교가 흔들리므로 고정값을 쓴다.
+        started = clock = 1000.0
         sent = []
 
         async def send(message):
