@@ -197,6 +197,9 @@ def uvicorn_logging(monkeypatch):
     return preserve
 
 
+# pytest 로그 수집 옵션과 관계없이 uvicorn 오류 기록과 그 traceback을 붙잡는다.
+# 반환한 목록은 content.append(0) 단언이 끝날 때까지 살아 있어야 한다.
+# 핸들러 제거는 uvicorn_logging에 맡기므로 with uvicorn_logging(): 안에서만 호출한다.
 def _record_uvicorn_errors():
     records = []
 
@@ -206,6 +209,15 @@ def _record_uvicorn_errors():
 
     logging.getLogger("uvicorn.error").addHandler(RecordHandler(logging.ERROR))
     return records
+
+
+def _assert_asgi_timeout_logged(records):
+    assert any(record.getMessage().startswith("Exception in ASGI application")
+               and record.exc_info and isinstance(record.exc_info[1], TimeoutError)
+               for record in records), "ASGI 시간 초과 오류 기록이 없습니다: %r" % [
+                   (record.getMessage().split("\n", 1)[0],
+                    type(record.exc_info[1]).__name__ if record.exc_info else None)
+                   for record in records]
 
 
 _BUFFER_ROUTES = [
@@ -932,9 +944,7 @@ def test_attachment_stall_releases_original_body_with_uvicorn_socketpair(
             assert main._file_buffer_semaphore()._value == 1
             assert transport.is_closing()
             assert transport.get_write_buffer_size() > 0
-            assert any(record.getMessage().startswith("Exception in ASGI application")
-                       and record.exc_info and isinstance(record.exc_info[1], TimeoutError)
-                       for record in records)
+            _assert_asgi_timeout_logged(records)
             # 클라이언트는 읽지 않았고 버퍼가 남아 있어도 원본을 내보내는 참조는 없어야 한다.
             content.append(0)
             assert len(content) == 8 * 1024 * 1024 + 1
@@ -1041,9 +1051,7 @@ def test_attachment_pipeline_start_stall_releases_original_body_with_uvicorn_soc
                 coroutine = coroutine.cr_await
             assert "send_500_response" in chain and "drain" in chain
             assert transport.get_write_buffer_size() > 0
-            assert any(record.getMessage().startswith("Exception in ASGI application")
-                       and record.exc_info and isinstance(record.exc_info[1], TimeoutError)
-                       for record in records)
+            _assert_asgi_timeout_logged(records)
             # 500 전송이 기다리는 동안 traceback이 남아도 원본 참조는 없어야 한다.
             content.append(0)
             assert len(content) == 8 * 1024 * 1024 + 1
