@@ -7,6 +7,18 @@
 - **MINOR**: 기능 추가·화면 개편(기존 데이터·설정 그대로 사용)
 - **PATCH**: 버그 수정, 문구·스타일 조정
 
+## [1.10.0] - 2026-11-19
+
+### 읽기 전용 조회 API
+- 다른 프로그램이 공고를 JSON으로 받아 갈 수 있는 읽기 전용 경로 추가: `GET /api/v1/bids`·`/api/v1/bids/{공고번호}`·`/api/v1/pre-specs`·`/api/v1/pre-specs/{등록번호}`
+- 새 환경변수 `NOTICE_API_TOKEN`(공백 없는 ASCII 보이는 글자 16자 이상)을 설정해야 켜지고, 요청 머리 `Authorization: Bearer <토큰>`이 맞을 때만 응답. 비어 있으면 꺼져 있고, 형식이 맞지 않으면 꺼진 채 서버 로그에 경고를 남김(토큰 값은 남기지 않음)
+- 목록 기본값은 지금 열려 있는 후보(목록 표시 대상이면서 마감 전인 입찰공고, SW 사업이면서 의견등록 마감 전인 사전규격). 공고일·갱신 시각·표시 대상 전체·마감 지난 것 포함 등 매개변수와 이어 받기 커서 지원
+- 응답에 공고 담당자 연락처가 들어 있어 토큰 없이는 응답하지 않고 캐시하지 않도록 표시
+- 사용법은 README 「조회 API (읽기 전용)」 절
+
+### 기타
+- 자동 시험 보강(첨부 다운로드 시험이 오류 기록을 스스로 모아 확인)
+
 ## [1.9.2] - 2026-11-03
 
 ### 첨부 다운로드
@@ -198,6 +210,7 @@
 ### 첫 버전
 - 입찰공고 API 호출·응답 확인 테스트 화면
 
+[1.10.0]: https://github.com/ccongs/procurement_parser/compare/v1.9.2...v1.10.0
 [1.9.2]: https://github.com/ccongs/procurement_parser/compare/v1.9.1...v1.9.2
 [1.9.1]: https://github.com/ccongs/procurement_parser/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/ccongs/procurement_parser/compare/v1.8.2...v1.9.0
