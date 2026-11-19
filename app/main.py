@@ -38,6 +38,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.types import Message, Receive, Scope, Send
 
 from app import __version__, api_client, classifier, industry_codes, region_codes, repository, rule_test, scheduler
+from app import read_api
 from app.db import SessionLocal, init_db
 from app.logging_config import setup_logging
 from app.models import BidNotice, PreSpec
@@ -96,6 +97,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="나라장터 입찰공고·사전규격 자동 수집", version=__version__, lifespan=lifespan)
+app.include_router(read_api.router)
 
 # 조회일시 영역에서 전용 위젯으로 렌더링하므로 일반 입력 그리드에서는 제외하는 파라미터.
 # (inqryBgnDt/inqryEndDt 는 화면의 날짜 선택값으로부터 서버에서 조립한다)

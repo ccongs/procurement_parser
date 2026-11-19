@@ -56,6 +56,50 @@
 | `GET /analysis/{type}/{id}` | **새 창 서버 렌더 분석 보고서**(영속화된 결과 표시) |
 | `GET·POST /api/export-cart` · `DELETE /api/export-cart/{id}`·`/all` | 검토항목 장바구니 조회·담기·삭제 |
 | `GET /api/export-cart/download` | 검토항목 장바구니 엑셀(xlsx) 다운로드 |
+| `GET /api/v1/bids` | 입찰공고 읽기 전용 조회 API(`NOTICE_API_TOKEN` 필요) |
+| `GET /api/v1/bids/{bid_ntce_no}` | 입찰공고 한 건 읽기 전용 조회 API(`NOTICE_API_TOKEN` 필요) |
+| `GET /api/v1/pre-specs` | 사전규격 읽기 전용 조회 API(`NOTICE_API_TOKEN` 필요) |
+| `GET /api/v1/pre-specs/{bf_spec_rgst_no}` | 사전규격 한 건 읽기 전용 조회 API(`NOTICE_API_TOKEN` 필요) |
+
+### 조회 API (읽기 전용)
+
+서버 `.env`에 `NOTICE_API_TOKEN`을 설정하면 켜진다(앞뒤 공백 제외).
+영문·숫자·기호(ASCII 보이는 글자)만, 공백 없이 16자 이상 — 예: 무작위 hex 32자 이상을 사용한다.
+비우거나 조건에 맞지 않으면 네 경로 모두 404로 꺼진다. 요청마다 `Authorization: Bearer <토큰>` 머리가 필요하다.
+토큰이 비어 있지 않은데 조건에 맞지 않으면 조회 API가 꺼지고 서버 로그에 경고가 남는다(토큰 값은 남기지 않는다).
+방식 이름은 대소문자를 구분하지 않고, 토큰 앞에는 공백 하나만 쓴다. 인증 실패는 401,
+잘못된 목록 매개변수는 `{"error": "한국어 설명"}` 형식의 422, 없는 번호는 404다.
+모든 조회 API 응답에는 `Cache-Control: no-store`가 붙는다.
+
+```bash
+curl -H "Authorization: Bearer <토큰>" "http://<호스트>:<포트>/api/v1/bids"
+```
+
+목록 기본 조건은 **열려 있는 후보**다. 입찰공고는 표시 대상, 사전규격은 SW사업대상(`Y`) 중
+마감이 현재 시각 이상인 건만 반환한다. 마감이 비었으면 공고일(사전규격은 접수일)이 최근 30일 이내인 건을 포함한다.
+한 건 조회에는 표시 대상·SW사업대상·마감 조건을 적용하지 않는다.
+
+| 목록 매개변수 | 값 / 의미 |
+|---|---|
+| `limit` | 1~500 정수, 기본 100 |
+| `cursor` | 직전 응답의 `next_cursor`(입찰 1~40자, 사전규격 1~30자) |
+| `ntce_from` · `ntce_to` | `YYYYMMDDHHMM` 실제 시각, 공고일(사전규격 접수일) 범위. from부터 to의 분 끝까지 포함, from ≤ to |
+| `updated_since` | `YYYYMMDDHHMM`, `updated_at`이 해당 시각 이상인 건 |
+| `open` | `true`(기본) / `false`(마감 조건 해제) |
+| `visible` | 입찰 전용, 생략 시 표시 대상만 / `all`이면 표시 조건 해제 |
+| `sw` | 사전규격 전용, 생략 시 SW사업대상만 / `all`이면 SW 조건 해제 |
+
+알려진 매개변수의 빈 값·중복·형식 오류는 422다. 값은 대소문자를 구분하며 모르는 이름은 무시한다.
+목록 봉투는 `{"api_version": "1", "generated_at": "...", "count": 0, "next_cursor": null, "items": []}`,
+한 건은 `{"api_version": "1", "generated_at": "...", "item": {...}}` 형식이다.
+시각은 서버 현지 시간대 오프셋을 붙인 ISO 8601, 금액은 정수, 빈 칸은 `null`이다.
+첨부는 저장된 `files: [{"name": "...", "url": "..."}]`, 관련 공고번호와 면허 허용 코드는 문자열 배열로 반환한다.
+목록은 번호 내림차순이며, `next_cursor`를 다음 요청의 `cursor`로 보내 이어받는다.
+`next_cursor`가 `null`일 때까지 같은 조건으로 반복하면 전체 후보를 받는다.
+
+표시 규칙을 바꿔 재분류해도 `updated_at`은 바뀌지 않으므로 `updated_since`만으로는 표시 대상 변경을 놓친다.
+**기본 조건으로 전체를 받는 쪽을 권장한다.** 응답에는 공고 담당자 연락처(개인정보)가 들어 있으므로
+받은 자료와 토큰의 저장 위치를 관리하고 공개 저장소에 올리지 않는다.
 
 ## 환경변수 (`.env`)
 
@@ -67,6 +111,7 @@
 | `PROCUREMENT_RESPONSE_TYPE` | 응답 타입 `json`(기본) 또는 `xml` |
 | `DATABASE_URL` | DB 경로(기본 `sqlite:///<프로젝트루트>/procurement.db`) |
 | `LOG_LEVEL` | 로그 레벨(기본 `INFO`) |
+| `NOTICE_API_TOKEN` | 읽기 전용 조회 API 토큰. **시크릿 — 커밋 금지**, 영문·숫자·기호(ASCII 보이는 글자)만, 공백 없이 16자 이상 — 예: 무작위 hex 32자 이상. 앞뒤 공백 제외, 비우거나 조건에 맞지 않으면 조회 API 꺼짐 |
 | `TZ` | 시간대(`Asia/Seoul` 권장 — 수집 윈도우가 로컬 시각 `datetime.now()` 기준) |
 | `ANALYSIS_PROVIDER` | RFP 분석 LLM 프로바이더 `claude`(기본)/`openai`/`gemini` |
 | `USE_ANALYSIS_PROVIDER` | 분석 컬럼·버튼 노출 여부. **기본 `false`(숨김)**, `true` 일 때만 표시 |
@@ -110,6 +155,7 @@ app/
   rule_test.py       # 규칙 테스트 페이지의 초안 검증·미리보기·적용 계획
   pre_spec_collector.py  # 사전규격 수집기. __main__=수동 백필
   repository.py      # 조회/upsert/설정/파일 목록 등 DB 접근
+  read_api.py        # 읽기 전용 조회 API(/api/v1, 토큰 보호)
   scheduler.py       # APScheduler 잡(collect / collect_pre_spec)·게이트
   logging_config.py  # 콘솔+회전파일 로깅, serviceKey 마스킹
   analysis/          # RFP 분석(선택): 파일 파싱(pdf/hwp/docx)·LibreOffice(.doc)변환·프로바이더(claude/openai/gemini)·분석 서비스
